@@ -1,0 +1,76 @@
+Hi! This is my project, I got and we gotta finish it! Read it first, and then after you can see my ideas how to solve it. We will implement my ideas in solving.
+
+Oves Enterprise
+
+Challenge 6
+
+Vision-only interception - design an onboard system for an interceptor drone that
+must fly a collision course toward an intruder drone using only a single monocular
+camera, with no radar, lidar or rangefinder available. Because the target type is
+known in advance, its true physical dimensions and volume are given; students must
+exploit the pinhole-camera relationship between real size, apparent size in the frame
+and focal length to recover an estimate of the range to the target, then fuse that
+range with the bearing in the image into a guidance law (pursuit or proportional
+navigation) that drives the interceptor to contact.
+
+ Deliverables include the system design and a working simulation or proof-of-
+concept, an analysis of how the range estimate degrades as the target shrinks in the
+frame, the minimum camera resolution required for a given engagement distance,
+and robustness to a target that rotates or maneuvers.
+
+
+
+INFO after discussing with the mentor of the project:
+
+We have nothing but a camera available. We can assume that we know the drone model by intercepting its signal via spoofing. We can assume it communicates with the satellites and it reaches us too. So we only have to look for signals if we already see a drone, and we can just assume it is the model we are looking for. Or the other idea is, that we can recognize the drone model. We should download drone models from the web, 3D models specifically. We may use if possible in python some blender like models, or if there is another langauge that would support that like java. Before all complications, we can use cubes, if it is possible to change them later.
+The tutor mentioned DINO v3 and YOLO for recognition models, but mentioned that they cant certainly always identify the drone model, only the shape. So he said we can assume we know the drone model, somehow we can "cheat" that. So it should be like they emit signals after we see them we look for signals too, and that also propogates fast or in a way like a signal would.
+
+IDEAS in solution:
+
+These are key things we have to make, in order for the program to be great. These are requirements I made up.
+
+1. When we notice the drone, there should be a box in bottom left of the screen, that says what model it found, or ??? if unknown. It says the model, with specifications like:
+DRONE X
+max speed: 70 m/s
+acceleration: 5 m/s2
+size: 70cm (or 0.7m)
+brakes (airbrakes)
+
+and next to it we see the distance too but those are calculations so it looks like:
+CALCULATIONS
+Dx:
+Dy:
+Dz:
+These 3 are the deltas we have to consider when making the project, these will be the outputs of the code that could do as output itself if it was real drones it could be used like that too.
+we can also write
+current speed:
+current acceleration: (negative if slowing down)
+
+and one more box, because these 3 boxes will be at the bottom of the screen, only borders, it will be transparent tho as visual.
+
+OUR DRONE
+and we got the 3 axes:
+X:
+Y:
+Z:
+
+and in each our speed in meters per seconds (total speed with all, the euclidean you get it)
+and our current acceleration, and total speed too.
+and ofcourse our size
+
+
+Let me know here in the planning phase, if we need additional information.
+
+
+But as info, we need to display everything that we use for calculations.
+
+And for calculating the distance, we know the size of the drone, and we calculate it by taking the ammount of pixels from the field of view, and use the formula for that.
+
+
+As for capturing the drone, phases should go like:
+
+We draw a circle, well rather an oval, where the drone can reach in the following 1 second, 5 seconds and milestones like that, we need to know when is the limit. When the circle reaches a certain size calculated off the angle of its size, like 20 degrees on our screen, or lifetime of the circle (these are ideas, you can verify which is the best for the use case).
+I like to imagine it as if like we approach it fast, we quickly should ignore the circles and directly go to its current trajectory. we can also draw dots and where the drone would go if NOTHING changes on the direction.
+As for calculating where to go, The best idea is to go towards the center of the oval, where the drone can be no matter what, UNTIL we can ourselves reache all the 4 sides of that oval. So we also calculate the distance of the oval, since its a flat surface, that we are perpendicular to as we hit the target, I think this is the best solution. So we calculate the distance of the oval, and if we can reach all 4 of its edges (like an oval has 4 edges in that way you get it), then we know we can reach any point of the oval, or lets assume, and go for the center of it. if we CANT reach all 4 points, we go to the next step: if there is a smaller oval, we repeat the steps on that, if there is no smaller oval, we go directly to the expected trajectory of the drone, like if the drone does not change anything on its speed.
+
+Also as idea: I know the oval wont be symmetrical, we still can use the 4 extreme points as prediction. we can assume the circle as we know the distance to the drone is the distance of the oval too. also we will go towards the weight point of the oval, like we add the 4 extreme points and divide the coordinates. we can calculate with only X and Y in terms of intercepting, since it can be projected into a 2D problem, since 2 dots only make a plane (2D X Y is what i mean, idk if its plane or plain) not a 3D world. And the direct line between us and the target drone is perpendicular to the plane. So to calculate we have to display these additional coordinates like relative speed based on distance + X Y axes, like the Z axe will be the literal line between us and the target drone.
