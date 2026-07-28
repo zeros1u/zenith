@@ -21,6 +21,8 @@ class DroneSpec:
     notes: str
     mesh_id: str = "falcon_quad"
     vehicle_type: str = "drone"
+    flight_model: str = "multirotor"
+    max_turn_rate_deg: float = 90.0
 
     @property
     def size_label(self) -> str:
@@ -52,6 +54,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         0.0016,
         "Agile reconnaissance quad",
         "falcon_quad",
+        flight_model="multirotor",
+        max_turn_rate_deg=115.0,
     ),
     DroneSpec(
         "WRS",
@@ -65,6 +69,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         0.0013,
         "Fast swept-wing platform",
         "wraith_wing",
+        flight_model="fixed_wing",
+        max_turn_rate_deg=82.0,
     ),
     DroneSpec(
         "AQ4",
@@ -78,6 +84,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         0.0020,
         "Compact defensive quad",
         "compact_quad",
+        flight_model="multirotor",
+        max_turn_rate_deg=125.0,
     ),
     DroneSpec(
         "TLR",
@@ -91,6 +99,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         0.0015,
         "High-agility interceptor",
         "talon_delta",
+        flight_model="fixed_wing",
+        max_turn_rate_deg=108.0,
     ),
     DroneSpec(
         "MNH",
@@ -104,6 +114,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         0.0024,
         "Heavy endurance platform",
         "manta_heavy",
+        flight_model="vectored_vtol",
+        max_turn_rate_deg=72.0,
     ),
 )
 
@@ -122,6 +134,8 @@ ROCKET_SPECS: tuple[DroneSpec, ...] = (
         "High-speed unguided rocket",
         "rocket_skyfall",
         "rocket",
+        "rocket",
+        18.0,
     ),
     DroneSpec(
         "LM2",
@@ -136,6 +150,8 @@ ROCKET_SPECS: tuple[DroneSpec, ...] = (
         "Maneuver-capable defense threat",
         "rocket_lance",
         "rocket",
+        "rocket",
+        31.0,
     ),
 )
 

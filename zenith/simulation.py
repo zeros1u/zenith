@@ -14,7 +14,13 @@ from .camera import (
     position_from_detection,
 )
 from .guidance import GuidanceSolution, TargetTrack, solve_guidance
-from .math3d import Vec3, clamp, lerp_vec
+from .math3d import (
+    Vec3,
+    basis_from_forward,
+    clamp,
+    rotate_towards,
+    world_direction_from_camera,
+)
 from .models import DroneSpec, get_spec
 from .physics import DroneState
 
@@ -52,7 +58,12 @@ class TelemetrySample:
 class InterceptionSimulation:
     DRONE_SIGNAL_DELAY_S = 0.65
     ROCKET_SIGNAL_DELAY_S = 0.42
-    CONTACT_TOLERANCE_M = 0.04
+    # Includes protruding rotors/fins that are not captured perfectly by the
+    # lightweight collision sphere, while the segment test still proves an
+    # actual close pass rather than a multi-metre "hit."
+    CONTACT_TOLERANCE_M = 0.35
+    GIMBAL_SLEW_RATE_DEG_S = 72.0
+    SEARCH_SLEW_RATE_DEG_S = 58.0
 
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
@@ -64,6 +75,10 @@ class InterceptionSimulation:
         self.status = "SEARCHING"
         self.signal_progress = 0.0
         self.identity_confirmed = False
+        self.visual_locked = False
+        self.lost_time_s = 0.0
+        self.reacquisition_count = 0
+        self.sensor_occluded = False
         self.last_event = "Simulation initialized"
         self.events: list[tuple[float, str]] = [(0.0, self.last_event)]
         self.telemetry: list[TelemetrySample] = []
@@ -95,6 +110,7 @@ class InterceptionSimulation:
             orientation=Vec3(0.0, math.pi if incoming_rocket else 0.25, 0.0),
         )
         self.camera_forward = initial_line
+        self.search_anchor_forward = initial_line
         self.detection = Detection(False, (0, 0, 0, 0), (0, 0), 0, 0, 0, 0, 0, 0, ())
         self.range_estimate: RangeEstimate | None = None
         self.track = TargetTrack()
@@ -123,6 +139,27 @@ class InterceptionSimulation:
         self.events.append((self.time_s, message))
         self.events = self.events[-12:]
 
+    def toggle_sensor_occlusion(self) -> None:
+        """Presentation control for proving lock-loss behavior deterministically."""
+        self.sensor_occluded = not self.sensor_occluded
+        state = "blocked" if self.sensor_occluded else "restored"
+        self._event(f"Camera image {state} by test control")
+
+    @staticmethod
+    def _empty_detection(depth: float = 0.0) -> Detection:
+        return Detection(
+            False,
+            (0, 0, 0, 0),
+            (0, 0),
+            0,
+            0,
+            0,
+            0,
+            0,
+            depth,
+            (),
+        )
+
     def _target_command(self) -> Vec3:
         spec = self.target.spec
         velocity = self.target.velocity
@@ -148,8 +185,8 @@ class InterceptionSimulation:
             return (
                 stabilise
                 + Vec3(
-                    math.sin(self.time_s * 1.55) * spec.lateral_accel * 0.72,
-                    math.sin(self.time_s * 0.83) * spec.lateral_accel * 0.24,
+                    math.sin(self.time_s * 1.55) * spec.lateral_accel * 0.62,
+                    math.sin(self.time_s * 0.83) * spec.lateral_accel * 0.16,
                     0.0,
                 )
             ).clamp_length(spec.max_accel)
@@ -184,14 +221,35 @@ class InterceptionSimulation:
         return stabilise.clamp_length(spec.max_accel)
 
     def _update_sensor(self, dt: float) -> None:
-        if self.identity_confirmed and self.track.position is not None:
+        if self.visual_locked and self.identity_confirmed and self.track.position is not None:
             predicted_direction = (
                 self.track.position - self.interceptor.position
             ).normalized(self.camera_forward)
-            tracker_alpha = 1.0 - math.exp(-4.5 * dt)
-            self.camera_forward = lerp_vec(
-                self.camera_forward, predicted_direction, tracker_alpha
-            ).normalized(self.camera_forward)
+            self.camera_forward = rotate_towards(
+                self.camera_forward,
+                predicted_direction,
+                math.radians(self.GIMBAL_SLEW_RATE_DEG_S) * dt,
+            )
+        elif self.lost_time_s > 0.0:
+            # Search uses only the last observed bearing. It deliberately does
+            # not point at simulation truth or continue a guidance-quality track.
+            right, up, anchor = basis_from_forward(self.search_anchor_forward)
+            scan_radius = math.radians(
+                min(168.0, 4.0 + self.lost_time_s * 18.0)
+            )
+            phase = self.lost_time_s * 1.35
+            sweep_axis = (
+                right * math.cos(phase) + up * math.sin(phase)
+            ).normalized(right)
+            search_direction = (
+                anchor * math.cos(scan_radius)
+                + sweep_axis * math.sin(scan_radius)
+            ).normalized(anchor)
+            self.camera_forward = rotate_towards(
+                self.camera_forward,
+                search_direction,
+                math.radians(self.SEARCH_SLEW_RATE_DEG_S) * dt,
+            )
 
         self.detection = detect_box(
             self.target,
@@ -199,31 +257,60 @@ class InterceptionSimulation:
             self.camera_forward,
             self.config.camera,
         )
+        if self.sensor_occluded:
+            self.detection = self._empty_detection(self.detection.camera_depth)
         incoming_rocket = self.target.spec.vehicle_type == "rocket"
-        minimum_lock_pixels = 3.0 if incoming_rocket else 4.0
+        was_locked = self.visual_locked
+        if self.identity_confirmed:
+            # Known-model detection can remain valid at a smaller apparent size
+            # than the initial generic-object / signal-query threshold.
+            minimum_lock_pixels = 2.0 if was_locked else 2.5
+        else:
+            minimum_lock_pixels = 3.0 if incoming_rocket else 4.0
         signal_delay = (
             self.ROCKET_SIGNAL_DELAY_S
             if incoming_rocket
             else self.DRONE_SIGNAL_DELAY_S
         )
-        visual_lock = self.detection.visible and max(
+        visual_detection = self.detection.visible and max(
             self.detection.width_px, self.detection.height_px
         ) >= minimum_lock_pixels
 
-        if visual_lock and not self.identity_confirmed:
+        previous_lost_time = self.lost_time_s
+        if visual_detection:
+            self.visual_locked = True
+            self.lost_time_s = 0.0
+            if not was_locked:
+                if self.identity_confirmed:
+                    self.reacquisition_count += 1
+                    self._event("Visual lock reacquired by image detector")
+                else:
+                    self._event("Visual detector acquired an unknown aerial vehicle")
+        else:
+            if was_locked:
+                self.search_anchor_forward = self.camera_forward
+                self._event("Visual lock lost; guidance disabled")
+            self.visual_locked = False
+            self.lost_time_s += dt
+            self.range_estimate = None
+
+        if self.visual_locked and not self.identity_confirmed:
             self.signal_progress += dt
             if self.status == "SEARCHING":
                 self.status = "VISUAL LOCK / SIGNAL QUERY"
-                self._event("Visual detector acquired an unknown aerial vehicle")
             if self.signal_progress >= signal_delay:
                 self.identity_confirmed = True
                 self.status = "IDENTITY CONFIRMED"
                 self._event(f"Signal match: {self.target.spec.name}")
-        elif not visual_lock and not self.identity_confirmed:
+        elif not self.visual_locked and not self.identity_confirmed:
             self.signal_progress = max(0.0, self.signal_progress - dt * 0.5)
             self.status = "SEARCHING"
 
-        if self.identity_confirmed and self.detection.visible:
+        if self.identity_confirmed and self.visual_locked:
+            if not was_locked and previous_lost_time > 0.25:
+                # A stale metric track must not silently become a current lock.
+                # Reacquisition begins a fresh camera-derived velocity estimate.
+                self.track = TargetTrack()
             # A known-model pose solver supplies orientation. Image-size-dependent
             # deterministic error keeps the simulation repeatable.
             pose_error = math.radians(
@@ -251,15 +338,21 @@ class InterceptionSimulation:
                 self.last_estimated_position = estimated_position
                 self.track.update(estimated_position, self.time_s)
 
-                desired_forward = (
-                    estimated_position - self.interceptor.position
-                ).normalized(self.camera_forward)
-                tracker_alpha = 1.0 - math.exp(-7.0 * dt)
-                self.camera_forward = lerp_vec(
-                    self.camera_forward, desired_forward, tracker_alpha
-                ).normalized(self.camera_forward)
+                camera_ray = Vec3(
+                    math.tan(math.radians(self.detection.bearing_x_deg)),
+                    math.tan(math.radians(self.detection.bearing_y_deg)),
+                    1.0,
+                )
+                measured_bearing = world_direction_from_camera(
+                    camera_ray, self.camera_forward
+                )
+                self.camera_forward = rotate_towards(
+                    self.camera_forward,
+                    measured_bearing,
+                    math.radians(self.GIMBAL_SLEW_RATE_DEG_S) * dt,
+                )
         elif self.identity_confirmed:
-            self.track.coast(self.time_s)
+            self.status = "TARGET LOST / SEARCHING"
 
     def _record_telemetry(self, dt: float) -> None:
         self._telemetry_timer += dt
@@ -299,32 +392,52 @@ class InterceptionSimulation:
         previous_relative = self.target.position - self.interceptor.position
 
         self._update_sensor(dt)
-        if self.identity_confirmed and self.track.position is not None:
-            self.guidance = solve_guidance(self.interceptor, self.track, self.target.spec)
+        if (
+            self.identity_confirmed
+            and self.visual_locked
+            and self.track.position is not None
+        ):
+            self.guidance = solve_guidance(
+                self.interceptor,
+                self.track,
+                self.target.spec,
+                self.camera_forward,
+            )
             interceptor_command = (
                 self.guidance.commanded_acceleration if self.guidance else Vec3()
             )
             if self.status != "INTERCEPT GUIDANCE":
                 self.status = "INTERCEPT GUIDANCE"
                 self._event("Oval reachability guidance active")
-        elif self.detection.visible:
+        elif self.visual_locked:
             # Bearing-only pursuit while the signal lookup runs.
+            self.guidance = None
             interceptor_command = (
                 self.camera_forward * self.interceptor.spec.max_speed
                 - self.interceptor.velocity
             ).clamp_length(self.interceptor.spec.max_accel)
         else:
+            self.guidance = None
             interceptor_command = Vec3()
 
         target_command = self._target_command()
         self.interceptor.integrate(interceptor_command, dt)
         self.target.integrate(target_command, dt)
         if self.config.scenario == "rotating":
-            self.target.orientation = Vec3(
-                math.sin(self.time_s * 1.7) * 0.42,
-                self.target.orientation.y + 1.45 * dt,
-                math.sin(self.time_s * 2.4) * 1.1,
-            )
+            if self.target.spec.flight_model in ("multirotor", "vectored_vtol"):
+                self.target.orientation = Vec3(
+                    self.target.orientation.x,
+                    self.target.orientation.y + 1.45 * dt,
+                    math.sin(self.time_s * 2.4) * 1.1,
+                )
+            else:
+                # Directional craft may roll about their flight axis, but their
+                # nose remains tied to their physically integrated velocity.
+                self.target.orientation = Vec3(
+                    self.target.orientation.x,
+                    self.target.orientation.y,
+                    math.sin(self.time_s * 2.4) * 0.65,
+                )
 
         # Continuous relative segment test prevents high-speed tunnelling.
         current_relative = self.target.position - self.interceptor.position

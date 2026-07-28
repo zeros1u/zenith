@@ -8,7 +8,7 @@ The guidance algorithm does not read simulated target coordinates. Simulation tr
 
 1. creating the synthetic camera observation;
 2. detecting physical contact and applying crash physics;
-3. producing the marked `VERIFY TRUE / ERR` value and exported verification data.
+3. producing the marked `TRUE / ERROR` value and exported verification data.
 
 Our interceptor's position and velocity are propagated from its own commanded acceleration, which represents normal onboard inertial/state estimation. No external target range sensor is modeled.
 
@@ -129,6 +129,8 @@ The implemented state machine is:
 2. a generic drone with at least 4 px apparent span, or a high-contrast rocket with at least 3 px, becomes `VISUAL LOCK / SIGNAL QUERY`
 3. a simulated lookup resolves the known target specification after 0.65 s for drones or 0.42 s for fast incoming rockets
 4. the range estimator, metric track, and oval guidance activate
+5. any later loss becomes `TARGET LOST / SEARCHING`, clears guidance immediately, and starts an expanding gimbal scan from the last visual bearing
+6. only a newly visible image detection can reacquire the target and reactivate guidance
 
 Before identification, the system has bearing, pixel size, and angular motion. After target dimensions arrive, it converts those observations to metres and metres per second. This separation makes it clear which calculations depend on known model data.
 
@@ -143,23 +145,38 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. When the detector temporarily loses the target, the track coasts with the last camera-derived velocity while the gimbal points toward the predicted position.
+This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. If detection is lost, range and guidance are invalidated immediately and the gimbal performs an expanding search around the last observed bearing. Reacquisition must come from a new visible image detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
 Prediction horizons are `1, 2, 3, and 5 seconds`.
 
-For every horizon, the target is propagated under maximum known lateral acceleration in four camera-plane directions:
+For every horizon, the target's unchanged-velocity point is:
+
+```text
+P₀(t) = P + Vt
+```
+
+The oval plane passes through this future region and its normal is exactly the current camera optical axis. Therefore every border point `Q` satisfies:
+
+```text
+(Q - center) · camera_forward = 0
+```
+
+Propulsion limits define acceleration support in the camera-plane X and Y directions. Multirotors use a bounded acceleration ellipsoid with separate horizontal and vertical authority. Wings use forward thrust, bounded braking, and lateral aerodynamic acceleration. Rockets have forward thrust and limited lateral steering, but no reverse engine thrust.
+
+Positive and negative support are calculated separately in four camera-plane directions:
 
 - positive X;
 - negative X;
 - positive Y;
 - negative Y.
 
-Maximum target speed is enforced during this propagation. The average of the four non-symmetric extremes is the oval's center:
+Those component bounds define a guaranteed rectangle for the projected future position. Directional vehicles use an ellipse whose semiaxes are multiplied by `√2`, which circumscribes that rectangle. The multirotor acceleration ellipsoid is aligned with the camera-plane horizontal/projected-vertical basis and needs no inflation. Thus the border is a conservative containment claim: any allowed projected maneuver remains inside it. Speed limits can only make the actual reachable set smaller.
 
 ```text
-center = (P+x + P-x + P+y + P-y) / 4
+center offset X = (support(+X) - support(-X)) t² / 4
+radius X        = (support(+X) + support(-X)) t² / 4 × containment factor
 ```
 
 The orange dots show the unchanged-velocity trajectory inside the smallest oval.
@@ -172,7 +189,7 @@ For every target extreme and horizon, ZENITH computes whether our interceptor ca
 distance_to_point ≤ maximum_distance(v_along, max_accel, max_speed, horizon)
 ```
 
-The maximum-distance calculation accelerates to maximum speed and then cruises. A small reserve accounts for turning and drag.
+The maximum-distance calculation accelerates to maximum speed and then cruises. For wings and rockets, the test also subtracts a turn-time penalty derived from current heading, lateral acceleration, and maximum turn rate. A small reserve accounts for drag and path curvature.
 
 The decision order follows the project idea:
 
@@ -181,18 +198,22 @@ The decision order follows the project idea:
 3. if no complete oval is reachable, aim at the unchanged-trajectory point in the 1 s oval;
 4. at short range or low time-to-contact, stop using the large ovals and enter terminal pursuit.
 
-Terminal pursuit solves the constant-velocity intercept equation and deliberately reduces closing speed while matching target lateral velocity. This prevents a visually impressive but physically incorrect high-speed fly-by.
+Terminal pursuit solves the constant-velocity intercept equation. Against a co-directional drone it controls closing speed while matching target lateral velocity. Against an incoming rocket it keeps the interceptor nose-on instead of asking a fixed-wing craft to reverse and velocity-match the threat.
 
 ## 10. Physics
 
-Physics advances at a fixed 60 ticks per simulated second:
+Physics advances at a fixed 60 ticks per simulated second. Guidance supplies a requested acceleration, but the flight-model layer decides what force the vehicle can actually produce:
+
+- multirotor and vectored-VTOL craft slew and tilt a thrust vector inside a bounded cone;
+- fixed-wing craft add engine thrust only along the nose and turn through bounded lateral aerodynamic acceleration;
+- rockets add forward thrust only, have no reverse thrust, and steer at their smaller lateral/turn-rate limit.
 
 ```text
 velocity(t+Δt) = clamp(velocity + acceleration Δt, max_speed)
 position(t+Δt) = position + velocity Δt
 ```
 
-Command acceleration, passive quadratic drag, model-specific airbrakes, maximum speed, and crash gravity are continuous. There are no instantaneous boosters in this milestone. The braking scenario activates a sustained airbrake acceleration rather than deleting a percentage of speed in one frame.
+Actual propulsion acceleration, passive quadratic drag, model-specific airbrakes, maximum speed, and crash gravity are continuous. The UI reports propulsion class and engine output. There are no instantaneous boosters in this milestone. The braking scenario activates a sustained airbrake acceleration rather than deleting a percentage of speed in one frame.
 
 Collision uses the closest separation across the entire relative-motion segment for each tick, preventing fast drones from tunneling through each other between frames. Following impact, both vehicles tumble and fall under gravity.
 
@@ -216,7 +237,7 @@ Rotation is handled by known-model pose-compensated physical spans. Maneuvers ar
 - Five original low-poly drone meshes and two original rocket meshes are bundled. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
 - The generic detector backend deterministically emits the synthetic camera bounding box. It represents the output contract of YOLO/DINO, not a trained neural network.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
-- Four extreme points approximate a convex maneuver envelope. A production system would propagate uncertainty, latency, pose confidence, wind, actuator limits, and safety constraints more formally.
+- The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
 - A monocular camera cannot recover absolute scale for an unknown object. Metric values correctly remain unavailable until known target dimensions are resolved.
 
 These boundaries are deliberately visible rather than hidden, so the project can be presented as a working and testable software proof-of-concept.

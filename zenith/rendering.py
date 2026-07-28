@@ -252,22 +252,12 @@ class WorldRenderer:
 
     @staticmethod
     def _oval_points(oval: PredictionOval, count: int = 72) -> list[Vec3]:
-        points: list[Vec3] = []
-        for index in range(count + 1):
-            angle = math.tau * index / count
-            cosine, sine = math.cos(angle), math.sin(angle)
-            x_vector = (
-                oval.extremes[0] - oval.center
-                if cosine >= 0
-                else oval.center - oval.extremes[1]
-            )
-            y_vector = (
-                oval.extremes[2] - oval.center
-                if sine >= 0
-                else oval.center - oval.extremes[3]
-            )
-            points.append(oval.center + x_vector * cosine + y_vector * sine)
-        return points
+        return [
+            oval.center
+            + oval.plane_x * (math.cos(math.tau * index / count) * oval.radius_x)
+            + oval.plane_y * (math.sin(math.tau * index / count) * oval.radius_y)
+            for index in range(count + 1)
+        ]
 
     def _draw_predictions(
         self,
@@ -326,7 +316,7 @@ class WorldRenderer:
         bounds: tuple[int, int, int, int] | None,
         sim: InterceptionSimulation,
     ) -> None:
-        if not bounds or self.view_mode != 0:
+        if not bounds or self.view_mode != 0 or not sim.visual_locked:
             return
         left, top, right, bottom = bounds
         center_x, center_y = (left + right) // 2, (top + bottom) // 2
@@ -377,6 +367,46 @@ class WorldRenderer:
                 )
                 pygame.draw.circle(surface, color, projected[:2], max(1, int(4 * fade)))
 
+    def _draw_camera_occlusion(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        if not sim.sensor_occluded or self.view_mode != 0:
+            return
+        width, height = surface.get_size()
+        camera_area = pygame.Rect(0, 54, width, max(1, height - 232))
+        blackout = pygame.Surface(camera_area.size, pygame.SRCALPHA)
+        blackout.fill((1, 7, 11, 238))
+        for y in range(0, camera_area.height, 9):
+            pygame.draw.line(
+                blackout,
+                (26, 47, 54, 115),
+                (0, y),
+                (camera_area.width, y),
+            )
+        message = self.font_large.render("CAMERA FEED OCCLUDED", True, RED)
+        detail = self.font_small.render(
+            "VISUAL LOCK INVALID // GUIDANCE OFF // SEARCH SCAN ACTIVE",
+            True,
+            AMBER,
+        )
+        blackout.blit(
+            message,
+            (
+                camera_area.width // 2 - message.get_width() // 2,
+                camera_area.height // 2 - 30,
+            ),
+        )
+        blackout.blit(
+            detail,
+            (
+                camera_area.width // 2 - detail.get_width() // 2,
+                camera_area.height // 2 + 14,
+            ),
+        )
+        surface.blit(blackout, camera_area.topleft)
+
     def draw_world(
         self,
         surface: pygame.Surface,
@@ -410,7 +440,7 @@ class WorldRenderer:
                 camera_coordinates(sim.target.position, camera.position, camera.forward).z,
                 sim.target,
                 "TARGET",
-                True,
+                sim.visual_locked,
             )
         )
         target_bounds = None
@@ -421,6 +451,7 @@ class WorldRenderer:
 
         self._draw_explosion(surface, sim, camera)
         self._draw_detection_brackets(surface, target_bounds, sim)
+        self._draw_camera_occlusion(surface, sim)
         self._draw_reticle(surface)
         return camera
 
@@ -450,8 +481,12 @@ class WorldRenderer:
         for row in rows:
             label, value = row[0], row[1]
             color = row[2] if len(row) > 2 else None
-            panel.blit(self.font_tiny.render(label, True, MUTED), (12, y))
+            label_rendered = self.font_tiny.render(label, True, MUTED)
+            panel.blit(label_rendered, (12, y))
             rendered = self.font_small.render(value, True, color or WHITE)
+            available_width = rect.width - 32 - label_rendered.get_width()
+            if rendered.get_width() > available_width:
+                rendered = self.font_tiny.render(value, True, color or WHITE)
             panel.blit(rendered, (rect.width - 12 - rendered.get_width(), y - 1))
             y += 18
             if y > rect.height - 15:
@@ -470,7 +505,7 @@ class WorldRenderer:
         top.fill((3, 12, 20, 205))
         top.blit(self.font_title.render("ZENITH", True, WHITE), (18, 9))
         top.blit(
-            self.font_small.render("VISION-ONLY INTERCEPTION // PROTOTYPE 01", True, CYAN),
+            self.font_small.render("VISION-ONLY INTERCEPTION // PROTOTYPE 02", True, CYAN),
             (132, 19),
         )
         status_color = GREEN if sim.hit else (CYAN if sim.identity_confirmed else AMBER)
@@ -486,7 +521,7 @@ class WorldRenderer:
 
         surface.blit(
             self.font_tiny.render(
-                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [SPACE] PAUSE   [A] ANALYSIS   [H] HELP",
+                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [SPACE] PAUSE   [O] OCCLUSION TEST   [A] ANALYSIS   [H] HELP",
                 True,
                 MUTED,
             ),
@@ -517,11 +552,11 @@ class WorldRenderer:
         )
         target_rows = [
             ("MODEL", target_name, sim.target.spec.color if sim.identity_confirmed else AMBER),
+            ("PROPULSION", sim.target.spec.flight_model.replace("_", " ").upper() if sim.identity_confirmed else "QUERYING"),
             ("MAX SPEED", f"{sim.target.spec.max_speed:.1f} m/s" if sim.identity_confirmed else "QUERYING"),
             ("ACCEL / BRAKE", f"{sim.target.spec.max_accel:.1f} / {sim.target.spec.brake_accel:.1f} m/s²" if sim.identity_confirmed else "QUERYING"),
             ("SIZE W/H/L", sim.target.spec.size_label if sim.identity_confirmed else "QUERYING"),
-            ("BOUND. VOLUME", f"{sim.target.spec.bounding_volume:.4f} m³" if sim.identity_confirmed else "QUERYING"),
-            ("SPEED / AXIAL A", f"{sim.track.velocity.length():.2f} / {target_axial_accel:+.2f}" if sim.track.sample_count > 2 else "ANGULAR ONLY"),
+            ("SPEED / AXIAL A", f"{sim.track.velocity.length():.2f} / {target_axial_accel:+.2f}" if sim.visual_locked and sim.track.sample_count > 2 else ("NO VISUAL LOCK" if sim.identity_confirmed and not sim.visual_locked else "ANGULAR ONLY")),
             ("SCENARIO", dict(SCENARIOS)[sim.config.scenario]),
         ]
 
@@ -545,12 +580,12 @@ class WorldRenderer:
         own = sim.interceptor
         own_rows = [
             ("MODEL", own.spec.name, own.spec.color),
+            ("PROPULSION", own.spec.flight_model.replace("_", " ").upper()),
             ("POSITION XYZ", f"{own.position.x:+.0f}/{own.position.y:+.0f}/{own.position.z:+.0f} m"),
-            ("Vx", f"{own.velocity.x:+.2f} m/s"),
-            ("Vy", f"{own.velocity.y:+.2f} m/s"),
-            ("Vz", f"{own.velocity.z:+.2f} m/s"),
+            ("VELOCITY XYZ", f"{own.velocity.x:+.1f}/{own.velocity.y:+.1f}/{own.velocity.z:+.1f}"),
             ("TOTAL SPEED", f"{own.velocity.length():.2f} / {own.spec.max_speed:.0f} m/s"),
             ("ACCELERATION", f"{own.acceleration.length():.2f} m/s²"),
+            ("ENGINE OUTPUT", f"{own.engine_output*100:.0f}%"),
         ]
 
         if sim.hit:
@@ -586,14 +621,20 @@ class WorldRenderer:
                 ("VERIFY", "CONTACT CONFIRMED", GREEN),
             ]
         else:
+            relative_xy = (
+                f"{relative_v.x:+.2f} / {relative_v.y:+.2f} m/s"
+                if sim.visual_locked
+                else "---"
+            )
+            relative_z = f"{relative_v.z:+.2f} m/s" if sim.visual_locked else "---"
             relative_rows = [
-                ("REL. Vx / Vy", f"{relative_v.x:+.2f} / {relative_v.y:+.2f} m/s"),
-                ("REL. Vz", f"{relative_v.z:+.2f} m/s"),
+                ("REL. Vx / Vy", relative_xy),
+                ("REL. Vz", relative_z),
                 ("CLOSING SPEED", f"{guidance.closing_speed:+.2f} m/s" if guidance else "---"),
                 ("TIME TO CONTACT", f"{guidance.time_to_contact_s:.2f} s" if guidance and math.isfinite(guidance.time_to_contact_s) else "---"),
-                ("GUIDANCE", guidance.mode if guidance else "BEARING PURSUIT"),
-                ("OVAL / EDGES", f"{guidance.selected_horizon_s:.1f}s / {guidance.reachable_count}/4" if guidance and guidance.selected_horizon_s else "---"),
-                ("VERIFY TRUE / ERR", f"{sim.true_range_m:.2f} / {error:+.2f} m" if error is not None else f"{sim.true_range_m:.2f} / ---", MUTED),
+                ("GUIDANCE", guidance.mode if guidance else ("BEARING PURSUIT" if sim.visual_locked else "NO VISUAL LOCK")),
+                ("OVAL / EDGES", f"{guidance.selected_horizon_s:.1f}s / {guidance.reachable_count}/4" if guidance and guidance.selected_horizon_s else ("SEARCHING" if not sim.visual_locked else "---")),
+                ("TRUE / ERROR", f"{sim.true_range_m:.2f} / {error:+.2f} m" if error is not None else f"{sim.true_range_m:.2f} / ---", MUTED),
             ]
 
         panels = (
@@ -730,6 +771,7 @@ class WorldRenderer:
             ("R", "restart the current simulation"),
             ("N", "return to setup and place new drones"),
             ("E", "export verification telemetry to a CSV file"),
+            ("O", "toggle camera occlusion to prove lock loss / search"),
             ("H", "close this help panel"),
             ("ESC", "close an overlay, then exit"),
         ]
@@ -740,8 +782,9 @@ class WorldRenderer:
             y += 38
         y += 8
         notes = [
-            "Green extreme point = our drone can reach it before the target.",
-            "Red extreme point = unreachable. White oval = selected solution.",
+            "Every oval lies exactly in the current camera line-of-sight plane.",
+            "Its border conservatively contains all allowed projected maneuvers.",
+            "Green/red points show whether our drone can reach each extreme.",
             "The bottom-right true range is simulation verification, never guidance input.",
         ]
         for note in notes:

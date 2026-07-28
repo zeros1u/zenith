@@ -5,7 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 
-from .math3d import Vec3, WORLD_FORWARD, clamp, lerp
+from .math3d import (
+    Vec3,
+    WORLD_FORWARD,
+    WORLD_UP,
+    clamp,
+    lerp,
+    lerp_vec,
+    rotate_euler,
+    rotate_towards,
+)
 from .models import DroneSpec
 
 
@@ -18,6 +27,8 @@ class DroneState:
     acceleration: Vec3 = field(default_factory=Vec3)
     crashed: bool = False
     airbrake: bool = False
+    thrust_vector: Vec3 = field(default_factory=Vec3)
+    engine_output: float = 0.0
 
     def integrate(self, commanded_acceleration: Vec3, dt: float) -> None:
         if self.crashed:
@@ -36,27 +47,150 @@ class DroneState:
                 self.velocity = Vec3(self.velocity.x * 0.55, 0.0, self.velocity.z * 0.55)
             return
 
-        command = commanded_acceleration.clamp_length(self.spec.max_accel)
+        if self.spec.flight_model in ("fixed_wing", "rocket"):
+            self._integrate_directional(commanded_acceleration, dt)
+        else:
+            self._integrate_vectored(commanded_acceleration, dt)
+
+    def forward_direction(self) -> Vec3:
+        """Vehicle nose direction used by engines and envelope calculations."""
+        pose = Vec3(self.orientation.x, self.orientation.y, 0.0)
+        return rotate_euler(WORLD_FORWARD, pose).normalized(WORLD_FORWARD)
+
+    def _drag_acceleration(self) -> Vec3:
         speed = self.velocity.length()
         passive_drag = self.velocity * (-self.spec.drag_coefficient * speed)
         if self.airbrake and speed > 0.01:
             passive_drag = passive_drag - self.velocity.normalized() * self.spec.brake_accel
+        return passive_drag
 
-        self.acceleration = command + passive_drag
+    def _integrate_vectored(self, commanded_acceleration: Vec3, dt: float) -> None:
+        """Multirotor/VTOL thrust: requested motion requires a visible body tilt."""
+        horizontal = Vec3(
+            commanded_acceleration.x,
+            0.0,
+            commanded_acceleration.z,
+        )
+        vertical = Vec3(0.0, commanded_acceleration.y, 0.0)
+        normalized_demand = math.sqrt(
+            (horizontal.length() / max(0.001, self.spec.lateral_accel)) ** 2
+            + (vertical.length() / max(0.001, self.spec.max_accel)) ** 2
+        )
+        demand_scale = 1.0 / max(1.0, normalized_demand)
+        command = (horizontal + vertical) * demand_scale
+        gravity_compensation = WORLD_UP * 9.81
+        desired_thrust = command + gravity_compensation
+
+        # A rotorcraft cannot point unlimited thrust sideways while maintaining
+        # altitude. Clamp the thrust cone, then slew it instead of teleporting it.
+        max_tilt = math.radians(58.0 if self.spec.flight_model == "multirotor" else 46.0)
+        desired_direction = rotate_towards(
+            WORLD_UP, desired_thrust.normalized(WORLD_UP), max_tilt
+        )
+        desired_thrust = desired_direction * desired_thrust.length()
+        current_thrust = (
+            self.thrust_vector
+            if self.thrust_vector.length() > 0.1
+            else gravity_compensation
+        )
+        response = 1.0 - math.exp(-self.spec.max_turn_rate_deg / 18.0 * dt)
+        self.thrust_vector = lerp_vec(current_thrust, desired_thrust, response)
+        propulsion_acceleration = self.thrust_vector - gravity_compensation
+        self.engine_output = clamp(
+            self.thrust_vector.length()
+            / math.sqrt(self.spec.max_accel**2 + 9.81**2),
+            0.0,
+            1.0,
+        )
+
+        self.acceleration = propulsion_acceleration + self._drag_acceleration()
         self.velocity = self.velocity + self.acceleration * dt
         self.velocity = self.velocity.clamp_length(self.spec.max_speed)
         self.position = self.position + self.velocity * dt
 
-        if self.velocity.length() > 0.25:
-            direction = self.velocity.normalized(WORLD_FORWARD)
-            target_yaw = math.atan2(direction.x, direction.z)
-            target_pitch = -math.asin(clamp(direction.y, -1.0, 1.0))
-            alpha = 1.0 - math.exp(-5.0 * dt)
-            self.orientation = Vec3(
-                lerp(self.orientation.x, target_pitch, alpha),
-                lerp_angle(self.orientation.y, target_yaw, alpha),
-                lerp(self.orientation.z, -command.x / max(1.0, self.spec.max_accel) * 0.5, alpha),
+        horizontal_velocity = Vec3(self.velocity.x, 0.0, self.velocity.z)
+        heading = horizontal_velocity.normalized(self.forward_direction())
+        target_yaw = math.atan2(heading.x, heading.z)
+        forward_flat = Vec3(math.sin(target_yaw), 0.0, math.cos(target_yaw))
+        right_flat = Vec3(forward_flat.z, 0.0, -forward_flat.x)
+        target_pitch = clamp(
+            -propulsion_acceleration.dot(forward_flat) / 9.81,
+            -max_tilt,
+            max_tilt,
+        )
+        target_roll = clamp(
+            -propulsion_acceleration.dot(right_flat) / 9.81,
+            -max_tilt,
+            max_tilt,
+        )
+        alpha = 1.0 - math.exp(-6.0 * dt)
+        self.orientation = Vec3(
+            lerp(self.orientation.x, target_pitch, alpha),
+            lerp_angle(self.orientation.y, target_yaw, alpha),
+            lerp(self.orientation.z, target_roll, alpha),
+        )
+
+    def _integrate_directional(self, commanded_acceleration: Vec3, dt: float) -> None:
+        """Wing/rocket dynamics: thrust is axial and steering is rate limited."""
+        old_velocity = self.velocity
+        speed = old_velocity.length()
+        forward = (
+            old_velocity.normalized(self.forward_direction())
+            if speed > 1.0
+            else self.forward_direction()
+        )
+        command = commanded_acceleration.clamp_length(
+            max(self.spec.max_accel, self.spec.brake_accel, self.spec.lateral_accel)
+        )
+
+        axial_request = command.dot(forward)
+        minimum_axial = 0.0 if self.spec.flight_model == "rocket" else -self.spec.brake_accel
+        axial = clamp(axial_request, minimum_axial, self.spec.max_accel)
+        lateral = (command - forward * axial_request).clamp_length(
+            self.spec.lateral_accel
+        )
+
+        commanded_turn_rate = lateral.length() / max(speed, 5.0)
+        allowed_turn_rate = min(
+            math.radians(self.spec.max_turn_rate_deg),
+            commanded_turn_rate,
+        )
+        if lateral.length() > 1e-6:
+            turn_target = (forward + lateral.normalized() * 0.8).normalized(forward)
+            new_forward = rotate_towards(
+                forward, turn_target, allowed_turn_rate * dt
             )
+        else:
+            new_forward = forward
+
+        drag = self._drag_acceleration()
+        drag_along = drag.dot(forward)
+        new_speed = clamp(
+            speed + (axial + drag_along) * dt,
+            0.0,
+            self.spec.max_speed,
+        )
+        self.velocity = new_forward * new_speed
+        self.acceleration = (self.velocity - old_velocity) / max(dt, 1e-6)
+        self.position = self.position + self.velocity * dt
+        self.thrust_vector = forward * max(0.0, axial)
+        self.engine_output = clamp(
+            max(0.0, axial) / max(0.001, self.spec.max_accel),
+            0.0,
+            1.0,
+        )
+
+        target_yaw = math.atan2(new_forward.x, new_forward.z)
+        target_pitch = -math.asin(clamp(new_forward.y, -1.0, 1.0))
+        turn_axis = forward.cross(new_forward)
+        bank_limit = math.radians(72.0 if self.spec.flight_model == "fixed_wing" else 28.0)
+        target_roll = clamp(-turn_axis.y / max(dt, 1e-6), -bank_limit, bank_limit)
+        alpha = 1.0 - math.exp(-7.0 * dt)
+        self.orientation = Vec3(
+            lerp(self.orientation.x, target_pitch, alpha),
+            lerp_angle(self.orientation.y, target_yaw, alpha),
+            lerp(self.orientation.z, target_roll, alpha),
+        )
 
 
 def lerp_angle(start: float, end: float, amount: float) -> float:

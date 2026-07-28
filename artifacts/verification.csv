@@ -1,7 +1,7 @@
 scenario,identity,hit,hit_time_s,minimum_range_m,range_mae_m,range_rmse_m,samples
-steady,True,True,7.883,0.0,12.468,20.118,62
-weave,True,True,16.267,0.0,3.354,8.335,134
-evasive,True,True,7.8,0.0,8.425,13.717,61
-braking,True,True,7.9,0.0,12.288,20.134,62
-rotating,True,True,7.333,0.0,4.351,6.83,57
-rocket_attack,True,True,3.0,0.0,5.721,8.635,22
+steady,True,True,6.85,0.0,10.416,17.181,53
+weave,True,True,6.983,0.0,4.475,7.23,54
+evasive,True,True,11.35,0.0,3.001,5.937,92
+braking,True,True,6.3,0.0,11.094,17.892,49
+rotating,True,True,6.783,0.0,4.236,6.805,53
+rocket_attack,True,True,2.267,0.0,6.791,9.748,16

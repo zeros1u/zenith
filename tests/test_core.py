@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import unittest
 
+from app import DISPLAY_OPTIONS, SENSOR_OPTIONS, WINDOW_SIZE
 from zenith.camera import (
     CameraModel,
     detect_box,
@@ -11,7 +12,7 @@ from zenith.camera import (
     range_from_apparent_size,
 )
 from zenith.guidance import TargetTrack, build_prediction_ovals
-from zenith.math3d import Vec3, basis_from_forward
+from zenith.math3d import Vec3, angle_between, basis_from_forward
 from zenith.meshes import get_mesh
 from zenith.models import DRONE_SPECS, ROCKET_SPECS, TARGET_SPECS
 from zenith.physics import DroneState, maximum_travel_distance
@@ -26,6 +27,14 @@ class VectorTests(unittest.TestCase):
         self.assertAlmostEqual(forward.length(), 1.0)
         self.assertAlmostEqual(right.dot(up), 0.0, places=7)
         self.assertAlmostEqual(right.dot(forward), 0.0, places=7)
+
+
+class InterfaceConfigTests(unittest.TestCase):
+    def test_default_window_is_smaller_and_independent_from_sensor_resolution(self) -> None:
+        self.assertEqual(WINDOW_SIZE, (1050, 700))
+        self.assertEqual(DISPLAY_OPTIONS[0], WINDOW_SIZE)
+        self.assertNotIn(WINDOW_SIZE, SENSOR_OPTIONS)
+        self.assertEqual(SENSOR_OPTIONS[1], (1920, 1080))
 
 
 class CameraTests(unittest.TestCase):
@@ -68,6 +77,99 @@ class GuidanceTests(unittest.TestCase):
         self.assertTrue(all(len(oval.extremes) == 4 for oval in ovals))
         self.assertTrue(all(len(oval.reachable) == 4 for oval in ovals))
 
+    def test_oval_plane_is_perpendicular_to_camera_view(self) -> None:
+        interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
+        view = Vec3(1.0, 0.25, 2.0).normalized()
+        ovals = build_prediction_ovals(
+            Vec3(0, 35, 150),
+            Vec3(6, 0, 20),
+            DRONE_SPECS[0],
+            interceptor,
+            view,
+        )
+        for oval in ovals:
+            self.assertAlmostEqual(oval.plane_normal.dot(view), 1.0, places=7)
+            for edge in oval.extremes:
+                self.assertAlmostEqual(
+                    (edge - oval.center).dot(oval.plane_normal),
+                    0.0,
+                    places=7,
+                )
+            self.assertTrue(oval.contains_projected(oval.ballistic_center))
+
+    def test_conservative_envelope_contains_allowed_acceleration_samples(self) -> None:
+        interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
+        view = Vec3(1.0, 0.25, 2.0).normalized()
+        position = Vec3(0, 35, 150)
+        velocity = Vec3(6, 0, 20)
+        horizon = 2.0
+        oval = build_prediction_ovals(
+            position, velocity, DRONE_SPECS[1], interceptor, view
+        )[1]
+        forward = velocity.normalized()
+        lateral_a, lateral_b, _ = basis_from_forward(forward)
+        ballistic = position + velocity * horizon
+        for axial in (-DRONE_SPECS[1].brake_accel, 0.0, DRONE_SPECS[1].max_accel):
+            for index in range(24):
+                angle = math.tau * index / 24
+                lateral = (
+                    lateral_a * math.cos(angle) + lateral_b * math.sin(angle)
+                ) * DRONE_SPECS[1].lateral_accel
+                endpoint = (
+                    ballistic
+                    + (forward * axial + lateral) * (0.5 * horizon**2)
+                )
+                self.assertTrue(oval.contains_projected(endpoint, 1e-7))
+
+        multirotor = DRONE_SPECS[0]
+        multirotor_oval = build_prediction_ovals(
+            position, velocity, multirotor, interceptor, view
+        )[1]
+        for elevation_index in range(13):
+            elevation = -math.pi * 0.5 + math.pi * elevation_index / 12
+            for azimuth_index in range(24):
+                azimuth = math.tau * azimuth_index / 24
+                acceleration = Vec3(
+                    math.cos(azimuth)
+                    * math.cos(elevation)
+                    * multirotor.lateral_accel,
+                    math.sin(elevation) * multirotor.max_accel,
+                    math.sin(azimuth)
+                    * math.cos(elevation)
+                    * multirotor.lateral_accel,
+                )
+                endpoint = ballistic + acceleration * (0.5 * horizon**2)
+                self.assertTrue(
+                    multirotor_oval.contains_projected(endpoint, 1e-7)
+                )
+
+
+class PropulsionTests(unittest.TestCase):
+    def test_fixed_wing_turn_is_rate_limited_and_thrust_is_axial(self) -> None:
+        spec = DRONE_SPECS[3]
+        state = DroneState(spec, Vec3(0, 30, 0), Vec3(0, 0, 30))
+        previous_forward = state.velocity.normalized()
+        dt = 1.0 / 60.0
+        state.integrate(Vec3(100, 0, 12), dt)
+        new_forward = state.velocity.normalized()
+        allowed_rate = min(
+            math.radians(spec.max_turn_rate_deg),
+            spec.lateral_accel / 30.0,
+        )
+        self.assertLessEqual(
+            angle_between(previous_forward, new_forward),
+            allowed_rate * dt + 1e-8,
+        )
+        self.assertAlmostEqual(state.thrust_vector.x, 0.0, places=7)
+        self.assertGreater(state.thrust_vector.z, 0.0)
+
+    def test_rocket_cannot_apply_reverse_engine_thrust(self) -> None:
+        spec = ROCKET_SPECS[0]
+        state = DroneState(spec, Vec3(0, 30, 0), Vec3(0, 0, 60))
+        state.integrate(Vec3(0, 0, -100), 1.0 / 60.0)
+        self.assertAlmostEqual(state.thrust_vector.length(), 0.0, places=7)
+        self.assertEqual(state.engine_output, 0.0)
+
 
 class ProjectTests(unittest.TestCase):
     def test_five_expandable_models_exist(self) -> None:
@@ -92,6 +194,32 @@ class ProjectTests(unittest.TestCase):
         for _ in range(60):
             sim.step()
         self.assertTrue(sim.identity_confirmed)
+
+    def test_loss_disables_guidance_until_visual_reacquisition(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
+        for _ in range(120):
+            sim.step()
+            if sim.identity_confirmed and sim.guidance is not None:
+                break
+        self.assertTrue(sim.visual_locked)
+        self.assertIsNotNone(sim.guidance)
+
+        sim.toggle_sensor_occlusion()
+        sim.step()
+        self.assertFalse(sim.visual_locked)
+        self.assertIsNone(sim.guidance)
+        self.assertIn("SEARCHING", sim.status)
+
+        for _ in range(8):
+            sim.step()
+        sim.toggle_sensor_occlusion()
+        for _ in range(120):
+            sim.step()
+            if sim.visual_locked and sim.guidance is not None:
+                break
+        self.assertTrue(sim.visual_locked)
+        self.assertIsNotNone(sim.guidance)
+        self.assertGreaterEqual(sim.reacquisition_count, 1)
 
     def test_default_scenarios_intercept(self) -> None:
         for scenario, _ in SCENARIOS:

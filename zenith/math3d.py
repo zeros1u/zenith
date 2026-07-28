@@ -88,6 +88,32 @@ def lerp_vec(a: Vec3, b: Vec3, amount: float) -> Vec3:
     return a * (1.0 - t) + b * t
 
 
+def angle_between(a: Vec3, b: Vec3) -> float:
+    """Smallest unsigned angle between two vectors, in radians."""
+    first = a.normalized()
+    second = b.normalized()
+    if first.length_squared() < EPSILON or second.length_squared() < EPSILON:
+        return 0.0
+    return math.acos(clamp(first.dot(second), -1.0, 1.0))
+
+
+def rotate_towards(current: Vec3, target: Vec3, maximum_angle: float) -> Vec3:
+    """Rotate a unit direction toward another without exceeding an angle."""
+    start = current.normalized(WORLD_FORWARD)
+    end = target.normalized(start)
+    angle = angle_between(start, end)
+    if angle <= maximum_angle or angle < EPSILON:
+        return end
+    # Normalized linear interpolation is stable here and also handles the
+    # almost-opposite case by supplying a deterministic perpendicular route.
+    if start.dot(end) < -0.9999:
+        axis = WORLD_UP if abs(start.dot(WORLD_UP)) < 0.9 else WORLD_RIGHT
+        end = axis.cross(start).normalized(WORLD_RIGHT)
+        angle = math.pi * 0.5
+    amount = clamp(maximum_angle / angle, 0.0, 1.0)
+    return lerp_vec(start, end, amount).normalized(start)
+
+
 def basis_from_forward(forward: Vec3) -> tuple[Vec3, Vec3, Vec3]:
     """Return right, up and forward camera axes."""
     fwd = forward.normalized(WORLD_FORWARD)

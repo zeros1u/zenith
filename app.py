@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import csv
 from datetime import datetime
 import json
@@ -29,13 +30,39 @@ from zenith.rendering import (
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
 
 
-WINDOW_SIZE = (1280, 800)
+DISPLAY_OPTIONS = (
+    (1050, 700),
+    (1152, 720),
+    (1280, 800),
+)
+WINDOW_SIZE = DISPLAY_OPTIONS[0]
+MINIMUM_WINDOW_SIZE = (1000, 680)
 FIXED_STEP = 1.0 / 60.0
 SENSOR_OPTIONS = (
     (1280, 720),
     (1920, 1080),
     (3840, 2160),
 )
+
+
+def enable_windows_dpi_awareness() -> bool:
+    """Keep requested client pixels physical when Windows display scaling is >100%."""
+    if os.name != "nt":
+        return False
+    try:
+        # Per-monitor V2 must be set before pygame creates its first window.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return True
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return True
+        except (AttributeError, OSError):
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+                return True
+            except (AttributeError, OSError):
+                return False
 
 
 class NumericField:
@@ -75,6 +102,12 @@ class SetupScreen:
         self.target_index = 0
         self.scenario_index = 2
         self.sensor_index = 1
+        self.display_index = min(
+            range(len(DISPLAY_OPTIONS)),
+            key=lambda index: abs(DISPLAY_OPTIONS[index][0] - size[0])
+            + abs(DISPLAY_OPTIONS[index][1] - size[1]),
+        )
+        self.display_request: tuple[int, int] | None = None
         self.own_fields = [
             NumericField("X", 0),
             NumericField("Y", 28),
@@ -104,7 +137,10 @@ class SetupScreen:
         fill = (14, 38, 49) if selected else (9, 27, 37)
         pygame.draw.rect(surface, fill, rect)
         pygame.draw.rect(surface, color, rect, 2 if selected else 1)
-        rendered = self.bold.render(text, True, accent if selected else WHITE)
+        font = self.bold
+        if font.size(text)[0] > rect.width - 12:
+            font = self.small
+        rendered = font.render(text, True, accent if selected else WHITE)
         surface.blit(
             rendered,
             (
@@ -201,6 +237,19 @@ class SetupScreen:
         pygame.draw.circle(surface, (17, 52, 63), (width - 120, 80), 110, 1)
 
         surface.blit(self.title.render("ZENITH", True, WHITE), (48, 30))
+        display_x = width - 424
+        surface.blit(
+            self.small.render("WINDOW SIZE // CAMERA SENSOR IS SEPARATE", True, MUTED),
+            (display_x, 20),
+        )
+        for index, resolution in enumerate(DISPLAY_OPTIONS):
+            self._button(
+                surface,
+                f"display_{index}",
+                pygame.Rect(display_x + index * 126, 43, 116, 34),
+                f"{resolution[0]} × {resolution[1]}",
+                index == self.display_index,
+            )
         surface.blit(
             self.subtitle.render(
                 "VISION-ONLY INTERCEPTION // SIMULATION CONFIGURATION",
@@ -216,8 +265,8 @@ class SetupScreen:
         left = (width - content_width) // 2
         card_gap = 22
         card_width = (content_width - card_gap) // 2
-        card_y = 158
-        card_height = 200
+        card_y = 142
+        card_height = 190
         self._draw_model_card(
             surface,
             pygame.Rect(left, card_y, card_width, card_height),
@@ -275,7 +324,7 @@ class SetupScreen:
             error_text = self.font.render(self.error, True, RED)
             surface.blit(error_text, (launch_rect.right - error_text.get_width(), launch_rect.bottom + 8))
 
-        footer_y = height - 58
+        footer_y = height - 38
         pygame.draw.line(surface, (39, 76, 89), (left, footer_y - 10), (left + content_width, footer_y - 10))
         footer = (
             "Five playable drones + two rocket threats • place both vehicles • no radar/lidar/rangefinder • "
@@ -311,9 +360,17 @@ class SetupScreen:
                 self.scenario_index = int(key.split("_")[1])
             elif key.startswith("sensor_"):
                 self.sensor_index = int(key.split("_")[1])
+            elif key.startswith("display_"):
+                self.display_index = int(key.split("_")[1])
+                self.display_request = DISPLAY_OPTIONS[self.display_index]
             elif key == "launch":
                 return self.build_config()
         return None
+
+    def consume_display_request(self) -> tuple[int, int] | None:
+        request = self.display_request
+        self.display_request = None
+        return request
 
     def _sync_target_scenario(self) -> None:
         is_rocket = TARGET_SPECS[self.target_index].vehicle_type == "rocket"
@@ -376,7 +433,7 @@ def run_headless(args: argparse.Namespace) -> int:
         pygame.image.save(surface, output)
 
     result = {
-        "version": "prototype-01",
+        "version": "prototype-02",
         "scenario": args.scenario,
         "steps": steps,
         "simulation_time_s": round(simulation.time_s, 3),
@@ -431,6 +488,7 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
 
 
 def run_interactive() -> int:
+    enable_windows_dpi_awareness()
     pygame.init()
     pygame.display.set_caption("ZENITH — Vision-only Interception")
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
@@ -454,11 +512,26 @@ def run_interactive() -> int:
             if event.type == pygame.QUIT:
                 running = False
                 continue
+            if event.type == pygame.VIDEORESIZE:
+                requested = (
+                    max(MINIMUM_WINDOW_SIZE[0], event.w),
+                    max(MINIMUM_WINDOW_SIZE[1], event.h),
+                )
+                if requested != screen.get_size():
+                    screen = pygame.display.set_mode(requested, pygame.RESIZABLE)
+                setup.size = screen.get_size()
+                continue
             if app_state == "setup":
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
                     continue
                 config = setup.handle_event(event)
+                requested_display = setup.consume_display_request()
+                if requested_display is not None:
+                    screen = pygame.display.set_mode(
+                        requested_display, pygame.RESIZABLE
+                    )
+                    setup.size = requested_display
                 if config is not None:
                     current_config = config
                     simulation = InterceptionSimulation(config)
@@ -505,6 +578,8 @@ def run_interactive() -> int:
                 elif event.key == pygame.K_e:
                     exported = export_telemetry(simulation)
                     simulation._event(f"Telemetry exported: {exported.name}")
+                elif event.key == pygame.K_o:
+                    simulation.toggle_sensor_occlusion()
 
         if app_state == "setup":
             setup.draw(screen)

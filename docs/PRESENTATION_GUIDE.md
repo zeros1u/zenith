@@ -21,7 +21,9 @@ Explain that the image center gives bearing, while known size gives scale. `Dx`,
 Point to the 1, 2, 3, and 5 second ovals:
 
 - each oval represents positions allowed by the target's known acceleration and speed;
-- the four extreme points are calculated separately, so the oval need not be symmetric;
+- every oval lies exactly in the plane perpendicular to our current camera view;
+- the border is inflated from propulsion-specific acceleration support, so the target's projected position cannot escape it under the stated limits;
+- the four extreme points are calculated separately and tested for our reachability;
 - green means our drone can arrive before the target; red means it cannot;
 - if all four extremes are reachable, the center is a safe guidance objective;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
@@ -33,9 +35,11 @@ Point out:
 
 - identity begins as `UNKNOWN / QUERYING`;
 - pixel size, focal length, estimated range, and uncertainty are visible;
-- `VERIFY TRUE / ERR` is labeled verification-only;
+- `TRUE / ERROR` is labeled verification-only;
 - the exact target coordinate never enters the guidance function;
 - pressing `E` exports the camera estimate and truth comparison for every sampled frame.
+
+Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The gimbal scans from the last seen bearing without using target truth. Press `O` again; only a new image detection can reacquire lock and restart guidance.
 
 ### 5. Demonstrate robustness — 60 seconds
 
@@ -73,11 +77,15 @@ The target occupies only a few pixels. A one-pixel width change can represent te
 
 ### “Why are the prediction regions ovals?”
 
-The target's bounded acceleration spreads its future position in the plane perpendicular to the line of sight. Four maximum-maneuver endpoints define a compact non-symmetric approximation that can be recomputed at 60 Hz.
+The target's bounded acceleration spreads its future projected position in the plane perpendicular to the current camera axis. Directional positive/negative acceleration supports give component bounds. The displayed ellipse circumscribes those bounds, making it a conservative containment border recomputed at 60 Hz.
 
 ### “Does checking four points prove the whole oval is reachable?”
 
-It is valid for this prototype's convex, acceleration-bounded approximation and conservative travel reserve. A production system would use a higher-resolution reachable set and formal uncertainty propagation.
+The four checks prove whether our drone can reach the four marked extremes used by this software's decision rule. Separately, the oval's conservative support construction proves containment of the target's projected acceleration-bounded set. A production system would add full 3D range uncertainty and formal actuator/wind uncertainty.
+
+### “Can an aircraft accelerate in any direction in this simulation?”
+
+No. Multirotors must slew and tilt their thrust vector. Fixed-wing engines push only along the nose; turns come from bounded aerodynamic lateral force. Rockets have forward thrust and limited steering but cannot command reverse thrust. The guidance request is always filtered through that vehicle-specific physics layer.
 
 ### “What happens when the target rotates?”
 
@@ -102,7 +110,7 @@ The prototype uses continuous acceleration, drag, and airbrake forces because th
 3. Start and wait for signal confirmation.
 4. Press `V` once for chase view, then again for tactical overview.
 5. Press `A`; discuss range degradation and resolution.
-6. Close analysis with `A`, return onboard with `V`, and press `-` for slow motion.
-7. Let the collision complete.
+6. Close analysis with `A`, return onboard with `V`, then press `O` to prove guidance loss and `O` again to demonstrate reacquisition.
+7. Press `-` for slow motion and let the collision complete.
 8. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`.
 9. Press `E` to export the proof data.
