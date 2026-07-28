@@ -29,6 +29,7 @@ RED = (255, 91, 99)
 WHITE = (224, 238, 244)
 MUTED = (130, 156, 170)
 PANEL = (5, 16, 25, 238)
+INFO_PAGE_COUNT = 4
 
 
 @dataclass(slots=True)
@@ -194,7 +195,7 @@ class WorldRenderer:
             base = ViewCamera(
                 position,
                 (midpoint - position).normalized(line),
-                "TACTICAL OVERVIEW",
+                "SPECTATOR / TACTICAL",
             )
 
         if not self.free_look_active:
@@ -366,8 +367,8 @@ class WorldRenderer:
     ) -> tuple[int, int, int]:
         if oval.fully_reachable:
             return GREEN
-        if any(oval.reachable):
-            return AMBER
+        # The decision rule requires all four extremes. A partial oval is
+        # therefore unavailable, not "almost selected."
         return RED
 
     def _draw_predictions(
@@ -401,16 +402,27 @@ class WorldRenderer:
                     )
             center_projected = self._project(oval.center, camera, *surface.get_size())
             if center_projected:
-                label = (
-                    f"SELECTED +{oval.horizon_s:.0f}s"
-                    if selected
-                    else f"+{oval.horizon_s:.0f}s"
-                )
+                reachable_count = sum(oval.reachable)
+                if selected:
+                    label = f"SELECTED +{oval.horizon_s:.0f}s  4/4"
+                elif oval.fully_reachable:
+                    label = f"+{oval.horizon_s:.0f}s  REACHABLE 4/4"
+                else:
+                    label = (
+                        f"+{oval.horizon_s:.0f}s  BLOCKED "
+                        f"{reachable_count}/4"
+                    )
                 text = self.font_tiny.render(label, True, draw_color)
                 surface.blit(text, (center_projected[0] + 5, center_projected[1] + 2))
 
         ballistic_points = [
-            sim.track.position + sim.track.velocity * (step * 0.5)
+            sim.track.position
+            + sim.track.velocity * (step * 0.5)
+            - sim.guidance.ovals[0].plane_normal
+            * (
+                sim.track.velocity
+                * (step * 0.5)
+            ).dot(sim.guidance.ovals[0].plane_normal)
             for step in range(1, 11)
         ] if sim.track.position else []
         for point in ballistic_points:
@@ -727,25 +739,30 @@ class WorldRenderer:
             x += key_width + 5
 
         flight_model = controlled.spec.flight_model
+        powered = controlled.engine_enabled
+        wingborne = controlled.spec.lift_efficiency > 0.0
         authority = (
-            ("FWD", GREEN),
+            ("FWD", GREEN if powered else RED),
             (
                 "REV",
                 GREEN
-                if flight_model in ("multirotor", "vectored_vtol")
+                if powered and flight_model in ("multirotor", "vectored_vtol")
                 else AMBER if flight_model == "fixed_wing" else RED,
             ),
             (
                 "TURN",
                 GREEN
-                if flight_model in ("multirotor", "vectored_vtol")
-                else AMBER,
+                if powered and flight_model in ("multirotor", "vectored_vtol")
+                else AMBER
+                if flight_model in ("fixed_wing", "rocket")
+                or (flight_model == "vectored_vtol" and wingborne)
+                else RED,
             ),
             (
                 "VERT",
                 GREEN
-                if flight_model in ("multirotor", "vectored_vtol")
-                else AMBER,
+                if powered and flight_model in ("multirotor", "vectored_vtol")
+                else AMBER if wingborne else RED,
             ),
             (
                 "BRAKE",
@@ -778,9 +795,12 @@ class WorldRenderer:
         panel.blit(
             self.font_tiny.render(
                 f"ENGINE REQ/ACT {sim.manual_command.requested_engine*100:3.0f}"
-                f"/{controlled.engine_output*100:3.0f}%   BRAKE {brake_text}",
+                f"/{controlled.engine_output*100:3.0f}% "
+                f"{'ON' if controlled.engine_enabled else 'CUT'}  BRAKE {brake_text}",
                 True,
-                AMBER if controlled.airbrake else MUTED,
+                RED
+                if not controlled.engine_enabled
+                else AMBER if controlled.airbrake else MUTED,
             ),
             (12, 121),
         )
@@ -825,7 +845,7 @@ class WorldRenderer:
 
         surface.blit(
             self.font_tiny.render(
-                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [RMB] CAPTURE LOOK   [SHIFT+RMB] ROLL   [C] CENTER   [H] HELP",
+                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [F3] SPECTATOR   [RMB] LOOK   [F1] INFO   [H] KEYS",
                 True,
                 MUTED,
             ),
@@ -890,7 +910,13 @@ class WorldRenderer:
             ("VELOCITY XYZ", f"{own.velocity.x:+.1f}/{own.velocity.y:+.1f}/{own.velocity.z:+.1f}"),
             ("TOTAL SPEED", f"{own.velocity.length():.2f} / {own.spec.max_speed:.0f} m/s"),
             ("ACCELERATION", f"{own.acceleration.length():.2f} m/s²"),
-            ("ENGINE OUTPUT", f"{own.engine_output*100:.0f}%"),
+            (
+                "ENGINE / LIFT",
+                f"{'ON' if own.engine_enabled else 'CUT'} "
+                f"{own.engine_output*100:.0f}% / "
+                f"{own.lift_acceleration.length():.1f} m/sÂ²",
+                RED if not own.engine_enabled else WHITE,
+            ),
         ]
 
         if sim.hit:
@@ -1060,6 +1086,272 @@ class WorldRenderer:
 
         surface.blit(overlay, (0, 0))
 
+    def draw_info(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+        page: int,
+    ) -> None:
+        """Four-page in-application reference for the whole prototype."""
+        page = page % INFO_PAGE_COUNT
+        width, height = surface.get_size()
+        overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+        overlay.fill((2, 8, 14, 242))
+        card = pygame.Rect(width // 2 - 470, height // 2 - 310, 940, 620)
+        pygame.draw.rect(overlay, (7, 22, 32), card)
+        pygame.draw.rect(overlay, CYAN, card, 1)
+
+        page_titles = (
+            "SENSOR, COORDINATES, AND READOUTS",
+            "PREDICTION OVALS AND GUIDANCE",
+            "GRAVITY, AERODYNAMICS, AND CONTROL",
+            "LOCK LOSS, CAMERAS, AND VERIFICATION",
+        )
+        title = f"FULL SYSTEM INFO {page + 1}/{INFO_PAGE_COUNT} // {page_titles[page]}"
+        overlay.blit(
+            self.font_title.render(title, True, WHITE),
+            (card.x + 26, card.y + 20),
+        )
+        navigation = self.font_tiny.render(
+            "[F1] CLOSE   [LEFT/RIGHT or PAGE UP/DOWN] CHANGE PAGE",
+            True,
+            MUTED,
+        )
+        overlay.blit(
+            navigation,
+            (card.right - navigation.get_width() - 24, card.y + 54),
+        )
+        pygame.draw.line(
+            overlay,
+            (42, 92, 103),
+            (card.x + 24, card.y + 76),
+            (card.right - 24, card.y + 76),
+            1,
+        )
+
+        estimated_range = (
+            f"{sim.range_estimate.distance_m:.2f} +/- "
+            f"{sim.range_estimate.sigma_m:.2f} m"
+            if sim.range_estimate is not None
+            else "unavailable without a current known-model detection"
+        )
+        current_guidance = (
+            f"{sim.guidance.mode}; aim "
+            f"({sim.guidance.aim_point.x:+.1f}, "
+            f"{sim.guidance.aim_point.y:+.1f}, "
+            f"{sim.guidance.aim_point.z:+.1f})"
+            if sim.guidance is not None
+            else "disabled: no guidance-quality visual observation"
+        )
+        oval_rows = []
+        if sim.guidance is not None:
+            for oval in sim.guidance.ovals:
+                selected = (
+                    sim.guidance.mode == "OVAL CENTER"
+                    and sim.guidance.selected_horizon_s is not None
+                    and abs(
+                        sim.guidance.selected_horizon_s - oval.horizon_s
+                    )
+                    < 0.02
+                )
+                oval_rows.append(
+                    f"{oval.horizon_s:.0f}s: radii "
+                    f"{oval.radius_x:.1f}/{oval.radius_y:.1f} m, "
+                    f"{sum(oval.reachable)}/4 reachable"
+                    f"{' [SELECTED]' if selected else ''}"
+                )
+        else:
+            oval_rows.append("No live ovals: visual guidance is unavailable.")
+
+        if page == 0:
+            sections = (
+                (
+                    "SENSOR PIPELINE",
+                    [
+                        "The synthetic monocular camera first returns only a 2D box, bearing, apparent pixel size, and confidence.",
+                        "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
+                        "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
+                        f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
+                        f"Current camera estimate: {estimated_range}",
+                    ],
+                ),
+                (
+                    "CAMERA-RELATIVE AXES",
+                    [
+                        "X is target left/right in the image.",
+                        "Y is target up/down in the image.",
+                        "Z is the optical line from our camera toward the target.",
+                        "World coordinates exist for simulation and collision, but target truth never enters range or guidance.",
+                    ],
+                ),
+                (
+                    "THE FOUR BOTTOM PANELS",
+                    [
+                        "TARGET VEHICLE: signal-resolved dimensions and maneuver limits.",
+                        "CALCULATIONS: measured pixels, confidence, range uncertainty, and Dx/Dy/Dz.",
+                        "OUR DRONE: integrated position, velocity, acceleration, engine state, and lift.",
+                        "RELATIVE: image-track relative velocity, closing time, chosen guidance, reachability, and verification-only truth error.",
+                    ],
+                ),
+                (
+                    "WHAT IS VERIFIABLE",
+                    [
+                        f"Sensor: {sim.config.camera.width_px} x {sim.config.camera.height_px}, focal length {sim.config.camera.focal_px:.1f} px.",
+                        f"Detected span: {max(sim.detection.width_px, sim.detection.height_px):.2f} px.",
+                        f"True range: {sim.true_range_m:.2f} m [verification only].",
+                        "F2 opens the resolution/error graph. F5 exports every sampled estimate and its marked truth comparison.",
+                    ],
+                ),
+            )
+        elif page == 1:
+            sections = (
+                (
+                    "WHAT EACH OVAL MEANS",
+                    [
+                        "The 1, 2, 3, and 5 second ellipses bound the target's allowed projected acceleration at those future times.",
+                        "Every ellipse is in the single plane through the target and perpendicular to the current sensor optical axis.",
+                        "Therefore the target, every oval center, every extreme, and every unchanged-trajectory dot have the same measured Z depth.",
+                        "The center is the average of the four asymmetric extreme points, not an arbitrary screen position.",
+                    ],
+                ),
+                (
+                    "COLOR AND FOUR-POINT RULE",
+                    [
+                        "GREEN border: all 4 extreme points are reachable; this oval may be selected.",
+                        "RED border: at least 1 required extreme is unreachable; the label states the exact reachable count.",
+                        "Individual extreme markers are green/red so the failing direction remains visible.",
+                        "AMBER dots are the unchanged-velocity trajectory, not a partially valid oval.",
+                    ],
+                ),
+                (
+                    "LIVE OVAL CHECK",
+                    oval_rows,
+                ),
+                (
+                    "HOW THE AIM IS CHOSEN",
+                    [
+                        "The solver checks 5s, 3s, 2s, then 1s and aims at the largest center whose four extremes all pass.",
+                        "If none pass, it aims at the smallest oval's unchanged-trajectory point.",
+                        "Near contact it switches to a camera-track terminal intercept instead of chasing a large oval.",
+                        f"Current guidance: {current_guidance}",
+                    ],
+                ),
+            )
+        elif page == 2:
+            sections = (
+                (
+                    "GRAVITY AND FORCE MODEL",
+                    [
+                        "Gravity is always 9.81 m/s2 downward for every airborne vehicle.",
+                        "Rotorcraft hover only because their powered thrust explicitly counters gravity; cutting the engine removes that support.",
+                        "Drag grows with speed. Airbrakes add continuous opposing acceleration instead of deleting speed instantly.",
+                        "X cuts or restarts the currently controlled vehicle's engine.",
+                    ],
+                ),
+                (
+                    "WINGS AND ROCKETS",
+                    [
+                        "Fixed wings generate lift perpendicular to their flight path. Lift grows with airflow, weakens below stall speed, and vanishes in a vertical fall.",
+                        "An engine-off wing therefore glides and loses altitude more slowly while moving forward, then sinks faster as drag removes airspeed.",
+                        "Rockets receive gravity and drag but no wing lift, reverse thrust, or airbrake.",
+                        "The model is deliberately simplified and exposes its stall speed and lift efficiency rather than claiming CFD fidelity.",
+                    ],
+                ),
+                (
+                    "LIVE FORCE READOUT",
+                    [
+                        f"OUR {sim.interceptor.spec.code}: engine {'ON' if sim.interceptor.engine_enabled else 'CUT'}, output {sim.interceptor.engine_output*100:.0f}%, lift {sim.interceptor.lift_acceleration.length():.2f}, drag {sim.interceptor.drag_acceleration.length():.2f} m/s2.",
+                        f"TARGET {sim.target.spec.code}: engine {'ON' if sim.target.engine_enabled else 'CUT'}, output {sim.target.engine_output*100:.0f}%, lift {sim.target.lift_acceleration.length():.2f}, drag {sim.target.drag_acceleration.length():.2f} m/s2.",
+                        f"OUR stall/lift factor: {sim.interceptor.spec.stall_speed:.1f} m/s / {sim.interceptor.spec.lift_efficiency:.2f}.",
+                        f"TARGET stall/lift factor: {sim.target.spec.stall_speed:.1f} m/s / {sim.target.spec.lift_efficiency:.2f}.",
+                    ],
+                ),
+                (
+                    "PLAYER AUTHORITY",
+                    [
+                        "Tab cycles AUTO -> OUR DRONE -> TARGET -> AUTO.",
+                        "W/S request forward/reverse or deceleration; A/D turn; Q/E change and then hold altitude; Shift requests full authority; Ctrl uses an available airbrake.",
+                        "Commands still pass through thrust direction, stall/lift, turn rate, speed, drag, gravity, and the two-metre floor.",
+                        "When our drone is manual, the oval solution remains visible only as an advisory.",
+                    ],
+                ),
+            )
+        else:
+            sections = (
+                (
+                    "WHEN VISUAL LOCK IS LOST",
+                    [
+                        "Range, target track, guidance, and ovals become invalid immediately.",
+                        "The last filtered image-bearing motion is extrapolated for at most 1.5 seconds.",
+                        "After that, the camera widens a horizontal scan while staying within +/-35 degrees of the world horizon.",
+                        "Autonomous body search turns horizontally and holds the altitude recorded at loss.",
+                        "Only a new detector result can reacquire; target truth is never used to point the search.",
+                    ],
+                ),
+                (
+                    "CAMERA AND SPECTATOR MODES",
+                    [
+                        "V cycles onboard sensor, chase, and spectator/tactical views.",
+                        "F3 jumps directly to the spectator view, which watches both vehicles and is not attached to either pilot.",
+                        "Right mouse captures unlimited presentation free-look; Shift+right mouse rolls; C centers.",
+                        "Presentation free-look never changes the sensor, oval plane, detection, or guidance calculation.",
+                    ],
+                ),
+                (
+                    "PROOF BOUNDARY",
+                    [
+                        "Target truth is used only to render the synthetic image, resolve physical contact, and compute explicitly labeled verification error.",
+                        "The generic detector and signal lookup are deterministic simulation adapters, not deployed YOLO/DINO or radio hardware.",
+                        "The meshes and aerodynamics are presentation-grade prototypes; production work needs calibrated cameras, wind, latency, uncertainty, and hardware tests.",
+                        "The automated suite verifies plane geometry, actual ellipses, center selection, colors, gravity/glide, engine cut, sensors, propulsion, and all scenarios.",
+                    ],
+                ),
+                (
+                    "FAST DEMO KEYS",
+                    [
+                        "F1 info | H controls | F2 analysis | F3 spectator | F5 CSV",
+                        "O camera occlusion | Space pause | +/- time | R restart | N setup",
+                        "Tab authority | X engine | W/S A/D Q/E flight | Shift full | Ctrl brake",
+                        f"Current status: {sim.status}",
+                    ],
+                ),
+            )
+
+        column_width = 412
+        column_x = (card.x + 28, card.x + 492)
+        for section_index, (heading, lines) in enumerate(sections):
+            column = section_index // 2
+            section_in_column = section_index % 2
+            x = column_x[column]
+            y = card.y + (96 if section_in_column == 0 else 345)
+            overlay.blit(self.font_bold.render(heading, True, AMBER), (x, y))
+            y += 27
+            for raw_line in lines:
+                words = raw_line.split()
+                wrapped: list[str] = []
+                current = ""
+                for word in words:
+                    candidate = f"{current} {word}".strip()
+                    if (
+                        current
+                        and self.font_tiny.size(candidate)[0] > column_width
+                    ):
+                        wrapped.append(current)
+                        current = word
+                    else:
+                        current = candidate
+                if current:
+                    wrapped.append(current)
+                for line in wrapped:
+                    overlay.blit(
+                        self.font_tiny.render(line, True, WHITE),
+                        (x, y),
+                    )
+                    y += 17
+                y += 5
+
+        surface.blit(overlay, (0, 0))
+
     def draw_help(self, surface: pygame.Surface) -> None:
         width, height = surface.get_size()
         overlay = pygame.Surface((width, height), pygame.SRCALPHA)
@@ -1074,11 +1366,13 @@ class WorldRenderer:
         presentation_items = [
             ("SPACE", "pause / continue the 60 Hz simulation"),
             ("+ / -", "increase / decrease time scale"),
-            ("V", "cycle onboard, chase, and tactical cameras"),
+            ("V", "cycle onboard, chase, and spectator cameras"),
             ("RMB HOLD", "capture mouse for unlimited free look"),
             ("SHIFT+RMB", "roll the presentation camera"),
             ("C", "center the free-look camera"),
+            ("F1", "open the full four-page system reference"),
             ("F2", "open range-error and resolution analysis"),
+            ("F3", "jump directly to spectator / tactical view"),
             ("F5", "export verification telemetry to CSV"),
             ("R", "restart the current simulation"),
             ("N", "return to setup and place new drones"),
@@ -1093,6 +1387,7 @@ class WorldRenderer:
             ("Q / E", "descend / climb; release to hold altitude"),
             ("SHIFT", "request full available maneuver authority"),
             ("CTRL", "airbrake (unavailable on rockets)"),
+            ("X", "cut / restart the controlled vehicle engine"),
             ("RMB", "mouse look suppresses flight-key input"),
             ("GREEN", "direct authority"),
             ("AMBER", "turn / braking limited"),
@@ -1110,7 +1405,7 @@ class WorldRenderer:
         for key, description in presentation_items:
             overlay.blit(self.font_bold.render(key, True, CYAN), (card.x + 36, y))
             overlay.blit(self.font_tiny.render(description, True, WHITE), (card.x + 138, y + 2))
-            y += 27
+            y += 24
         y = card.y + 108
         for key, description in flight_items:
             color = GREEN if key == "GREEN" else AMBER if key == "AMBER" else RED if key == "RED" else CYAN
@@ -1127,9 +1422,9 @@ class WorldRenderer:
             1,
         )
         notes = [
-            "Every oval lies exactly in the sensor line-of-sight plane.",
+            "Every oval shares the target plane perpendicular to the sensor.",
             "Its border conservatively contains all allowed projected maneuvers.",
-            "Green oval = 4/4 reachable; amber = partial; red = unreachable.",
+            "Green oval = 4/4 reachable; red = at least one required edge failed.",
             "True range is simulation verification only, never guidance input.",
         ]
         y = separator_y + 12

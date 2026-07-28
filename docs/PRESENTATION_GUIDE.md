@@ -21,10 +21,10 @@ Explain that the image center gives bearing, while known size gives scale. `Dx`,
 Point to the 1, 2, 3, and 5 second ovals:
 
 - each oval represents positions allowed by the target's known acceleration and speed;
-- every oval lies exactly in the plane perpendicular to our sensor camera view;
+- every oval, its four extremes, its center, the projected unchanged path, and the target lie in one plane perpendicular to our sensor camera view;
 - the border is inflated from propulsion-specific acceleration support, so the target's projected position cannot escape it under the stated limits;
 - the four extreme points are calculated separately and tested for our reachability;
-- a green border means all 4 extremes are reachable, amber means a partial 1–3/4 result, and red means 0/4;
+- a green border means all 4 extremes are reachable; if even one required point fails, the border is red and reports the exact `n/4` count;
 - an unreachable oval remains visible and red instead of disappearing;
 - if all four extremes are reachable, the center is a safe guidance objective;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
@@ -43,6 +43,8 @@ Point out:
 Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The gimbal scans from the last seen bearing without using target truth. Press `O` again; only a new image detection can reacquire lock and restart guidance.
 
 Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered sensor presentation.
+
+Press `F3` for the independent spectator/tactical camera. This is the clearest view for proving that the target and all four ovals occupy the same plane. Press `F1` at any time for the four-page explanation of every coordinate, color, force, guidance state, camera, and verification boundary.
 
 ### 5. Demonstrate robustness — 60 seconds
 
@@ -90,6 +92,10 @@ The four checks prove whether our drone can reach the four marked extremes used 
 
 No. Multirotors must slew and tilt their thrust vector. Fixed-wing engines push only along the nose; turns come from bounded aerodynamic lateral force. Rockets have forward thrust and limited steering but cannot command reverse thrust. The guidance request is always filtered through that vehicle-specific physics layer.
 
+### “Where is gravity, and why does a wing fall differently?”
+
+Gravity is continuously applied at `9.81 m/s²` to every airborne vehicle. A powered multirotor spends upward thrust to cancel it. A wing creates lift perpendicular to its flight path; that lift depends on airspeed, weakens below the model's visible stall speed, and vanishes during a vertical fall. With its engine cut, a fast wing therefore glides and sinks slowly at first, then falls faster as drag removes speed. Rockets have gravity and drag but no wing lift. Take over a vehicle with `Tab` and press `X` to cut or restart its engine.
+
 ### “What happens when the target rotates?”
 
 A naive fixed-width calculation is biased. ZENITH projects all eight corners of the known 3D dimensions using a pose estimate and fits both horizontal and vertical spans.
@@ -115,10 +121,11 @@ Yes. `Tab` cycles from autonomy to our interceptor, then to the target, then bac
 1. Start `run_zenith.bat`.
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
 3. Start and wait for signal confirmation.
-4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it, press `C` to center, then press `V` for tactical overview.
-5. Press `Tab` for our-drone control. Show the guidance advisory beside your own command, then use `W/A/Q` with `Shift`. Press `Tab` again and control the target; point out the chase camera and authority HUD. Press `Tab` a third time to restore autonomy.
-6. Press `F2`; discuss range degradation and resolution.
-7. Close analysis with `F2`, return onboard with `V`, then press `O` to prove guidance loss. Point out that search follows the last image motion while holding altitude and staying near the horizon. Press `O` again to demonstrate genuine reacquisition.
-8. Press `-` for slow motion and let the collision complete.
-9. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`. Take over the rocket to show that reverse and airbrake are red/unavailable.
-10. Press `F5` to export the proof data.
+4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it and press `C` to center.
+5. Press `F3` for spectator view. Point out that the target, every oval center/border, and every amber unchanged-path dot occupy the same oblique plane. Red now means the oval fails the required four-point rule even if only one point is unreachable.
+6. Press `Tab` for our-drone control. Show the guidance advisory beside your own command, then use `W/A/Q` with `Shift`. Press `X` to cut the engine and show gravity/lift, then restart it. Press `Tab` again and control the target; point out the chase camera and authority HUD. Press `Tab` a third time to restore autonomy.
+7. Press `F1`; show the oval and aerodynamics information pages. Close it and press `F2` to discuss range degradation and resolution.
+8. Close analysis with `F2`, return onboard with `V`, then press `O` to prove guidance loss. Point out that search follows the last image motion while holding altitude and staying near the horizon. Press `O` again to demonstrate genuine reacquisition.
+9. Press `-` for slow motion and let the collision complete.
+10. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`. Take over the rocket to show that reverse, airbrake, and wing lift are unavailable.
+11. Press `F5` to export the proof data.

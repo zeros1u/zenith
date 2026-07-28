@@ -22,6 +22,7 @@ from zenith.rendering import (
     BG_TOP,
     CYAN,
     GREEN,
+    INFO_PAGE_COUNT,
     MUTED,
     RED,
     WHITE,
@@ -504,6 +505,8 @@ def run_interactive() -> int:
     time_scale_index = 2
     analysis_open = False
     help_open = False
+    info_open = False
+    info_page = 0
     cinematic_hit_seen = False
     right_mouse_dragging = False
     window_focused = True
@@ -584,6 +587,7 @@ def run_interactive() -> int:
                 and event.button == 3
                 and not analysis_open
                 and not help_open
+                and not info_open
             ):
                 set_mouse_capture(True)
                 continue
@@ -595,6 +599,7 @@ def run_interactive() -> int:
                 and right_mouse_dragging
                 and not analysis_open
                 and not help_open
+                and not info_open
             ):
                 continue
             if event.type == pygame.KEYDOWN:
@@ -604,6 +609,8 @@ def run_interactive() -> int:
                         analysis_open = False
                     elif help_open:
                         help_open = False
+                    elif info_open:
+                        info_open = False
                     else:
                         running = False
                 elif event.key == pygame.K_SPACE:
@@ -615,6 +622,9 @@ def run_interactive() -> int:
                     time_scale_index = max(0, time_scale_index - 1)
                 elif event.key == pygame.K_v:
                     renderer.cycle_view()
+                elif event.key == pygame.K_F3:
+                    renderer.view_mode = 2
+                    renderer.reset_view_offset()
                 elif event.key == pygame.K_c:
                     renderer.reset_view_offset()
                 elif event.key == pygame.K_TAB:
@@ -627,22 +637,48 @@ def run_interactive() -> int:
                     set_mouse_capture(False)
                     analysis_open = not analysis_open
                     help_open = False
+                    info_open = False
+                elif event.key == pygame.K_F1:
+                    set_mouse_capture(False)
+                    info_open = not info_open
+                    analysis_open = False
+                    help_open = False
+                elif info_open and event.key in (
+                    pygame.K_RIGHT,
+                    pygame.K_PAGEDOWN,
+                ):
+                    info_page = (info_page + 1) % INFO_PAGE_COUNT
+                elif info_open and event.key in (
+                    pygame.K_LEFT,
+                    pygame.K_PAGEUP,
+                ):
+                    info_page = (info_page - 1) % INFO_PAGE_COUNT
                 elif event.key == pygame.K_h:
                     set_mouse_capture(False)
                     help_open = not help_open
                     analysis_open = False
+                    info_open = False
+                elif (
+                    event.key == pygame.K_x
+                    and not analysis_open
+                    and not help_open
+                    and not info_open
+                ):
+                    simulation.toggle_controlled_engine()
                 elif event.key == pygame.K_r and current_config is not None:
                     set_mouse_capture(False)
                     simulation = InterceptionSimulation(current_config)
                     renderer = WorldRenderer()
                     accumulator = 0.0
                     cinematic_hit_seen = False
+                    info_open = False
                 elif event.key == pygame.K_n:
                     set_mouse_capture(False)
                     app_state = "setup"
                     simulation = None
                     analysis_open = False
                     help_open = False
+                    info_open = False
                 elif event.key == pygame.K_F5:
                     exported = export_telemetry(simulation)
                     simulation._event(f"Telemetry exported: {exported.name}")
@@ -654,6 +690,7 @@ def run_interactive() -> int:
             and right_mouse_dragging
             and not analysis_open
             and not help_open
+            and not info_open
         ):
             relative_x, relative_y = pygame.mouse.get_rel()
             if relative_x or relative_y:
@@ -674,6 +711,7 @@ def run_interactive() -> int:
                 simulation.paused
                 or analysis_open
                 or help_open
+                or info_open
                 or right_mouse_dragging
                 or not window_focused
                 or simulation.finished
@@ -682,7 +720,12 @@ def run_interactive() -> int:
             simulation.set_manual_input(
                 read_manual_input(manual_input_suppressed)
             )
-            if not simulation.paused and not analysis_open and not help_open:
+            if (
+                not simulation.paused
+                and not analysis_open
+                and not help_open
+                and not info_open
+            ):
                 accumulator += real_dt * time_scales[time_scale_index]
                 steps_this_frame = 0
                 while accumulator >= FIXED_STEP and steps_this_frame < 16:
@@ -700,7 +743,9 @@ def run_interactive() -> int:
                 time_scales[time_scale_index],
                 clock.get_fps(),
             )
-            if analysis_open:
+            if info_open:
+                renderer.draw_info(screen, simulation, info_page)
+            elif analysis_open:
                 renderer.draw_analysis(screen, simulation)
             elif help_open:
                 renderer.draw_help(screen)

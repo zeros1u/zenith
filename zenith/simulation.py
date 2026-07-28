@@ -67,8 +67,8 @@ class InterceptionSimulation:
     # lightweight collision sphere, while the segment test still proves an
     # actual close pass rather than a multi-metre "hit."
     CONTACT_TOLERANCE_M = 0.35
-    GIMBAL_SLEW_RATE_DEG_S = 72.0
-    SEARCH_SLEW_RATE_DEG_S = 90.0
+    GIMBAL_SLEW_RATE_DEG_S = 120.0
+    SEARCH_SLEW_RATE_DEG_S = 120.0
 
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
@@ -162,6 +162,19 @@ class InterceptionSimulation:
 
     def clear_manual_input(self) -> None:
         self.manual_input = ManualControlInput()
+
+    def toggle_controlled_engine(self) -> bool | None:
+        controlled = self.controlled_vehicle
+        if controlled is None:
+            self._event("Select a player vehicle before toggling its engine")
+            return None
+        if controlled.crashed:
+            self._event(f"{controlled.spec.code} engine unavailable after impact")
+            return False
+        controlled.engine_enabled = not controlled.engine_enabled
+        state = "started" if controlled.engine_enabled else "cut"
+        self._event(f"{controlled.spec.code} engine {state} by player")
+        return controlled.engine_enabled
 
     def cycle_control_mode(self) -> ControlMode:
         """Cycle AUTO -> own vehicle -> target vehicle -> AUTO."""
@@ -337,6 +350,12 @@ class InterceptionSimulation:
             cruise_z - velocity.z,
         )
         stabilise = stabilise * 0.7
+        if spec.flight_model in ("fixed_wing", "rocket"):
+            stabilise = stabilise + Vec3(
+                0.0,
+                max(0.0, 9.81 - self.target.lift_acceleration.y),
+                0.0,
+            )
         self.target.airbrake = False
 
         if scenario == "weave":
@@ -659,6 +678,8 @@ class InterceptionSimulation:
             self.target.velocity = average_velocity + Vec3(2.0, 2.5, 0.0)
             self.interceptor.crashed = True
             self.target.crashed = True
+            self.interceptor.engine_enabled = False
+            self.target.engine_enabled = False
             self.explosion_age_s = 0.0
             self.clear_manual_input()
 

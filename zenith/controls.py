@@ -130,6 +130,12 @@ class ManualFlightController:
                 if forward_request >= 0.0
                 else spec.brake_accel
             )
+            directional_vertical = vertical_acceleration
+            if state.engine_enabled or spec.lift_efficiency > 0.0:
+                directional_vertical += max(
+                    0.0,
+                    9.81 - state.lift_acceleration.y,
+                )
             requested = (
                 forward * forward_request * axial_limit * full_scale
                 + right
@@ -137,7 +143,7 @@ class ManualFlightController:
                 * spec.lateral_accel
                 * full_scale
                 + WORLD_UP
-                * vertical_acceleration
+                * directional_vertical
             )
             desired_yaw = None
 

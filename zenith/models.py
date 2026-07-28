@@ -23,6 +23,8 @@ class DroneSpec:
     vehicle_type: str = "drone"
     flight_model: str = "multirotor"
     max_turn_rate_deg: float = 90.0
+    stall_speed: float = 0.0
+    lift_efficiency: float = 0.0
 
     @property
     def size_label(self) -> str:
@@ -71,6 +73,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         "wraith_wing",
         flight_model="fixed_wing",
         max_turn_rate_deg=82.0,
+        stall_speed=18.0,
+        lift_efficiency=0.90,
     ),
     DroneSpec(
         "AQ4",
@@ -101,6 +105,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         "talon_delta",
         flight_model="fixed_wing",
         max_turn_rate_deg=108.0,
+        stall_speed=16.0,
+        lift_efficiency=0.92,
     ),
     DroneSpec(
         "MNH",
@@ -116,6 +122,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         "manta_heavy",
         flight_model="vectored_vtol",
         max_turn_rate_deg=72.0,
+        stall_speed=14.0,
+        lift_efficiency=0.72,
     ),
 )
 

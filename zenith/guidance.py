@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 
-from .math3d import Vec3, angle_between, basis_from_forward, clamp, lerp_vec
+from .math3d import (
+    Vec3,
+    WORLD_UP,
+    angle_between,
+    basis_from_forward,
+    clamp,
+    lerp_vec,
+)
 from .models import DroneSpec
 from .physics import DroneState, maximum_travel_distance
 
@@ -147,7 +154,15 @@ def build_prediction_ovals(
     target_forward = target_velocity.normalized(line_of_sight)
     result: list[PredictionOval] = []
     for horizon in PREDICTION_HORIZONS:
-        ballistic = target_position + target_velocity * horizon
+        # The project treats interception as a 2D problem at the measured
+        # target range. Remove line-of-sight motion so every oval, every
+        # unchanged-trajectory point, and the target share one physical plane.
+        future_displacement = target_velocity * horizon
+        ballistic = (
+            target_position
+            + future_displacement
+            - plane_normal * future_displacement.dot(plane_normal)
+        )
         scale = 0.5 * horizon**2
         positive_x = _acceleration_support(
             target_spec, target_forward, plane_x
@@ -238,7 +253,7 @@ def solve_guidance(
             selected = oval
             break
 
-    if distance < 90.0 or time_to_contact < 1.8:
+    if distance < 120.0 or time_to_contact < 2.2:
         # Closed-form constant-velocity lead. It remains a camera-only solution:
         # relative position and target velocity both come from the image track.
         speed = max(5.0, interceptor.spec.max_speed)
@@ -316,6 +331,13 @@ def solve_guidance(
     # A small proportional-navigation term damps sideways line-of-sight motion.
     lateral_relative = relative_velocity - line * relative_velocity.dot(line)
     command = command + lateral_relative * 1.25
+    if interceptor.spec.flight_model in ("fixed_wing", "rocket"):
+        # Directional craft must generate aerodynamic/steering force to cancel
+        # the part of gravity that their current wing lift does not support.
+        command = command + WORLD_UP * max(
+            0.0,
+            9.81 - interceptor.lift_acceleration.y,
+        )
     command_limit = interceptor.spec.max_accel
     if interceptor.spec.flight_model in ("fixed_wing", "rocket"):
         # Thrust/braking and aerodynamic turning are independent bounded force

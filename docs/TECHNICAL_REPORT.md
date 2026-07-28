@@ -153,16 +153,17 @@ This reduces range-quantization jitter without secretly substituting ground trut
 
 Prediction horizons are `1, 2, 3, and 5 seconds`.
 
-For every horizon, the target's unchanged-velocity point is:
+For every horizon, the target's unchanged-velocity displacement is projected into the target's current range plane:
 
 ```text
-P₀(t) = P + Vt
+N      = camera optical-axis unit vector
+P₀(t)  = P + Vt - N(Vt · N)
 ```
 
-The oval plane passes through this future region and its normal is exactly the current camera optical axis. Therefore every border point `Q` satisfies:
+The one oval plane passes through the current target `P`, and its normal is exactly the current camera optical axis. Therefore the target, every oval center, every extreme, and every projected unchanged-trajectory point have the same camera depth:
 
 ```text
-(Q - center) · camera_forward = 0
+(Q - P) · N = 0
 ```
 
 Propulsion limits define acceleration support in the camera-plane X and Y directions. Multirotors use a bounded acceleration ellipsoid with separate horizontal and vertical authority. Wings use forward thrust, bounded braking, and lateral aerodynamic acceleration. Rockets have forward thrust and limited lateral steering, but no reverse engine thrust.
@@ -183,7 +184,7 @@ radius X        = (support(+X) + support(-X)) t² / 4 × containment factor
 
 The orange dots show the unchanged-velocity trajectory inside the smallest oval.
 
-The complete border communicates the four reachability tests: green means `4/4`, amber means `1–3/4`, and red means `0/4`. All active prediction horizons remain drawn regardless of reachability. Ovals are hidden only when visual lock is invalid and the system therefore has no current guidance-quality observation.
+The complete border communicates the required four-point decision: green means `4/4` and is eligible for center guidance. If even one extreme fails, the border is red and reports the exact `0–3/4` reachable count. Individual extreme markers retain their own green/red state so the failing direction remains visible. Amber is reserved for the projected unchanged-velocity dots. All active horizons remain drawn regardless of reachability. Ovals are hidden only when visual lock is invalid and the system therefore has no current guidance-quality observation.
 
 ## 9. Reachability and maneuver choice
 
@@ -208,16 +209,24 @@ Terminal pursuit solves the constant-velocity intercept equation. Against a co-d
 
 Physics advances at a fixed 60 ticks per simulated second. Guidance supplies a requested acceleration, but the flight-model layer decides what force the vehicle can actually produce:
 
-- multirotor and vectored-VTOL craft slew and tilt a thrust vector inside a bounded cone;
-- fixed-wing craft add engine thrust only along the nose and turn through bounded lateral aerodynamic acceleration;
-- rockets add forward thrust only, have no reverse thrust, and steer at their smaller lateral/turn-rate limit.
+- gravity supplies `9.81 m/s²` downward acceleration to every airborne class on every tick;
+- multirotor and vectored-VTOL craft slew and tilt a powered thrust vector inside a bounded cone, explicitly spending thrust to counter gravity;
+- fixed-wing craft add engine thrust only along the nose, turn through bounded lateral aerodynamic acceleration, and generate airflow-dependent lift perpendicular to the flight path;
+- rockets add forward thrust only, have no reverse thrust or wing lift, and steer at their smaller lateral/turn-rate limit.
 
 ```text
 velocity(t+Δt) = clamp(velocity + acceleration Δt, max_speed)
 position(t+Δt) = position + velocity Δt
 ```
 
-Actual propulsion acceleration, passive quadratic drag, model-specific airbrakes, maximum speed, and crash gravity are continuous. The UI reports propulsion class and engine output. There are no instantaneous boosters in this milestone. The braking scenario activates a sustained airbrake acceleration rather than deleting a percentage of speed in one frame.
+Actual propulsion acceleration, gravity, passive quadratic drag, model-specific airbrakes, maximum speed, and ground contact are continuous. Wing lift uses an explicit model stall speed and lift-efficiency factor:
+
+```text
+airflow factor = clamp((speed / stall_speed)², 0, 1)
+lift            = 9.81 × lift_efficiency × airflow factor
+```
+
+Lift points perpendicular to the flight path toward world-up. A horizontal wing therefore sinks more slowly when unpowered, lift weakens as drag removes airspeed below stall, and lift vanishes for a vertical fall. This is a transparent presentation model rather than computational fluid dynamics. `X` cuts or restarts the player-controlled engine, making powered rotor hover, wing glide, and unlifted rocket fall directly demonstrable. The UI reports engine state/output and current lift. There are no instantaneous boosters in this milestone. The braking scenario activates a sustained airbrake acceleration rather than deleting a percentage of speed in one frame.
 
 Collision uses the closest separation across the entire relative-motion segment for each tick, preventing fast drones from tunneling through each other between frames. Following impact, both vehicles tumble and fall under gravity.
 
@@ -225,14 +234,16 @@ Collision uses the closest separation across the entire relative-motion segment 
 
 `Tab` cycles between autonomous guidance, player control of our interceptor, player control of the target, and autonomy again. Entering a player mode copies the vehicle's current heading and altitude into the assisted controller, so authority transfer does not create an artificial pose or speed jump. The presentation camera follows the controlled vehicle, while the synthetic defense sensor remains independent.
 
-The player does not write position or velocity directly. `W/S`, `A/D`, and `Q/E` create forward, turn, and vertical requests; `Shift` requests the full available bound and `Ctrl` activates a supported airbrake. Those requests pass through the normal 60 Hz flight model:
+The player does not write position or velocity directly. `W/S`, `A/D`, and `Q/E` create forward, turn, and vertical requests; `Shift` requests the full available bound, `Ctrl` activates a supported airbrake, and `X` cuts or restarts the selected engine. Those requests pass through the normal 60 Hz flight model:
 
 - multirotors may command forward or reverse acceleration and an explicit body heading, but their thrust vector must still slew and tilt;
 - fixed-wing vehicles may decelerate but never fly backward under engine power, and lateral input is turn-rate limited;
 - rockets have forward thrust and limited steering but reject reverse thrust and airbrake requests;
 - a two-metre altitude floor blocks commanded descent into the ground.
 
-The compact authority HUD labels direct capability green, limited turn/brake capability amber, and unavailable capability red. It also reports active keys, requested versus achieved acceleration, engine output, and airbrake state. During player control of our interceptor, autonomous oval guidance continues only as a visible advisory. During player control of the target, our interceptor remains autonomous. Mouse capture suppresses vehicle keys so `Shift + right mouse` rolls only the presentation camera.
+The compact authority HUD labels direct capability green, limited turn/brake/glide capability amber, and unavailable capability red. Cutting an engine immediately updates those authority colors. It also reports active keys, requested versus achieved acceleration, requested/actual engine output, engine state, and airbrake state. During player control of our interceptor, autonomous oval guidance continues only as a visible advisory. During player control of the target, our interceptor remains autonomous. Mouse capture suppresses vehicle keys so `Shift + right mouse` rolls only the presentation camera.
+
+`F3` selects an independent spectator/tactical camera that is attached to neither pilot and is useful for inspecting the common target/oval plane. `F1` opens a four-page live reference covering sensor inputs, axes, panels, oval geometry and selection, current oval radii/reachability, gravity and aerodynamic forces, controls, target-loss behavior, camera modes, verification boundaries, and shortcuts.
 
 During target loss, player control of our interceptor overrides the automatic body-search turn, but the sensor gimbal continues its bearing-based scan. This separation makes manual flight useful for a demonstration without allowing it to manufacture sensor lock.
 
@@ -257,6 +268,7 @@ Rotation is handled by known-model pose-compensated physical spans. Maneuvers ar
 - The generic detector backend deterministically emits the synthetic camera bounding box. It represents the output contract of YOLO/DINO, not a trained neural network.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
 - The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
+- The lift model is not CFD. Production aerodynamics require measured lift/drag curves, mass, wing area, angle of attack, wind, control-surface dynamics, and flight-test validation.
 - A monocular camera cannot recover absolute scale for an unknown object. Metric values correctly remain unavailable until known target dimensions are resolved.
 
 These boundaries are deliberately visible rather than hidden, so the project can be presented as a working and testable software proof-of-concept.

@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import unittest
 
+import pygame
+
 from app import DISPLAY_OPTIONS, SENSOR_OPTIONS, WINDOW_SIZE
 from zenith.camera import (
     CameraModel,
@@ -12,12 +14,22 @@ from zenith.camera import (
     range_from_apparent_size,
 )
 from zenith.controls import ControlMode, ManualControlInput
-from zenith.guidance import TargetTrack, build_prediction_ovals
+from zenith.guidance import (
+    TargetTrack,
+    build_prediction_ovals,
+    solve_guidance,
+)
 from zenith.math3d import Vec3, angle_between, basis_from_forward, clamp
 from zenith.meshes import get_mesh
 from zenith.models import DRONE_SPECS, ROCKET_SPECS, TARGET_SPECS
 from zenith.physics import DroneState, maximum_travel_distance
-from zenith.rendering import AMBER, GREEN, RED, ViewCamera, WorldRenderer
+from zenith.rendering import (
+    GREEN,
+    INFO_PAGE_COUNT,
+    RED,
+    ViewCamera,
+    WorldRenderer,
+)
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
 
 
@@ -86,6 +98,23 @@ class InterfaceConfigTests(unittest.TestCase):
         )
         self.assertIn(sim.target.spec.code, camera.name)
 
+    def test_spectator_camera_is_not_an_onboard_view(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        renderer.view_mode = 2
+        camera = renderer.get_view_camera(sim)
+        self.assertIn("SPECTATOR", camera.name)
+        self.assertGreater(camera.position.distance_to(sim.interceptor.position), 10.0)
+        self.assertGreater(camera.position.distance_to(sim.target.position), 10.0)
+
+    def test_full_information_pages_render_at_minimum_window_size(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        surface = pygame.Surface(WINDOW_SIZE)
+        self.assertEqual(INFO_PAGE_COUNT, 4)
+        for page in range(INFO_PAGE_COUNT):
+            renderer.draw_info(surface, sim, page)
+
 
 class CameraTests(unittest.TestCase):
     def test_direct_pinhole_formula(self) -> None:
@@ -138,7 +167,7 @@ class GuidanceTests(unittest.TestCase):
         oval.reachable = (True, True, True, True)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), GREEN)
         oval.reachable = (True, False, False, False)
-        self.assertEqual(WorldRenderer._oval_reachability_color(oval), AMBER)
+        self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
         oval.reachable = (False, False, False, False)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
 
@@ -154,13 +183,82 @@ class GuidanceTests(unittest.TestCase):
         )
         for oval in ovals:
             self.assertAlmostEqual(oval.plane_normal.dot(view), 1.0, places=7)
+            for edge in (
+                oval.center,
+                oval.ballistic_center,
+                *oval.extremes,
+            ):
+                self.assertAlmostEqual(
+                    (edge - Vec3(0, 35, 150)).dot(oval.plane_normal),
+                    0.0,
+                    places=7,
+                )
             for edge in oval.extremes:
                 self.assertAlmostEqual(
                     (edge - oval.center).dot(oval.plane_normal),
                     0.0,
                     places=7,
                 )
+            averaged_extremes = (
+                oval.extremes[0]
+                + oval.extremes[1]
+                + oval.extremes[2]
+                + oval.extremes[3]
+            ) / 4.0
+            self.assertLess(
+                averaged_extremes.distance_to(oval.center),
+                1e-8,
+            )
             self.assertTrue(oval.contains_projected(oval.ballistic_center))
+
+    def test_rendered_border_satisfies_ellipse_equation(self) -> None:
+        interceptor = DroneState(
+            DRONE_SPECS[3],
+            Vec3(0, 30, 0),
+            Vec3(0, 0, 25),
+        )
+        oval = build_prediction_ovals(
+            Vec3(0, 35, 150),
+            Vec3(6, 0, 20),
+            DRONE_SPECS[1],
+            interceptor,
+            Vec3(0.2, 0.1, 1.0).normalized(),
+        )[2]
+        self.assertNotAlmostEqual(oval.radius_x, oval.radius_y, places=4)
+        for point in WorldRenderer._oval_points(oval):
+            offset = point - oval.center
+            x = offset.dot(oval.plane_x) / oval.radius_x
+            y = offset.dot(oval.plane_y) / oval.radius_y
+            self.assertAlmostEqual(x * x + y * y, 1.0, places=7)
+
+    def test_guidance_aims_at_largest_fully_reachable_oval_center(self) -> None:
+        interceptor = DroneState(
+            DRONE_SPECS[2],
+            Vec3(0, 30, 0),
+            Vec3(0, 0, DRONE_SPECS[2].max_speed),
+        )
+        track = TargetTrack(
+            position=Vec3(0, 35, 125),
+            last_measurement=Vec3(0, 35, 125),
+            velocity=Vec3(0, 0, 2),
+            sample_count=5,
+        )
+        solution = solve_guidance(
+            interceptor,
+            track,
+            DRONE_SPECS[4],
+            Vec3(0, 0, 1),
+        )
+        self.assertIsNotNone(solution)
+        assert solution is not None
+        self.assertEqual(solution.mode, "OVAL CENTER")
+        selected = next(
+            oval
+            for oval in solution.ovals
+            if oval.horizon_s == solution.selected_horizon_s
+        )
+        self.assertTrue(selected.fully_reachable)
+        self.assertLess(solution.aim_point.distance_to(selected.center), 1e-8)
 
     def test_conservative_envelope_contains_allowed_acceleration_samples(self) -> None:
         interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
@@ -235,6 +333,71 @@ class PropulsionTests(unittest.TestCase):
         self.assertAlmostEqual(state.thrust_vector.length(), 0.0, places=7)
         self.assertEqual(state.engine_output, 0.0)
 
+    def test_every_unpowered_vehicle_class_receives_gravity(self) -> None:
+        for spec in (
+            DRONE_SPECS[0],
+            DRONE_SPECS[1],
+            DRONE_SPECS[4],
+            ROCKET_SPECS[0],
+        ):
+            with self.subTest(flight_model=spec.flight_model):
+                state = DroneState(spec, Vec3(0, 100, 0), Vec3())
+                state.engine_enabled = False
+                state.integrate(Vec3(), 0.1)
+                self.assertLess(state.position.y, 100.0)
+                self.assertLess(state.acceleration.y, 0.0)
+
+    def test_powered_multirotor_hovers_but_engine_cut_falls(self) -> None:
+        powered = DroneState(DRONE_SPECS[0], Vec3(0, 100, 0), Vec3())
+        unpowered = DroneState(DRONE_SPECS[0], Vec3(0, 100, 0), Vec3())
+        unpowered.engine_enabled = False
+        for _ in range(60):
+            powered.integrate(Vec3(), 1.0 / 60.0)
+            unpowered.integrate(Vec3(), 1.0 / 60.0)
+        self.assertAlmostEqual(powered.position.y, 100.0, delta=0.1)
+        self.assertLess(unpowered.position.y, powered.position.y - 3.0)
+        self.assertEqual(unpowered.engine_output, 0.0)
+
+    def test_horizontal_wing_glides_slower_than_unlifted_rocket_falls(self) -> None:
+        wing = DroneState(
+            DRONE_SPECS[1],
+            Vec3(0, 100, 0),
+            Vec3(0, 0, 30),
+        )
+        rocket = DroneState(
+            ROCKET_SPECS[0],
+            Vec3(0, 100, 0),
+            Vec3(0, 0, 30),
+        )
+        wing.engine_enabled = False
+        rocket.engine_enabled = False
+        for _ in range(60):
+            wing.integrate(Vec3(), 1.0 / 60.0)
+            rocket.integrate(Vec3(), 1.0 / 60.0)
+        self.assertGreater(wing.lift_acceleration.length(), 0.0)
+        self.assertAlmostEqual(rocket.lift_acceleration.length(), 0.0)
+        self.assertGreater(wing.position.y, rocket.position.y + 3.0)
+
+    def test_wing_lift_weakens_below_stall_speed(self) -> None:
+        slow = DroneState(
+            DRONE_SPECS[1],
+            Vec3(0, 100, 0),
+            Vec3(0, 0, 5),
+        )
+        fast = DroneState(
+            DRONE_SPECS[1],
+            Vec3(0, 100, 0),
+            Vec3(0, 0, 30),
+        )
+        slow.engine_enabled = False
+        fast.engine_enabled = False
+        slow.integrate(Vec3(), 1.0 / 60.0)
+        fast.integrate(Vec3(), 1.0 / 60.0)
+        self.assertLess(
+            slow.lift_acceleration.length(),
+            fast.lift_acceleration.length() * 0.2,
+        )
+
 
 class ManualControlTests(unittest.TestCase):
     def test_tab_cycles_auto_own_target_auto(self) -> None:
@@ -246,6 +409,15 @@ class ManualControlTests(unittest.TestCase):
         self.assertIs(sim.controlled_vehicle, sim.target)
         self.assertIs(sim.cycle_control_mode(), ControlMode.AUTO)
         self.assertIsNone(sim.controlled_vehicle)
+
+    def test_player_can_cut_and_restart_selected_engine(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        self.assertIsNone(sim.toggle_controlled_engine())
+        sim.cycle_control_mode()
+        self.assertFalse(sim.toggle_controlled_engine())
+        self.assertFalse(sim.interceptor.engine_enabled)
+        self.assertTrue(sim.toggle_controlled_engine())
+        self.assertTrue(sim.interceptor.engine_enabled)
 
     def test_player_own_command_overrides_but_preserves_guidance_advisory(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
