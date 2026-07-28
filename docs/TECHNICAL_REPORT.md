@@ -102,7 +102,7 @@ At 1920 horizontal pixels and 75° HFOV, `f ≈ 1251.1 px`. For the 0.70 m-wide 
 | 500 m | 1.75 px | ±28.5% |
 | 1000 m | 0.88 px | ±57.1% |
 
-This is visible in the application's `A` analysis screen and in the exported telemetry. A filtered track is essential because direct frame-to-frame differentiation would turn this quantization noise into unusable speed estimates.
+This is visible in the application's `F2` analysis screen and in the exported telemetry. A filtered track is essential because direct frame-to-frame differentiation would turn this quantization noise into unusable speed estimates.
 
 ## 5. Minimum camera resolution
 
@@ -131,7 +131,7 @@ The implemented state machine is:
 2. a generic drone with at least 4 px apparent span, or a high-contrast rocket with at least 3 px, becomes `VISUAL LOCK / SIGNAL QUERY`
 3. a simulated lookup resolves the known target specification after 0.65 s for drones or 0.42 s for fast incoming rockets
 4. the range estimator, metric track, and oval guidance activate
-5. any later loss becomes `TARGET LOST / SEARCHING`, clears guidance immediately, and starts an expanding gimbal scan from the last visual bearing
+5. any later loss becomes `TARGET LOST / SEARCHING`, clears guidance immediately, and extrapolates the filtered image-plane bearing rate for no more than 1.5 seconds
 6. only a newly visible image detection can reacquire the target and reactivate guidance
 
 Before identification, the system has bearing, pixel size, and angular motion. After target dimensions arrive, it converts those observations to metres and metres per second. This separation makes it clear which calculations depend on known model data.
@@ -147,7 +147,7 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. If detection is lost, range and guidance are invalidated immediately and the gimbal performs an expanding search around the last observed bearing. Reacquisition must come from a new visible image detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
+This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds; the gimbal then performs an expanding horizontal scan around that predicted direction. Its world elevation remains inside `-35 to +35 degrees`, avoiding a blind search above or below the horizon. The interceptor turns horizontally toward the predicted search direction while holding the altitude recorded at loss. Reacquisition must come from a new visible image detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
@@ -221,7 +221,22 @@ Actual propulsion acceleration, passive quadratic drag, model-specific airbrakes
 
 Collision uses the closest separation across the entire relative-motion segment for each tick, preventing fast drones from tunneling through each other between frames. Following impact, both vehicles tumble and fall under gravity.
 
-## 11. Robustness evidence
+## 11. Player takeover and control authority
+
+`Tab` cycles between autonomous guidance, player control of our interceptor, player control of the target, and autonomy again. Entering a player mode copies the vehicle's current heading and altitude into the assisted controller, so authority transfer does not create an artificial pose or speed jump. The presentation camera follows the controlled vehicle, while the synthetic defense sensor remains independent.
+
+The player does not write position or velocity directly. `W/S`, `A/D`, and `Q/E` create forward, turn, and vertical requests; `Shift` requests the full available bound and `Ctrl` activates a supported airbrake. Those requests pass through the normal 60 Hz flight model:
+
+- multirotors may command forward or reverse acceleration and an explicit body heading, but their thrust vector must still slew and tilt;
+- fixed-wing vehicles may decelerate but never fly backward under engine power, and lateral input is turn-rate limited;
+- rockets have forward thrust and limited steering but reject reverse thrust and airbrake requests;
+- a two-metre altitude floor blocks commanded descent into the ground.
+
+The compact authority HUD labels direct capability green, limited turn/brake capability amber, and unavailable capability red. It also reports active keys, requested versus achieved acceleration, engine output, and airbrake state. During player control of our interceptor, autonomous oval guidance continues only as a visible advisory. During player control of the target, our interceptor remains autonomous. Mouse capture suppresses vehicle keys so `Shift + right mouse` rolls only the presentation camera.
+
+During target loss, player control of our interceptor overrides the automatic body-search turn, but the sensor gimbal continues its bearing-based scan. This separation makes manual flight useful for a demonstration without allowing it to manufacture sensor lock.
+
+## 12. Robustness evidence
 
 Six deterministic behaviors are included:
 
@@ -236,7 +251,7 @@ Six deterministic behaviors are included:
 
 Rotation is handled by known-model pose-compensated physical spans. Maneuvers are handled by the alpha-beta track, model acceleration limits, four-extreme ovals, and terminal velocity matching.
 
-## 12. Known prototype boundaries
+## 13. Known prototype boundaries
 
 - Five original low-poly drone meshes and two original rocket meshes are bundled. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
 - The generic detector backend deterministically emits the synthetic camera bounding box. It represents the output contract of YOLO/DINO, not a trained neural network.

@@ -13,10 +13,15 @@ from .camera import (
     estimate_range,
     position_from_detection,
 )
+from .controls import (
+    ControlMode,
+    ManualCommand,
+    ManualControlInput,
+    ManualFlightController,
+)
 from .guidance import GuidanceSolution, TargetTrack, solve_guidance
 from .math3d import (
     Vec3,
-    basis_from_forward,
     clamp,
     rotate_towards,
     world_direction_from_camera,
@@ -63,7 +68,7 @@ class InterceptionSimulation:
     # actual close pass rather than a multi-metre "hit."
     CONTACT_TOLERANCE_M = 0.35
     GIMBAL_SLEW_RATE_DEG_S = 72.0
-    SEARCH_SLEW_RATE_DEG_S = 58.0
+    SEARCH_SLEW_RATE_DEG_S = 90.0
 
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
@@ -79,6 +84,11 @@ class InterceptionSimulation:
         self.lost_time_s = 0.0
         self.reacquisition_count = 0
         self.sensor_occluded = False
+        self.control_mode = ControlMode.AUTO
+        self.manual_input = ManualControlInput()
+        self.manual_controller = ManualFlightController()
+        self.manual_command = ManualCommand()
+        self.guidance_advisory_command = Vec3()
         self.last_event = "Simulation initialized"
         self.events: list[tuple[float, str]] = [(0.0, self.last_event)]
         self.telemetry: list[TelemetrySample] = []
@@ -111,6 +121,13 @@ class InterceptionSimulation:
         )
         self.camera_forward = initial_line
         self.search_anchor_forward = initial_line
+        self.search_direction = initial_line
+        self.search_hold_altitude_m = self.config.interceptor_position.y
+        self.last_bearing_x_deg = 0.0
+        self.last_bearing_y_deg = 0.0
+        self.bearing_rate_x_deg_s = 0.0
+        self.bearing_rate_y_deg_s = 0.0
+        self._bearing_sample_valid = False
         self.detection = Detection(False, (0, 0, 0, 0), (0, 0), 0, 0, 0, 0, 0, 0, ())
         self.range_estimate: RangeEstimate | None = None
         self.track = TargetTrack()
@@ -132,6 +149,40 @@ class InterceptionSimulation:
             return "ROCKET INTERCEPTED SUCCESSFULLY"
         return "DRONE HIT SUCCESSFULLY"
 
+    @property
+    def controlled_vehicle(self) -> DroneState | None:
+        if self.control_mode is ControlMode.INTERCEPTOR:
+            return self.interceptor
+        if self.control_mode is ControlMode.TARGET:
+            return self.target
+        return None
+
+    def set_manual_input(self, controls: ManualControlInput) -> None:
+        self.manual_input = controls
+
+    def clear_manual_input(self) -> None:
+        self.manual_input = ManualControlInput()
+
+    def cycle_control_mode(self) -> ControlMode:
+        """Cycle AUTO -> own vehicle -> target vehicle -> AUTO."""
+        current_vehicle = self.controlled_vehicle
+        if current_vehicle is not None:
+            current_vehicle.airbrake = False
+        if self.control_mode is ControlMode.AUTO:
+            self.control_mode = ControlMode.INTERCEPTOR
+        elif self.control_mode is ControlMode.INTERCEPTOR:
+            self.control_mode = ControlMode.TARGET
+        else:
+            self.control_mode = ControlMode.AUTO
+        self.clear_manual_input()
+        self.manual_command = ManualCommand()
+        controlled = self.controlled_vehicle
+        if controlled is not None:
+            self.manual_controller = ManualFlightController()
+            self.manual_controller.initialize(controlled)
+        self._event(f"Control mode: {self.control_mode.value}")
+        return self.control_mode
+
     def _event(self, message: str) -> None:
         if message == self.last_event:
             return
@@ -144,6 +195,113 @@ class InterceptionSimulation:
         self.sensor_occluded = not self.sensor_occluded
         state = "blocked" if self.sensor_occluded else "restored"
         self._event(f"Camera image {state} by test control")
+
+    def _update_bearing_motion(self, dt: float, reset: bool = False) -> None:
+        """Filter image-plane motion without reading target ground truth."""
+        bearing_x = self.detection.bearing_x_deg
+        bearing_y = self.detection.bearing_y_deg
+        if self._bearing_sample_valid and not reset and dt > 1e-6:
+            raw_x = clamp(
+                (bearing_x - self.last_bearing_x_deg) / dt,
+                -120.0,
+                120.0,
+            )
+            raw_y = clamp(
+                (bearing_y - self.last_bearing_y_deg) / dt,
+                -90.0,
+                90.0,
+            )
+            alpha = 1.0 - math.exp(-5.0 * dt)
+            self.bearing_rate_x_deg_s += (
+                raw_x - self.bearing_rate_x_deg_s
+            ) * alpha
+            self.bearing_rate_y_deg_s += (
+                raw_y - self.bearing_rate_y_deg_s
+            ) * alpha
+        elif reset:
+            self.bearing_rate_x_deg_s = 0.0
+            self.bearing_rate_y_deg_s = 0.0
+        self.last_bearing_x_deg = bearing_x
+        self.last_bearing_y_deg = bearing_y
+        self._bearing_sample_valid = True
+
+    def _predicted_search_direction(self) -> Vec3:
+        """Extrapolate the last image motion, then perform a horizon-safe scan."""
+        anchor = self.search_anchor_forward.normalized(self.camera_forward)
+        anchor_yaw = math.atan2(anchor.x, anchor.z)
+        anchor_elevation = math.asin(clamp(anchor.y, -1.0, 1.0))
+        extrapolation_s = min(1.5, self.lost_time_s)
+        predicted_yaw = anchor_yaw + math.radians(
+            self.last_bearing_x_deg
+            + self.bearing_rate_x_deg_s * extrapolation_s
+        )
+        predicted_elevation = anchor_elevation + math.radians(
+            self.last_bearing_y_deg
+            + self.bearing_rate_y_deg_s * extrapolation_s
+        )
+
+        search_elapsed_s = max(0.0, self.lost_time_s - 1.5)
+        horizontal_radius = (
+            math.radians(min(160.0, 4.0 + search_elapsed_s * 18.0))
+            if search_elapsed_s > 0.0
+            else 0.0
+        )
+        vertical_radius = (
+            math.radians(min(18.0, 2.0 + search_elapsed_s * 3.0))
+            if search_elapsed_s > 0.0
+            else 0.0
+        )
+        predicted_yaw += horizontal_radius * math.sin(search_elapsed_s * 1.35)
+        predicted_elevation += vertical_radius * math.sin(
+            search_elapsed_s * 0.91
+        )
+        predicted_elevation = clamp(
+            predicted_elevation,
+            math.radians(-35.0),
+            math.radians(35.0),
+        )
+        horizontal = math.cos(predicted_elevation)
+        return Vec3(
+            math.sin(predicted_yaw) * horizontal,
+            math.sin(predicted_elevation),
+            math.cos(predicted_yaw) * horizontal,
+        ).normalized(anchor)
+
+    def _lost_search_command(self) -> Vec3:
+        """Turn toward the predicted horizontal bearing while holding altitude."""
+        if not self._bearing_sample_valid:
+            return Vec3()
+        spec = self.interceptor.spec
+        horizontal_direction = Vec3(
+            self.search_direction.x,
+            0.0,
+            self.search_direction.z,
+        ).normalized(self.interceptor.forward_direction())
+        current_forward = Vec3(
+            self.interceptor.velocity.x,
+            0.0,
+            self.interceptor.velocity.z,
+        ).normalized(self.interceptor.forward_direction())
+        turn_direction = (
+            horizontal_direction
+            - current_forward * horizontal_direction.dot(current_forward)
+        )
+        turn_ramp = clamp(self.lost_time_s / 0.8, 0.0, 1.0)
+        horizontal_turn = (
+            turn_direction.normalized()
+            * spec.lateral_accel
+            * turn_direction.length()
+            * turn_ramp
+        )
+        vertical_request = clamp(
+            (self.search_hold_altitude_m - self.interceptor.position.y) * 1.4
+            - self.interceptor.velocity.y * 1.1,
+            -spec.lateral_accel,
+            spec.lateral_accel,
+        )
+        return (
+            horizontal_turn + Vec3(0.0, vertical_request, 0.0)
+        ).clamp_length(max(spec.max_accel, spec.lateral_accel))
 
     @staticmethod
     def _empty_detection(depth: float = 0.0) -> Detection:
@@ -231,23 +389,12 @@ class InterceptionSimulation:
                 math.radians(self.GIMBAL_SLEW_RATE_DEG_S) * dt,
             )
         elif self.lost_time_s > 0.0:
-            # Search uses only the last observed bearing. It deliberately does
-            # not point at simulation truth or continue a guidance-quality track.
-            right, up, anchor = basis_from_forward(self.search_anchor_forward)
-            scan_radius = math.radians(
-                min(168.0, 4.0 + self.lost_time_s * 18.0)
-            )
-            phase = self.lost_time_s * 1.35
-            sweep_axis = (
-                right * math.cos(phase) + up * math.sin(phase)
-            ).normalized(right)
-            search_direction = (
-                anchor * math.cos(scan_radius)
-                + sweep_axis * math.sin(scan_radius)
-            ).normalized(anchor)
+            # Search uses only the last observed image bearing and bearing rate.
+            # It deliberately does not point at simulation truth.
+            self.search_direction = self._predicted_search_direction()
             self.camera_forward = rotate_towards(
                 self.camera_forward,
-                search_direction,
+                self.search_direction,
                 math.radians(self.SEARCH_SLEW_RATE_DEG_S) * dt,
             )
 
@@ -278,6 +425,10 @@ class InterceptionSimulation:
 
         previous_lost_time = self.lost_time_s
         if visual_detection:
+            self._update_bearing_motion(
+                dt,
+                reset=not was_locked and previous_lost_time > 0.25,
+            )
             self.visual_locked = True
             self.lost_time_s = 0.0
             if not was_locked:
@@ -289,6 +440,8 @@ class InterceptionSimulation:
         else:
             if was_locked:
                 self.search_anchor_forward = self.camera_forward
+                self.search_direction = self.camera_forward
+                self.search_hold_altitude_m = self.interceptor.position.y
                 self._event("Visual lock lost; guidance disabled")
             self.visual_locked = False
             self.lost_time_s += dt
@@ -403,7 +556,7 @@ class InterceptionSimulation:
                 self.target.spec,
                 self.camera_forward,
             )
-            interceptor_command = (
+            advisory_command = (
                 self.guidance.commanded_acceleration if self.guidance else Vec3()
             )
             if self.status != "INTERCEPT GUIDANCE":
@@ -412,18 +565,58 @@ class InterceptionSimulation:
         elif self.visual_locked:
             # Bearing-only pursuit while the signal lookup runs.
             self.guidance = None
-            interceptor_command = (
+            advisory_command = (
                 self.camera_forward * self.interceptor.spec.max_speed
                 - self.interceptor.velocity
             ).clamp_length(self.interceptor.spec.max_accel)
         else:
             self.guidance = None
-            interceptor_command = Vec3()
+            advisory_command = self._lost_search_command()
 
-        target_command = self._target_command()
-        self.interceptor.integrate(interceptor_command, dt)
-        self.target.integrate(target_command, dt)
-        if self.config.scenario == "rotating":
+        self.guidance_advisory_command = advisory_command
+        if self.control_mode is ControlMode.INTERCEPTOR:
+            self.manual_command = self.manual_controller.command(
+                self.interceptor,
+                self.manual_input,
+                dt,
+            )
+            interceptor_command = self.manual_command.acceleration
+            if self.guidance is not None:
+                self.status = "PLAYER CONTROL / GUIDANCE ADVISORY"
+            elif not self.visual_locked:
+                self.status = "PLAYER CONTROL / SENSOR SEARCH"
+        else:
+            self.interceptor.airbrake = False
+            interceptor_command = advisory_command
+            if self.control_mode is ControlMode.AUTO:
+                self.manual_command = ManualCommand()
+
+        if self.control_mode is ControlMode.TARGET:
+            self.manual_command = self.manual_controller.command(
+                self.target,
+                self.manual_input,
+                dt,
+            )
+            target_command = self.manual_command.acceleration
+        else:
+            target_command = self._target_command()
+
+        interceptor_yaw = (
+            self.manual_command.desired_yaw_rad
+            if self.control_mode is ControlMode.INTERCEPTOR
+            else None
+        )
+        target_yaw = (
+            self.manual_command.desired_yaw_rad
+            if self.control_mode is ControlMode.TARGET
+            else None
+        )
+        self.interceptor.integrate(interceptor_command, dt, interceptor_yaw)
+        self.target.integrate(target_command, dt, target_yaw)
+        if (
+            self.config.scenario == "rotating"
+            and self.control_mode is not ControlMode.TARGET
+        ):
             if self.target.spec.flight_model in ("multirotor", "vectored_vtol"):
                 self.target.orientation = Vec3(
                     self.target.orientation.x,
@@ -467,5 +660,6 @@ class InterceptionSimulation:
             self.interceptor.crashed = True
             self.target.crashed = True
             self.explosion_age_s = 0.0
+            self.clear_manual_input()
 
         self._record_telemetry(dt)

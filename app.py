@@ -13,6 +13,7 @@ from pathlib import Path
 import pygame
 
 from zenith.camera import CameraModel
+from zenith.controls import ControlMode, ManualControlInput
 from zenith.math3d import Vec3
 from zenith.models import DRONE_SPECS, TARGET_SPECS
 from zenith.physics import DroneState
@@ -505,12 +506,39 @@ def run_interactive() -> int:
     help_open = False
     cinematic_hit_seen = False
     right_mouse_dragging = False
+    window_focused = True
     running = True
+
+    def set_mouse_capture(captured: bool) -> None:
+        nonlocal right_mouse_dragging
+        right_mouse_dragging = captured
+        pygame.event.set_grab(captured)
+        pygame.mouse.set_visible(not captured)
+        if captured:
+            pygame.mouse.set_pos(
+                (screen.get_width() // 2, screen.get_height() // 2)
+            )
+        pygame.mouse.get_rel()
+
+    def read_manual_input(suppressed: bool) -> ManualControlInput:
+        if suppressed:
+            return ManualControlInput()
+        keys = pygame.key.get_pressed()
+        return ManualControlInput(
+            forward=float(keys[pygame.K_w]) - float(keys[pygame.K_s]),
+            turn=float(keys[pygame.K_d]) - float(keys[pygame.K_a]),
+            vertical=float(keys[pygame.K_e]) - float(keys[pygame.K_q]),
+            full_thrust=bool(
+                keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            ),
+            brake=bool(keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]),
+        )
 
     while running:
         real_dt = min(clock.tick(120) / 1000.0, 0.1)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                set_mouse_capture(False)
                 running = False
                 continue
             if event.type == pygame.VIDEORESIZE:
@@ -523,7 +551,12 @@ def run_interactive() -> int:
                 setup.size = screen.get_size()
                 continue
             if event.type == pygame.WINDOWFOCUSLOST:
-                right_mouse_dragging = False
+                window_focused = False
+                set_mouse_capture(False)
+                if simulation is not None:
+                    simulation.clear_manual_input()
+            elif event.type == pygame.WINDOWFOCUSGAINED:
+                window_focused = True
             if app_state == "setup":
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
@@ -546,11 +579,16 @@ def run_interactive() -> int:
 
             if simulation is None:
                 continue
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-                right_mouse_dragging = True
+            if (
+                event.type == pygame.MOUSEBUTTONDOWN
+                and event.button == 3
+                and not analysis_open
+                and not help_open
+            ):
+                set_mouse_capture(True)
                 continue
             if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
-                right_mouse_dragging = False
+                set_mouse_capture(False)
                 continue
             if (
                 event.type == pygame.MOUSEMOTION
@@ -558,14 +596,10 @@ def run_interactive() -> int:
                 and not analysis_open
                 and not help_open
             ):
-                renderer.rotate_view(
-                    event.rel[0],
-                    event.rel[1],
-                    bool(pygame.key.get_mods() & pygame.KMOD_SHIFT),
-                )
                 continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
+                    set_mouse_capture(False)
                     if analysis_open:
                         analysis_open = False
                     elif help_open:
@@ -574,6 +608,7 @@ def run_interactive() -> int:
                         running = False
                 elif event.key == pygame.K_SPACE:
                     simulation.paused = not simulation.paused
+                    simulation.clear_manual_input()
                 elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
                     time_scale_index = min(len(time_scales) - 1, time_scale_index + 1)
                 elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
@@ -582,32 +617,71 @@ def run_interactive() -> int:
                     renderer.cycle_view()
                 elif event.key == pygame.K_c:
                     renderer.reset_view_offset()
-                elif event.key == pygame.K_a:
+                elif event.key == pygame.K_TAB:
+                    mode = simulation.cycle_control_mode()
+                    renderer.view_mode = (
+                        0 if mode is ControlMode.AUTO else 1
+                    )
+                    renderer.reset_view_offset()
+                elif event.key == pygame.K_F2:
+                    set_mouse_capture(False)
                     analysis_open = not analysis_open
                     help_open = False
                 elif event.key == pygame.K_h:
+                    set_mouse_capture(False)
                     help_open = not help_open
                     analysis_open = False
                 elif event.key == pygame.K_r and current_config is not None:
+                    set_mouse_capture(False)
                     simulation = InterceptionSimulation(current_config)
                     renderer = WorldRenderer()
                     accumulator = 0.0
                     cinematic_hit_seen = False
                 elif event.key == pygame.K_n:
+                    set_mouse_capture(False)
                     app_state = "setup"
                     simulation = None
-                    right_mouse_dragging = False
                     analysis_open = False
                     help_open = False
-                elif event.key == pygame.K_e:
+                elif event.key == pygame.K_F5:
                     exported = export_telemetry(simulation)
                     simulation._event(f"Telemetry exported: {exported.name}")
                 elif event.key == pygame.K_o:
                     simulation.toggle_sensor_occlusion()
 
+        if (
+            app_state == "simulation"
+            and right_mouse_dragging
+            and not analysis_open
+            and not help_open
+        ):
+            relative_x, relative_y = pygame.mouse.get_rel()
+            if relative_x or relative_y:
+                renderer.rotate_view(
+                    relative_x,
+                    relative_y,
+                    bool(pygame.key.get_mods() & pygame.KMOD_SHIFT),
+                )
+            pygame.mouse.set_pos(
+                (screen.get_width() // 2, screen.get_height() // 2)
+            )
+            pygame.mouse.get_rel()
+
         if app_state == "setup":
             setup.draw(screen)
         elif simulation is not None:
+            manual_input_suppressed = (
+                simulation.paused
+                or analysis_open
+                or help_open
+                or right_mouse_dragging
+                or not window_focused
+                or simulation.finished
+                or simulation.hit
+            )
+            simulation.set_manual_input(
+                read_manual_input(manual_input_suppressed)
+            )
             if not simulation.paused and not analysis_open and not help_open:
                 accumulator += real_dt * time_scales[time_scale_index]
                 steps_this_frame = 0
@@ -633,6 +707,7 @@ def run_interactive() -> int:
 
         pygame.display.flip()
 
+    set_mouse_capture(False)
     pygame.quit()
     return 0
 

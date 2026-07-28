@@ -11,8 +11,9 @@ from zenith.camera import (
     minimum_horizontal_resolution,
     range_from_apparent_size,
 )
+from zenith.controls import ControlMode, ManualControlInput
 from zenith.guidance import TargetTrack, build_prediction_ovals
-from zenith.math3d import Vec3, angle_between, basis_from_forward
+from zenith.math3d import Vec3, angle_between, basis_from_forward, clamp
 from zenith.meshes import get_mesh
 from zenith.models import DRONE_SPECS, ROCKET_SPECS, TARGET_SPECS
 from zenith.physics import DroneState, maximum_travel_distance
@@ -70,6 +71,20 @@ class InterfaceConfigTests(unittest.TestCase):
         assert projected is not None
         self.assertAlmostEqual(projected[0], 500, delta=1)
         self.assertGreater(projected[1], 300)
+
+    def test_manual_takeover_camera_follows_selected_vehicle(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        sim.cycle_control_mode()
+        sim.cycle_control_mode()
+        renderer.view_mode = 1
+        camera = renderer.get_view_camera(sim)
+        self.assertIs(sim.controlled_vehicle, sim.target)
+        self.assertLess(
+            camera.position.distance_to(sim.target.position),
+            camera.position.distance_to(sim.interceptor.position),
+        )
+        self.assertIn(sim.target.spec.code, camera.name)
 
 
 class CameraTests(unittest.TestCase):
@@ -221,6 +236,113 @@ class PropulsionTests(unittest.TestCase):
         self.assertEqual(state.engine_output, 0.0)
 
 
+class ManualControlTests(unittest.TestCase):
+    def test_tab_cycles_auto_own_target_auto(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        self.assertIs(sim.control_mode, ControlMode.AUTO)
+        self.assertIs(sim.cycle_control_mode(), ControlMode.INTERCEPTOR)
+        self.assertIs(sim.controlled_vehicle, sim.interceptor)
+        self.assertIs(sim.cycle_control_mode(), ControlMode.TARGET)
+        self.assertIs(sim.controlled_vehicle, sim.target)
+        self.assertIs(sim.cycle_control_mode(), ControlMode.AUTO)
+        self.assertIsNone(sim.controlled_vehicle)
+
+    def test_player_own_command_overrides_but_preserves_guidance_advisory(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
+        for _ in range(120):
+            sim.step()
+            if sim.guidance is not None:
+                break
+        self.assertIsNotNone(sim.guidance)
+        sim.cycle_control_mode()
+        sim.set_manual_input(ManualControlInput())
+        sim.step()
+        self.assertGreater(sim.guidance_advisory_command.length(), 0.0)
+        self.assertAlmostEqual(sim.manual_command.acceleration.x, 0.0, places=7)
+        self.assertAlmostEqual(sim.manual_command.acceleration.z, 0.0, places=7)
+        self.assertLess(
+            sim.manual_command.acceleration.length(),
+            sim.guidance_advisory_command.length(),
+        )
+        self.assertIn("PLAYER CONTROL", sim.status)
+
+    def test_multirotor_player_can_turn_heading_independently(self) -> None:
+        sim = InterceptionSimulation(
+            SimulationConfig(target_code="FX1", scenario="steady")
+        )
+        sim.cycle_control_mode()
+        sim.cycle_control_mode()
+        initial_yaw = sim.target.orientation.y
+        sim.set_manual_input(
+            ManualControlInput(forward=1.0, turn=1.0)
+        )
+        for _ in range(60):
+            sim.step()
+        self.assertGreater(
+            abs(sim.target.orientation.y - initial_yaw),
+            math.radians(20.0),
+        )
+        self.assertLessEqual(
+            sim.manual_command.acceleration.length(),
+            max(
+                sim.target.spec.max_accel,
+                sim.target.spec.lateral_accel,
+            )
+            + 1e-7,
+        )
+
+    def test_rocket_reverse_and_airbrake_are_unavailable(self) -> None:
+        sim = InterceptionSimulation(
+            SimulationConfig(target_code="SR1", scenario="rocket_attack")
+        )
+        sim.cycle_control_mode()
+        sim.cycle_control_mode()
+        sim.set_manual_input(
+            ManualControlInput(forward=-1.0, brake=True)
+        )
+        sim.step()
+        self.assertFalse(sim.manual_command.brake_available)
+        self.assertFalse(sim.target.airbrake)
+        self.assertGreaterEqual(
+            sim.manual_command.acceleration.dot(
+                sim.target.forward_direction()
+            ),
+            -1e-7,
+        )
+
+    def test_manual_altitude_floor_blocks_descent(self) -> None:
+        sim = InterceptionSimulation(
+            SimulationConfig(
+                target_code="FX1",
+                target_position=Vec3(10.0, 2.1, 240.0),
+                scenario="steady",
+            )
+        )
+        sim.cycle_control_mode()
+        sim.cycle_control_mode()
+        sim.set_manual_input(ManualControlInput(vertical=-1.0))
+        sim.step()
+        self.assertTrue(sim.manual_command.floor_protection)
+        self.assertGreaterEqual(sim.manual_command.acceleration.y, 0.0)
+
+    def test_player_own_control_overrides_automatic_search_turn(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="evasive"))
+        for _ in range(150):
+            sim.step()
+            if sim.guidance is not None:
+                break
+        sim.cycle_control_mode()
+        sim.toggle_sensor_occlusion()
+        sim.set_manual_input(ManualControlInput())
+        for _ in range(10):
+            sim.step()
+        self.assertFalse(sim.visual_locked)
+        self.assertIsNone(sim.guidance)
+        self.assertAlmostEqual(sim.manual_command.acceleration.x, 0.0, places=7)
+        self.assertAlmostEqual(sim.manual_command.acceleration.z, 0.0, places=7)
+        self.assertGreater(sim.lost_time_s, 0.0)
+
+
 class ProjectTests(unittest.TestCase):
     def test_five_expandable_models_exist(self) -> None:
         self.assertEqual(len(DRONE_SPECS), 5)
@@ -270,6 +392,24 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(sim.visual_locked)
         self.assertIsNotNone(sim.guidance)
         self.assertGreaterEqual(sim.reacquisition_count, 1)
+
+    def test_lost_target_search_is_horizon_limited(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="evasive"))
+        for _ in range(150):
+            sim.step()
+            if sim.guidance is not None:
+                break
+        held_altitude = sim.interceptor.position.y
+        sim.toggle_sensor_occlusion()
+        for _ in range(100):
+            sim.step()
+        elevation = math.degrees(
+            math.asin(clamp(sim.search_direction.y, -1.0, 1.0))
+        )
+        self.assertLessEqual(abs(elevation), 35.0 + 1e-7)
+        self.assertAlmostEqual(sim.search_hold_altitude_m, held_altitude, places=5)
+        self.assertFalse(sim.visual_locked)
+        self.assertIsNone(sim.guidance)
 
     def test_default_scenarios_intercept(self) -> None:
         for scenario, _ in SCENARIOS:

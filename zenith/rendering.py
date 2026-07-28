@@ -8,6 +8,7 @@ import math
 import pygame
 
 from .camera import minimum_horizontal_resolution, model_vertices
+from .controls import ControlMode
 from .guidance import PredictionOval
 from .math3d import (
     Vec3,
@@ -81,17 +82,20 @@ class WorldRenderer:
         roll_mode: bool = False,
     ) -> None:
         """Apply an independent presentation-camera mouse offset."""
-        sensitivity = 0.004
         if roll_mode:
             self.look_roll_rad = (
-                self.look_roll_rad + relative_x * sensitivity + math.pi
+                self.look_roll_rad
+                + relative_x * math.radians(0.15)
+                + math.pi
             ) % math.tau - math.pi
             return
         self.look_yaw_rad = (
-            self.look_yaw_rad + relative_x * sensitivity + math.pi
+            self.look_yaw_rad
+            + relative_x * math.radians(0.12)
+            + math.pi
         ) % math.tau - math.pi
         self.look_pitch_rad = clamp(
-            self.look_pitch_rad - relative_y * sensitivity,
+            self.look_pitch_rad - relative_y * math.radians(0.12),
             math.radians(-85.0),
             math.radians(85.0),
         )
@@ -149,19 +153,35 @@ class WorldRenderer:
         line = (sim.target.position - sim.interceptor.position).normalized(
             sim.camera_forward
         )
+        controlled = sim.controlled_vehicle
+        followed = controlled or sim.interceptor
+        travel_direction = followed.velocity.normalized(
+            followed.forward_direction()
+        )
         if self.view_mode == 0:
-            base = ViewCamera(
-                sim.interceptor.position,
-                sim.camera_forward,
-                "ONBOARD / GIMBAL",
-            )
+            if controlled is None:
+                base = ViewCamera(
+                    sim.interceptor.position,
+                    sim.camera_forward,
+                    "ONBOARD / GIMBAL",
+                )
+            else:
+                base = ViewCamera(
+                    followed.position,
+                    followed.forward_direction(),
+                    f"ONBOARD / {followed.spec.code} PLAYER",
+                )
         elif self.view_mode == 1:
-            position = sim.interceptor.position - line * 14.0 + Vec3(0, 6.5, 0)
-            focus = sim.interceptor.position + line * min(45.0, sim.true_range_m * 0.55)
+            position = followed.position - travel_direction * 14.0 + Vec3(0, 5.0, 0)
+            focus = followed.position + travel_direction * 8.0
             base = ViewCamera(
                 position,
-                (focus - position).normalized(line),
-                "CHASE",
+                (focus - position).normalized(travel_direction),
+                (
+                    f"CHASE / {followed.spec.code} PLAYER"
+                    if controlled is not None
+                    else "CHASE"
+                ),
             )
         else:
             midpoint = (sim.interceptor.position + sim.target.position) * 0.5
@@ -467,12 +487,44 @@ class WorldRenderer:
                 )
                 pygame.draw.circle(surface, color, projected[:2], max(1, int(4 * fade)))
 
+    def _draw_manual_command(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+        camera: ViewCamera,
+    ) -> None:
+        controlled = sim.controlled_vehicle
+        request = sim.manual_command.acceleration
+        if controlled is None or request.length() < 0.05 or sim.hit:
+            return
+        maximum = max(
+            controlled.spec.max_accel,
+            controlled.spec.lateral_accel,
+            controlled.spec.brake_accel,
+            0.001,
+        )
+        length = 1.5 + 3.0 * clamp(request.length() / maximum, 0.0, 1.0)
+        start = controlled.position
+        end = start + request.normalized() * length
+        self._draw_polyline_3d(surface, [start, end], camera, CYAN, 3)
+        projected = self._project(end, camera, *surface.get_size())
+        if projected:
+            pygame.draw.circle(surface, CYAN, projected[:2], 5, 2)
+            surface.blit(
+                self.font_tiny.render("PLAYER CMD", True, CYAN),
+                (projected[0] + 7, projected[1] - 7),
+            )
+
     def _draw_camera_occlusion(
         self,
         surface: pygame.Surface,
         sim: InterceptionSimulation,
     ) -> None:
-        if not sim.sensor_occluded or self.view_mode != 0:
+        if (
+            not sim.sensor_occluded
+            or self.view_mode != 0
+            or sim.control_mode is not ControlMode.AUTO
+        ):
             return
         width, height = surface.get_size()
         camera_area = pygame.Rect(0, 54, width, max(1, height - 232))
@@ -522,27 +574,42 @@ class WorldRenderer:
         self._draw_ground_grid(surface, camera, usable_height)
         self._draw_trails(surface, camera)
         self._draw_predictions(surface, sim, camera)
+        self._draw_manual_command(surface, sim, camera)
 
         drone_draws = []
-        if self.view_mode != 0:
+        camera_vehicle = (
+            sim.controlled_vehicle
+            if self.view_mode == 0 and sim.controlled_vehicle is not None
+            else sim.interceptor if self.view_mode == 0 else None
+        )
+        if sim.interceptor is not camera_vehicle:
             drone_draws.append(
                 (
                     camera_coordinates(
                         sim.interceptor.position, camera.position, camera.forward
                     ).z,
                     sim.interceptor,
-                    f"OUR // {sim.interceptor.spec.code}",
+                    (
+                        f"PLAYER // OUR // {sim.interceptor.spec.code}"
+                        if sim.control_mode is ControlMode.INTERCEPTOR
+                        else f"OUR // {sim.interceptor.spec.code}"
+                    ),
                     False,
                 )
             )
-        drone_draws.append(
-            (
-                camera_coordinates(sim.target.position, camera.position, camera.forward).z,
-                sim.target,
-                "TARGET",
-                sim.visual_locked,
+        if sim.target is not camera_vehicle:
+            drone_draws.append(
+                (
+                    camera_coordinates(sim.target.position, camera.position, camera.forward).z,
+                    sim.target,
+                    (
+                        f"PLAYER // TARGET // {sim.target.spec.code}"
+                        if sim.control_mode is ControlMode.TARGET
+                        else "TARGET"
+                    ),
+                    sim.visual_locked,
+                )
             )
-        )
         target_bounds = None
         for _, state, label, highlighted in sorted(drone_draws, reverse=True, key=lambda item: item[0]):
             bounds = self._draw_drone(surface, state, camera, label, highlighted)
@@ -593,6 +660,143 @@ class WorldRenderer:
                 break
         surface.blit(panel, rect)
 
+    def _draw_control_hud(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        if sim.control_mode is ControlMode.AUTO:
+            label = self.font_bold.render("TAB  TAKE CONTROL", True, CYAN)
+            chip = pygame.Surface((label.get_width() + 24, 34), pygame.SRCALPHA)
+            chip.fill(PANEL)
+            pygame.draw.rect(chip, (64, 143, 155), chip.get_rect(), 1)
+            chip.blit(label, (12, 8))
+            surface.blit(chip, (12, 84))
+            return
+
+        controlled = sim.controlled_vehicle
+        if controlled is None:
+            return
+        rect = pygame.Rect(12, 84, 318, 164)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill(PANEL)
+        pygame.draw.rect(panel, CYAN, panel.get_rect(), 1)
+        panel.blit(
+            self.font_bold.render(sim.control_mode.value, True, CYAN),
+            (12, 8),
+        )
+        panel.blit(
+            self.font_tiny.render(
+                f"{controlled.spec.name} // {controlled.spec.flight_model.upper()}",
+                True,
+                WHITE,
+            ),
+            (12, 29),
+        )
+
+        controls = sim.manual_input
+        key_states = (
+            ("W", controls.forward > 0.0),
+            ("A", controls.turn < 0.0),
+            ("S", controls.forward < 0.0),
+            ("D", controls.turn > 0.0),
+            ("Q", controls.vertical < 0.0),
+            ("E", controls.vertical > 0.0),
+            ("SHIFT", controls.full_thrust),
+            ("CTRL", controls.brake),
+        )
+        x = 12
+        for key, active in key_states:
+            key_width = 48 if len(key) > 1 else 26
+            box = pygame.Rect(x, 48, key_width, 22)
+            pygame.draw.rect(
+                panel,
+                (20, 64, 67) if active else (10, 30, 39),
+                box,
+            )
+            pygame.draw.rect(panel, GREEN if active else MUTED, box, 1)
+            text = self.font_tiny.render(
+                key,
+                True,
+                GREEN if active else MUTED,
+            )
+            panel.blit(
+                text,
+                (box.centerx - text.get_width() // 2, box.y + 4),
+            )
+            x += key_width + 5
+
+        flight_model = controlled.spec.flight_model
+        authority = (
+            ("FWD", GREEN),
+            (
+                "REV",
+                GREEN
+                if flight_model in ("multirotor", "vectored_vtol")
+                else AMBER if flight_model == "fixed_wing" else RED,
+            ),
+            (
+                "TURN",
+                GREEN
+                if flight_model in ("multirotor", "vectored_vtol")
+                else AMBER,
+            ),
+            (
+                "VERT",
+                GREEN
+                if flight_model in ("multirotor", "vectored_vtol")
+                else AMBER,
+            ),
+            (
+                "BRAKE",
+                RED
+                if flight_model == "rocket"
+                else AMBER if flight_model == "fixed_wing" else GREEN,
+            ),
+        )
+        x = 12
+        for label, color in authority:
+            rendered = self.font_tiny.render(f"{label} >", True, color)
+            panel.blit(rendered, (x, 79))
+            x += rendered.get_width() + 9
+
+        requested = sim.manual_command.acceleration.length()
+        actual = controlled.acceleration.length()
+        panel.blit(
+            self.font_tiny.render(
+                f"REQUEST / ACTUAL A   {requested:5.2f} / {actual:5.2f} m/s2",
+                True,
+                WHITE,
+            ),
+            (12, 102),
+        )
+        brake_text = (
+            "ON"
+            if controlled.airbrake
+            else "N/A" if flight_model == "rocket" else "OFF"
+        )
+        panel.blit(
+            self.font_tiny.render(
+                f"ENGINE REQ/ACT {sim.manual_command.requested_engine*100:3.0f}"
+                f"/{controlled.engine_output*100:3.0f}%   BRAKE {brake_text}",
+                True,
+                AMBER if controlled.airbrake else MUTED,
+            ),
+            (12, 121),
+        )
+        if sim.control_mode is ControlMode.INTERCEPTOR:
+            advisory = (
+                f"GUIDANCE ADVISORY {sim.guidance_advisory_command.length():.2f} m/s2"
+                if sim.guidance is not None
+                else "GUIDANCE ADVISORY: SENSOR SEARCH"
+            )
+        else:
+            advisory = "OUR DRONE REMAINS UNDER AUTO GUIDANCE"
+        if sim.manual_command.floor_protection:
+            advisory = "ALTITUDE FLOOR ACTIVE // DOWN LIMITED"
+        panel.blit(self.font_tiny.render(advisory, True, AMBER), (12, 141))
+        surface.blit(panel, rect)
+
     def draw_hud(
         self,
         surface: pygame.Surface,
@@ -621,12 +825,13 @@ class WorldRenderer:
 
         surface.blit(
             self.font_tiny.render(
-                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [RMB] LOOK   [SHIFT+RMB] ROLL   [C] CENTER   [H] HELP",
+                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [RMB] CAPTURE LOOK   [SHIFT+RMB] ROLL   [C] CENTER   [H] HELP",
                 True,
                 MUTED,
             ),
             (16, 62),
         )
+        self._draw_control_hud(surface, sim)
         if sim.paused:
             pause = self.font_large.render("SIMULATION PAUSED", True, AMBER)
             surface.blit(pause, (width // 2 - pause.get_width() // 2, 82))
@@ -759,7 +964,7 @@ class WorldRenderer:
         margin = 42
         pygame.draw.rect(overlay, (59, 136, 151), (margin, margin, width - margin * 2, height - margin * 2), 1)
         overlay.blit(self.font_title.render("ENGINEERING ANALYSIS // MONOCULAR RANGE", True, WHITE), (margin + 24, margin + 18))
-        overlay.blit(self.font_small.render("[A] close analysis", True, MUTED), (width - margin - 160, margin + 25))
+        overlay.blit(self.font_small.render("[F2] close analysis", True, MUTED), (width - margin - 175, margin + 25))
         overlay.blit(
             self.font.render("Pinhole model:  range Z = focal length f × known target span S ÷ apparent pixel span p", True, CYAN),
             (margin + 24, margin + 58),
@@ -859,38 +1064,79 @@ class WorldRenderer:
         width, height = surface.get_size()
         overlay = pygame.Surface((width, height), pygame.SRCALPHA)
         overlay.fill((2, 8, 14, 230))
-        card = pygame.Rect(width // 2 - 330, height // 2 - 315, 660, 630)
+        card = pygame.Rect(width // 2 - 470, height // 2 - 300, 940, 600)
         pygame.draw.rect(overlay, (7, 22, 32), card)
         pygame.draw.rect(overlay, CYAN, card, 1)
-        overlay.blit(self.font_title.render("PRESENTATION CONTROLS", True, WHITE), (card.x + 28, card.y + 24))
-        items = [
+        overlay.blit(
+            self.font_title.render("PRESENTATION + FLIGHT CONTROLS", True, WHITE),
+            (card.x + 28, card.y + 24),
+        )
+        presentation_items = [
             ("SPACE", "pause / continue the 60 Hz simulation"),
             ("+ / -", "increase / decrease time scale"),
             ("V", "cycle onboard, chase, and tactical cameras"),
-            ("RMB DRAG", "look freely without changing sensor guidance"),
+            ("RMB HOLD", "capture mouse for unlimited free look"),
             ("SHIFT+RMB", "roll the presentation camera"),
             ("C", "center the free-look camera"),
-            ("A", "open range-error and resolution analysis"),
+            ("F2", "open range-error and resolution analysis"),
+            ("F5", "export verification telemetry to CSV"),
             ("R", "restart the current simulation"),
             ("N", "return to setup and place new drones"),
-            ("E", "export verification telemetry to a CSV file"),
-            ("O", "toggle camera occlusion to prove lock loss / search"),
+            ("O", "force camera occlusion (lock-loss proof)"),
             ("H", "close this help panel"),
             ("ESC", "close an overlay, then exit"),
         ]
-        y = card.y + 86
-        for key, description in items:
+        flight_items = [
+            ("TAB", "AUTO -> OUR DRONE -> TARGET -> AUTO"),
+            ("W / S", "forward thrust / reverse or decelerate"),
+            ("A / D", "turn left / right within vehicle limits"),
+            ("Q / E", "descend / climb; release to hold altitude"),
+            ("SHIFT", "request full available maneuver authority"),
+            ("CTRL", "airbrake (unavailable on rockets)"),
+            ("RMB", "mouse look suppresses flight-key input"),
+            ("GREEN", "direct authority"),
+            ("AMBER", "turn / braking limited"),
+            ("RED", "requested action unavailable"),
+        ]
+        overlay.blit(
+            self.font_bold.render("CAMERA / DEMO", True, AMBER),
+            (card.x + 36, card.y + 76),
+        )
+        overlay.blit(
+            self.font_bold.render("PLAYER AUTHORITY", True, AMBER),
+            (card.x + 490, card.y + 76),
+        )
+        y = card.y + 108
+        for key, description in presentation_items:
             overlay.blit(self.font_bold.render(key, True, CYAN), (card.x + 36, y))
-            overlay.blit(self.font.render(description, True, WHITE), (card.x + 160, y))
+            overlay.blit(self.font_tiny.render(description, True, WHITE), (card.x + 138, y + 2))
+            y += 27
+        y = card.y + 108
+        for key, description in flight_items:
+            color = GREEN if key == "GREEN" else AMBER if key == "AMBER" else RED if key == "RED" else CYAN
+            overlay.blit(self.font_bold.render(key, True, color), (card.x + 490, y))
+            overlay.blit(self.font_tiny.render(description, True, WHITE), (card.x + 586, y + 2))
             y += 30
-        y += 8
+
+        separator_y = card.bottom - 112
+        pygame.draw.line(
+            overlay,
+            (42, 92, 103),
+            (card.x + 28, separator_y),
+            (card.right - 28, separator_y),
+            1,
+        )
         notes = [
             "Every oval lies exactly in the sensor line-of-sight plane.",
             "Its border conservatively contains all allowed projected maneuvers.",
             "Green oval = 4/4 reachable; amber = partial; red = unreachable.",
-            "The bottom-right true range is simulation verification, never guidance input.",
+            "True range is simulation verification only, never guidance input.",
         ]
+        y = separator_y + 12
         for note in notes:
-            overlay.blit(self.font_small.render(note, True, MUTED), (card.x + 36, y))
-            y += 25
+            overlay.blit(
+                self.font_tiny.render(note, True, MUTED),
+                (card.x + 36, y),
+            )
+            y += 19
         surface.blit(overlay, (0, 0))

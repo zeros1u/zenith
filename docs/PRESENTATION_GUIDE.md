@@ -38,11 +38,11 @@ Point out:
 - pixel size, focal length, estimated range, and uncertainty are visible;
 - `TRUE / ERROR` is labeled verification-only;
 - the exact target coordinate never enters the guidance function;
-- pressing `E` exports the camera estimate and truth comparison for every sampled frame.
+- pressing `F5` exports the camera estimate and truth comparison for every sampled frame.
 
 Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The gimbal scans from the last seen bearing without using target truth. Press `O` again; only a new image detection can reacquire lock and restart guidance.
 
-Hold the right mouse button and drag to inspect the scene. Hold `Shift` during the drag to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance. Press `C` to return to the centered sensor presentation.
+Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered sensor presentation.
 
 ### 5. Demonstrate robustness — 60 seconds
 
@@ -62,7 +62,7 @@ python verify_prototype.py
 
 ### 6. Show analysis and finish — 60 seconds
 
-Press `A`. Explain that range error grows inversely with pixel count. Show the minimum-resolution table, which changes with the selected target size. Finish with the successful collision, explosion, and falling physics.
+Press `F2`. Explain that range error grows inversely with pixel count. Show the minimum-resolution table, which changes with the selected target size. Finish with the successful collision, explosion, and falling physics.
 
 ## Likely questions
 
@@ -106,14 +106,19 @@ No. The renderer now uses original low-poly meshes with rotors, arms, fuselages,
 
 The prototype uses continuous acceleration, drag, and airbrake forces because they are easier to verify physically. A booster would use the same acceleration command interface but with a time-limited higher bound.
 
+### “Can you control both vehicles?”
+
+Yes. `Tab` cycles from autonomy to our interceptor, then to the target, then back to autonomy. `W/S` requests forward/reverse or braking, `A/D` turns, `Q/E` changes altitude, `Shift` requests full authority, and `Ctrl` uses an available airbrake. The colored authority row proves that a multirotor, fixed wing, and rocket do not receive the same capabilities. The player command still passes through the exact propulsion physics used by autonomous guidance.
+
 ## A clean live-demo sequence
 
 1. Start `run_zenith.bat`.
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
 3. Start and wait for signal confirmation.
-4. Press `V` once for chase view, right-drag to look around, and use `Shift` + right-drag to show camera roll. Press `C` to center it, then press `V` for tactical overview.
-5. Press `A`; discuss range degradation and resolution.
-6. Close analysis with `A`, return onboard with `V`, then press `O` to prove guidance loss and `O` again to demonstrate reacquisition.
-7. Press `-` for slow motion and let the collision complete.
-8. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`.
-9. Press `E` to export the proof data.
+4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it, press `C` to center, then press `V` for tactical overview.
+5. Press `Tab` for our-drone control. Show the guidance advisory beside your own command, then use `W/A/Q` with `Shift`. Press `Tab` again and control the target; point out the chase camera and authority HUD. Press `Tab` a third time to restore autonomy.
+6. Press `F2`; discuss range degradation and resolution.
+7. Close analysis with `F2`, return onboard with `V`, then press `O` to prove guidance loss. Point out that search follows the last image motion while holding altitude and staying near the horizon. Press `O` again to demonstrate genuine reacquisition.
+8. Press `-` for slow motion and let the collision complete.
+9. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`. Take over the rocket to show that reverse and airbrake are red/unavailable.
+10. Press `F5` to export the proof data.

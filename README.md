@@ -2,7 +2,7 @@
 
 ZENITH is a windowed interactive desktop proof-of-concept for vision-only interception. It estimates an intruder's range from a monocular camera, builds conservative maneuver-containment ovals, and outputs the maneuver for a propulsion-constrained interceptor. No radar, lidar, rangefinder, or target ground-truth coordinates are used by the guidance calculation.
 
-The project includes five playable drones with distinct low-poly quadcopter, swept-wing, delta-wing, and blended-wing meshes. Two target-only rocket profiles add nose cones, cylindrical bodies, fins, exhausts, incoming-flight physics, and rocket-specific interception messages.
+The project includes five controllable drones with distinct low-poly quadcopter, swept-wing, delta-wing, and blended-wing meshes. Two rocket profiles add nose cones, cylindrical bodies, fins, exhausts, incoming-flight physics, and rocket-specific interception messages; rockets can also be taken over during a demonstration.
 
 ![DPI-aware windowed setup](artifacts/setup_windowed.png)
 
@@ -11,6 +11,8 @@ The project includes five playable drones with distinct low-poly quadcopter, swe
 ![Rolled chase-camera free look](artifacts/camera_freelook.png)
 
 ![Visual lock loss and search state](artifacts/lock_loss_search.png)
+
+![Manual target takeover and authority HUD](artifacts/manual_takeover.png)
 
 ![Rocket interception](artifacts/rocket_intercept.png)
 
@@ -33,12 +35,13 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 2. Select `EVASIVE MANEUVERS`, `1920 × 1080`, and start the simulation.
 3. Observe the target label change from `UNKNOWN / QUERYING` to `FALCON-X1`.
 4. Point out the 1, 2, 3, and 5 second prediction ovals. A green border means 4/4 extremes are reachable, amber means some are reachable, and red means none are reachable.
-5. Press `A` to show the camera-resolution and range-error analysis.
-6. Press `V` to cycle views. Hold the right mouse button and drag to look around; hold `Shift` while right-dragging to roll the presentation camera. Press `C` to center it.
+5. Press `F2` to show the camera-resolution and range-error analysis.
+6. Press `V` to cycle views. Hold the right mouse button to capture the pointer for unlimited free look; hold `Shift` while moving it to roll the presentation camera. Release the button to restore the pointer, or press `C` to center the view.
 7. Press `O` to obscure the camera: lock, guidance, range, and ovals disappear immediately. Press `O` again and watch the search pattern genuinely reacquire the target.
-8. Press `-` to slow the terminal interception.
-9. Start a new simulation, select `SKYFALL-R1` or `LANCE-M2` as the target, and demonstrate `ROCKET ATTACK`.
-10. Press `E` to export the run's verification telemetry.
+8. Press `Tab` to take over our drone, then press it again to take over the target. Use `W/S`, `A/D`, `Q/E`, `Shift`, and `Ctrl`; the authority HUD proves which requests each propulsion model can execute. A third `Tab` restores full autonomy.
+9. Press `-` to slow the terminal interception.
+10. Start a new simulation, select `SKYFALL-R1` or `LANCE-M2` as the target, and demonstrate `ROCKET ATTACK`.
+11. Press `F5` to export the run's verification telemetry.
 
 ## Controls
 
@@ -47,13 +50,19 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 | `Space` | Pause or continue |
 | `+` / `-` | Change time scale from 0.25× to 4× |
 | `V` | Cycle onboard, chase, and tactical views |
-| Right mouse drag | Look freely around the current presentation view |
-| `Shift` + right mouse drag | Roll the presentation camera |
+| Hold right mouse | Capture the pointer for unlimited free look |
+| `Shift` + right mouse | Roll the presentation camera |
 | `C` | Center the free-look camera |
-| `A` | Toggle engineering analysis |
+| `Tab` | Cycle `AUTO -> PLAYER / OUR DRONE -> PLAYER / TARGET -> AUTO` |
+| `W` / `S` | Forward thrust / reverse or decelerate |
+| `A` / `D` | Turn left / right within propulsion limits |
+| `Q` / `E` | Descend / climb; release to hold the assisted altitude |
+| `Shift` | Request full available maneuver authority |
+| `Ctrl` | Airbrake where the selected vehicle supports one |
+| `F2` | Toggle engineering analysis |
 | `H` | Toggle help |
 | `O` | Toggle camera occlusion for lock-loss/reacquisition proof |
-| `E` | Export verification telemetry as CSV |
+| `F5` | Export verification telemetry as CSV |
 | `R` | Restart the current setup |
 | `N` | Start a new setup |
 | `Esc` | Close an overlay, then exit |
@@ -79,7 +88,7 @@ flowchart LR
     E --> F
     F --> G[Filtered position and velocity track]
     C --> L{Visual lock valid?}
-    L -- No --> M[Disable guidance and scan from last bearing]
+    L -- No --> M[Disable guidance and extrapolate image bearing]
     M --> B
     L -- Yes --> F
     E --> H[1, 2, 3, 5 s maneuver ovals]
@@ -89,11 +98,13 @@ flowchart LR
     J --> K[Acceleration command]
 ```
 
-The simulation's exact target position is used only to render the synthetic camera, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads the camera detection, signal-resolved model data, and our drone's own integrated state. A lost visual detection invalidates guidance immediately; the last track is not coasted as if it were a current lock.
+The simulation's exact target position is used only to render the synthetic camera, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads the camera detection, signal-resolved model data, and our drone's own integrated state. A lost visual detection invalidates guidance immediately; the last metric track is not coasted as if it were a current lock. The search system filters the final image-plane bearing rate, extrapolates it for at most 1.5 seconds, then widens a horizontal scan while limiting elevation to 35 degrees from the world horizon. The autonomous interceptor turns toward that predicted horizontal direction while holding the altitude recorded at loss. If the player controls our drone, the player command overrides that body turn while the independent sensor camera continues searching.
 
 Every prediction oval is constructed in the plane perpendicular to the sensor camera's optical axis. Its four marked points are the reachability tests requested by the project idea. The ellipse itself conservatively contains the projection of every acceleration allowed by the identified target's propulsion limits; the orange unchanged-trajectory prediction is inside it. Active ovals remain visible when they are unreachable: green is 4/4, amber is partial, and red is 0/4. They disappear only when visual lock is invalid, because displaying a current prediction without a current observation would be misleading.
 
-Mouse free-look changes only the presentation renderer, not the sensor axis, detection, or guidance. This lets the oval plane be inspected from the side without altering the result being demonstrated.
+Mouse free-look changes only the presentation renderer, not the sensor axis, detection, or guidance. While the right button is held, the pointer is captured and hidden so window edges cannot stop rotation; release, focus loss, overlays, or simulation exit restore it. Vehicle key input is suppressed during mouse capture so `Shift` can roll without also commanding thrust.
+
+Manual takeover is an advisory proof mode rather than a physics bypass. Inputs become acceleration and turn requests, then pass through the same thrust cone, axial engine, airbrake, turn-rate, speed, drag, and altitude-floor constraints used by autonomous guidance. During our-drone takeover, the normal oval solution remains visible as a guidance recommendation beside the player's actual request.
 
 ## Verification
 
@@ -104,7 +115,7 @@ python verify_prototype.py --duration 30 --csv artifacts\verification.csv
 python -m unittest discover -v
 ```
 
-The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated test suite checks the camera model, coordinate basis, free-look/roll isolation, complete-oval reachability colors, minimum-resolution formula, exact oval-plane orientation, conservative containment samples, propulsion direction and turn limits, visual lock loss/reacquisition, model catalogue, and every default target behavior.
+The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated test suite checks the camera model, coordinate basis, free-look/roll isolation, manual authority cycling, chase-camera following, drone and rocket control constraints, altitude-floor protection, guidance advisory override, horizon-limited lost-target search, complete-oval reachability colors, minimum-resolution formula, exact oval-plane orientation, conservative containment samples, propulsion direction and turn limits, visual lock loss/reacquisition, model catalogue, and every default target behavior.
 
 ## Project structure
 
@@ -113,9 +124,10 @@ app.py                    Desktop UI, setup screen, controls, CSV export
 verify_prototype.py       Deterministic six-scenario verification
 zenith/
   camera.py               Pinhole camera, detector output, range estimator
+  controls.py             Manual authority modes and assisted flight requests
   guidance.py             Tracking, prediction ovals, reachability, commands
   math3d.py               Vector, camera-basis, and transform mathematics
-  models.py               Five drones and two target-only rocket profiles
+  models.py               Five drones and two controllable rocket profiles
   meshes.py               Bundled procedural drone and rocket polygon meshes
   physics.py              60 Hz thrust/turn limits, drag, brake, crash physics
   rendering.py            Software 3D scene, four-panel HUD, analysis display

@@ -30,7 +30,12 @@ class DroneState:
     thrust_vector: Vec3 = field(default_factory=Vec3)
     engine_output: float = 0.0
 
-    def integrate(self, commanded_acceleration: Vec3, dt: float) -> None:
+    def integrate(
+        self,
+        commanded_acceleration: Vec3,
+        dt: float,
+        desired_yaw_rad: float | None = None,
+    ) -> None:
         if self.crashed:
             gravity = Vec3(0.0, -9.81, 0.0)
             drag = self.velocity * (-0.004 * self.velocity.length())
@@ -50,7 +55,11 @@ class DroneState:
         if self.spec.flight_model in ("fixed_wing", "rocket"):
             self._integrate_directional(commanded_acceleration, dt)
         else:
-            self._integrate_vectored(commanded_acceleration, dt)
+            self._integrate_vectored(
+                commanded_acceleration,
+                dt,
+                desired_yaw_rad,
+            )
 
     def forward_direction(self) -> Vec3:
         """Vehicle nose direction used by engines and envelope calculations."""
@@ -64,7 +73,12 @@ class DroneState:
             passive_drag = passive_drag - self.velocity.normalized() * self.spec.brake_accel
         return passive_drag
 
-    def _integrate_vectored(self, commanded_acceleration: Vec3, dt: float) -> None:
+    def _integrate_vectored(
+        self,
+        commanded_acceleration: Vec3,
+        dt: float,
+        desired_yaw_rad: float | None = None,
+    ) -> None:
         """Multirotor/VTOL thrust: requested motion requires a visible body tilt."""
         horizontal = Vec3(
             commanded_acceleration.x,
@@ -110,7 +124,11 @@ class DroneState:
 
         horizontal_velocity = Vec3(self.velocity.x, 0.0, self.velocity.z)
         heading = horizontal_velocity.normalized(self.forward_direction())
-        target_yaw = math.atan2(heading.x, heading.z)
+        target_yaw = (
+            desired_yaw_rad
+            if desired_yaw_rad is not None
+            else math.atan2(heading.x, heading.z)
+        )
         forward_flat = Vec3(math.sin(target_yaw), 0.0, math.cos(target_yaw))
         right_flat = Vec3(forward_flat.z, 0.0, -forward_flat.x)
         target_pitch = clamp(
