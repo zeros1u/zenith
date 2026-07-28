@@ -21,10 +21,11 @@ Explain that the image center gives bearing, while known size gives scale. `Dx`,
 Point to the 1, 2, 3, and 5 second ovals:
 
 - each oval represents positions allowed by the target's known acceleration and speed;
-- every oval lies exactly in the plane perpendicular to our current camera view;
+- every oval lies exactly in the plane perpendicular to our sensor camera view;
 - the border is inflated from propulsion-specific acceleration support, so the target's projected position cannot escape it under the stated limits;
 - the four extreme points are calculated separately and tested for our reachability;
-- green means our drone can arrive before the target; red means it cannot;
+- a green border means all 4 extremes are reachable, amber means a partial 1–3/4 result, and red means 0/4;
+- an unreachable oval remains visible and red instead of disappearing;
 - if all four extremes are reachable, the center is a safe guidance objective;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
 - near contact, large ovals are ignored and terminal pursuit matches the target's motion.
@@ -40,6 +41,8 @@ Point out:
 - pressing `E` exports the camera estimate and truth comparison for every sampled frame.
 
 Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The gimbal scans from the last seen bearing without using target truth. Press `O` again; only a new image detection can reacquire lock and restart guidance.
+
+Hold the right mouse button and drag to inspect the scene. Hold `Shift` during the drag to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance. Press `C` to return to the centered sensor presentation.
 
 ### 5. Demonstrate robustness — 60 seconds
 
@@ -108,7 +111,7 @@ The prototype uses continuous acceleration, drag, and airbrake forces because th
 1. Start `run_zenith.bat`.
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
 3. Start and wait for signal confirmation.
-4. Press `V` once for chase view, then again for tactical overview.
+4. Press `V` once for chase view, right-drag to look around, and use `Shift` + right-drag to show camera roll. Press `C` to center it, then press `V` for tactical overview.
 5. Press `A`; discuss range degradation and resolution.
 6. Close analysis with `A`, return onboard with `V`, then press `O` to prove guidance loss and `O` again to demonstrate reacquisition.
 7. Press `-` for slow motion and let the collision complete.

@@ -8,6 +8,8 @@ The project includes five playable drones with distinct low-poly quadcopter, swe
 
 ![Mid-flight prototype](artifacts/prototype_midflight.png)
 
+![Rolled chase-camera free look](artifacts/camera_freelook.png)
+
 ![Visual lock loss and search state](artifacts/lock_loss_search.png)
 
 ![Rocket interception](artifacts/rocket_intercept.png)
@@ -30,9 +32,9 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 1. Keep `TALON-R` as our interceptor and `FALCON-X1` as the target.
 2. Select `EVASIVE MANEUVERS`, `1920 × 1080`, and start the simulation.
 3. Observe the target label change from `UNKNOWN / QUERYING` to `FALCON-X1`.
-4. Point out the 1, 2, 3, and 5 second prediction ovals. Green extremes are reachable; red extremes are not.
+4. Point out the 1, 2, 3, and 5 second prediction ovals. A green border means 4/4 extremes are reachable, amber means some are reachable, and red means none are reachable.
 5. Press `A` to show the camera-resolution and range-error analysis.
-6. Press `V` to cycle through onboard, chase, and tactical views.
+6. Press `V` to cycle views. Hold the right mouse button and drag to look around; hold `Shift` while right-dragging to roll the presentation camera. Press `C` to center it.
 7. Press `O` to obscure the camera: lock, guidance, range, and ovals disappear immediately. Press `O` again and watch the search pattern genuinely reacquire the target.
 8. Press `-` to slow the terminal interception.
 9. Start a new simulation, select `SKYFALL-R1` or `LANCE-M2` as the target, and demonstrate `ROCKET ATTACK`.
@@ -45,6 +47,9 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 | `Space` | Pause or continue |
 | `+` / `-` | Change time scale from 0.25× to 4× |
 | `V` | Cycle onboard, chase, and tactical views |
+| Right mouse drag | Look freely around the current presentation view |
+| `Shift` + right mouse drag | Roll the presentation camera |
+| `C` | Center the free-look camera |
 | `A` | Toggle engineering analysis |
 | `H` | Toggle help |
 | `O` | Toggle camera occlusion for lock-loss/reacquisition proof |
@@ -86,7 +91,9 @@ flowchart LR
 
 The simulation's exact target position is used only to render the synthetic camera, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads the camera detection, signal-resolved model data, and our drone's own integrated state. A lost visual detection invalidates guidance immediately; the last track is not coasted as if it were a current lock.
 
-Every prediction oval is constructed in the plane perpendicular to the current camera optical axis. Its four marked points are the reachability tests requested by the project idea. The ellipse itself conservatively contains the projection of every acceleration allowed by the identified target's propulsion limits; the orange unchanged-trajectory prediction is inside it.
+Every prediction oval is constructed in the plane perpendicular to the sensor camera's optical axis. Its four marked points are the reachability tests requested by the project idea. The ellipse itself conservatively contains the projection of every acceleration allowed by the identified target's propulsion limits; the orange unchanged-trajectory prediction is inside it. Active ovals remain visible when they are unreachable: green is 4/4, amber is partial, and red is 0/4. They disappear only when visual lock is invalid, because displaying a current prediction without a current observation would be misleading.
+
+Mouse free-look changes only the presentation renderer, not the sensor axis, detection, or guidance. This lets the oval plane be inspected from the side without altering the result being demonstrated.
 
 ## Verification
 
@@ -97,7 +104,7 @@ python verify_prototype.py --duration 30 --csv artifacts\verification.csv
 python -m unittest discover -v
 ```
 
-The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated test suite checks the camera model, coordinate basis, minimum-resolution formula, exact oval-plane orientation, conservative containment samples, propulsion direction and turn limits, visual lock loss/reacquisition, model catalogue, and every default target behavior.
+The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated test suite checks the camera model, coordinate basis, free-look/roll isolation, complete-oval reachability colors, minimum-resolution formula, exact oval-plane orientation, conservative containment samples, propulsion direction and turn limits, visual lock loss/reacquisition, model catalogue, and every default target behavior.
 
 ## Project structure
 

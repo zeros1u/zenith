@@ -504,6 +504,7 @@ def run_interactive() -> int:
     analysis_open = False
     help_open = False
     cinematic_hit_seen = False
+    right_mouse_dragging = False
     running = True
 
     while running:
@@ -521,6 +522,8 @@ def run_interactive() -> int:
                     screen = pygame.display.set_mode(requested, pygame.RESIZABLE)
                 setup.size = screen.get_size()
                 continue
+            if event.type == pygame.WINDOWFOCUSLOST:
+                right_mouse_dragging = False
             if app_state == "setup":
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     running = False
@@ -543,6 +546,24 @@ def run_interactive() -> int:
 
             if simulation is None:
                 continue
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                right_mouse_dragging = True
+                continue
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 3:
+                right_mouse_dragging = False
+                continue
+            if (
+                event.type == pygame.MOUSEMOTION
+                and right_mouse_dragging
+                and not analysis_open
+                and not help_open
+            ):
+                renderer.rotate_view(
+                    event.rel[0],
+                    event.rel[1],
+                    bool(pygame.key.get_mods() & pygame.KMOD_SHIFT),
+                )
+                continue
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if analysis_open:
@@ -559,6 +580,8 @@ def run_interactive() -> int:
                     time_scale_index = max(0, time_scale_index - 1)
                 elif event.key == pygame.K_v:
                     renderer.cycle_view()
+                elif event.key == pygame.K_c:
+                    renderer.reset_view_offset()
                 elif event.key == pygame.K_a:
                     analysis_open = not analysis_open
                     help_open = False
@@ -573,6 +596,7 @@ def run_interactive() -> int:
                 elif event.key == pygame.K_n:
                     app_state = "setup"
                     simulation = None
+                    right_mouse_dragging = False
                     analysis_open = False
                     help_open = False
                 elif event.key == pygame.K_e:

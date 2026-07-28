@@ -27,7 +27,7 @@ AMBER = (255, 190, 86)
 RED = (255, 91, 99)
 WHITE = (224, 238, 244)
 MUTED = (130, 156, 170)
-PANEL = (5, 16, 25, 208)
+PANEL = (5, 16, 25, 238)
 
 
 @dataclass(slots=True)
@@ -35,6 +35,7 @@ class ViewCamera:
     position: Vec3
     forward: Vec3
     name: str
+    roll_rad: float = 0.0
 
 
 class WorldRenderer:
@@ -52,9 +53,48 @@ class WorldRenderer:
         self.interceptor_trail: list[Vec3] = []
         self.target_trail: list[Vec3] = []
         self._trail_timer = 0.0
+        self.look_yaw_rad = 0.0
+        self.look_pitch_rad = 0.0
+        self.look_roll_rad = 0.0
 
     def cycle_view(self) -> None:
         self.view_mode = (self.view_mode + 1) % 3
+        self.reset_view_offset()
+
+    @property
+    def free_look_active(self) -> bool:
+        return (
+            abs(self.look_yaw_rad) > 1e-5
+            or abs(self.look_pitch_rad) > 1e-5
+            or abs(self.look_roll_rad) > 1e-5
+        )
+
+    def reset_view_offset(self) -> None:
+        self.look_yaw_rad = 0.0
+        self.look_pitch_rad = 0.0
+        self.look_roll_rad = 0.0
+
+    def rotate_view(
+        self,
+        relative_x: float,
+        relative_y: float,
+        roll_mode: bool = False,
+    ) -> None:
+        """Apply an independent presentation-camera mouse offset."""
+        sensitivity = 0.004
+        if roll_mode:
+            self.look_roll_rad = (
+                self.look_roll_rad + relative_x * sensitivity + math.pi
+            ) % math.tau - math.pi
+            return
+        self.look_yaw_rad = (
+            self.look_yaw_rad + relative_x * sensitivity + math.pi
+        ) % math.tau - math.pi
+        self.look_pitch_rad = clamp(
+            self.look_pitch_rad - relative_y * sensitivity,
+            math.radians(-85.0),
+            math.radians(85.0),
+        )
 
     def update_trails(self, sim: InterceptionSimulation, dt: float) -> None:
         self._trail_timer += dt
@@ -110,18 +150,51 @@ class WorldRenderer:
             sim.camera_forward
         )
         if self.view_mode == 0:
-            return ViewCamera(sim.interceptor.position, sim.camera_forward, "ONBOARD / GIMBAL")
-        if self.view_mode == 1:
+            base = ViewCamera(
+                sim.interceptor.position,
+                sim.camera_forward,
+                "ONBOARD / GIMBAL",
+            )
+        elif self.view_mode == 1:
             position = sim.interceptor.position - line * 14.0 + Vec3(0, 6.5, 0)
             focus = sim.interceptor.position + line * min(45.0, sim.true_range_m * 0.55)
-            return ViewCamera(position, (focus - position).normalized(line), "CHASE")
-        midpoint = (sim.interceptor.position + sim.target.position) * 0.5
-        separation = clamp(sim.true_range_m, 35.0, 280.0)
-        position = midpoint + Vec3(-separation * 0.54, separation * 0.40, -separation * 0.58)
+            base = ViewCamera(
+                position,
+                (focus - position).normalized(line),
+                "CHASE",
+            )
+        else:
+            midpoint = (sim.interceptor.position + sim.target.position) * 0.5
+            separation = clamp(sim.true_range_m, 35.0, 280.0)
+            position = midpoint + Vec3(
+                -separation * 0.54,
+                separation * 0.40,
+                -separation * 0.58,
+            )
+            base = ViewCamera(
+                position,
+                (midpoint - position).normalized(line),
+                "TACTICAL OVERVIEW",
+            )
+
+        if not self.free_look_active:
+            return base
+        right, up, forward = basis_from_forward(base.forward)
+        yawed = (
+            forward * math.cos(self.look_yaw_rad)
+            + right * math.sin(self.look_yaw_rad)
+        ).normalized(forward)
+        yawed_right = up.cross(yawed).normalized(right)
+        yawed_up = yawed.cross(yawed_right).normalized(up)
+        looked = (
+            yawed * math.cos(self.look_pitch_rad)
+            + yawed_up * math.sin(self.look_pitch_rad)
+        ).normalized(yawed)
         return ViewCamera(
-            position,
-            (midpoint - position).normalized(line),
-            "TACTICAL OVERVIEW",
+            base.position,
+            looked,
+            f"{base.name} / FREE LOOK",
+            self.look_roll_rad,
         )
 
     @staticmethod
@@ -133,6 +206,14 @@ class WorldRenderer:
         fov_deg: float = 72.0,
     ) -> tuple[int, int, float] | None:
         relative = camera_coordinates(point, camera.position, camera.forward)
+        if abs(camera.roll_rad) > 1e-8:
+            cosine = math.cos(camera.roll_rad)
+            sine = math.sin(camera.roll_rad)
+            relative = Vec3(
+                relative.x * cosine + relative.y * sine,
+                -relative.x * sine + relative.y * cosine,
+                relative.z,
+            )
         if relative.z <= 0.08:
             return None
         focal = width / (2.0 * math.tan(math.radians(fov_deg) * 0.5))
@@ -259,6 +340,16 @@ class WorldRenderer:
             for index in range(count + 1)
         ]
 
+    @staticmethod
+    def _oval_reachability_color(
+        oval: PredictionOval,
+    ) -> tuple[int, int, int]:
+        if oval.fully_reachable:
+            return GREEN
+        if any(oval.reachable):
+            return AMBER
+        return RED
+
     def _draw_predictions(
         self,
         surface: pygame.Surface,
@@ -267,21 +358,20 @@ class WorldRenderer:
     ) -> None:
         if not sim.guidance or sim.hit:
             return
-        colors = ((54, 117, 133), (54, 139, 152), (58, 169, 180), CYAN)
         selected_horizon = sim.guidance.selected_horizon_s
-        for oval, color in zip(sim.guidance.ovals, colors):
+        for oval in sim.guidance.ovals:
             selected = (
                 selected_horizon is not None
                 and abs(oval.horizon_s - selected_horizon) < 0.02
                 and sim.guidance.mode == "OVAL CENTER"
             )
-            draw_color = WHITE if selected else color
+            draw_color = self._oval_reachability_color(oval)
             self._draw_polyline_3d(
                 surface,
                 self._oval_points(oval),
                 camera,
                 draw_color,
-                2 if selected else 1,
+                3 if selected else 2,
             )
             for point, reachable in zip(oval.extremes, oval.reachable):
                 projected = self._project(point, camera, *surface.get_size())
@@ -291,7 +381,12 @@ class WorldRenderer:
                     )
             center_projected = self._project(oval.center, camera, *surface.get_size())
             if center_projected:
-                text = self.font_tiny.render(f"+{oval.horizon_s:.0f}s", True, draw_color)
+                label = (
+                    f"SELECTED +{oval.horizon_s:.0f}s"
+                    if selected
+                    else f"+{oval.horizon_s:.0f}s"
+                )
+                text = self.font_tiny.render(label, True, draw_color)
                 surface.blit(text, (center_projected[0] + 5, center_projected[1] + 2))
 
         ballistic_points = [
@@ -316,7 +411,12 @@ class WorldRenderer:
         bounds: tuple[int, int, int, int] | None,
         sim: InterceptionSimulation,
     ) -> None:
-        if not bounds or self.view_mode != 0 or not sim.visual_locked:
+        if (
+            not bounds
+            or self.view_mode != 0
+            or self.free_look_active
+            or not sim.visual_locked
+        ):
             return
         left, top, right, bottom = bounds
         center_x, center_y = (left + right) // 2, (top + bottom) // 2
@@ -502,7 +602,7 @@ class WorldRenderer:
     ) -> None:
         width, height = surface.get_size()
         top = pygame.Surface((width, 54), pygame.SRCALPHA)
-        top.fill((3, 12, 20, 205))
+        top.fill((3, 12, 20, 235))
         top.blit(self.font_title.render("ZENITH", True, WHITE), (18, 9))
         top.blit(
             self.font_small.render("VISION-ONLY INTERCEPTION // PROTOTYPE 02", True, CYAN),
@@ -521,7 +621,7 @@ class WorldRenderer:
 
         surface.blit(
             self.font_tiny.render(
-                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [SPACE] PAUSE   [O] OCCLUSION TEST   [A] ANALYSIS   [H] HELP",
+                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [RMB] LOOK   [SHIFT+RMB] ROLL   [C] CENTER   [H] HELP",
                 True,
                 MUTED,
             ),
@@ -767,6 +867,9 @@ class WorldRenderer:
             ("SPACE", "pause / continue the 60 Hz simulation"),
             ("+ / -", "increase / decrease time scale"),
             ("V", "cycle onboard, chase, and tactical cameras"),
+            ("RMB DRAG", "look freely without changing sensor guidance"),
+            ("SHIFT+RMB", "roll the presentation camera"),
+            ("C", "center the free-look camera"),
             ("A", "open range-error and resolution analysis"),
             ("R", "restart the current simulation"),
             ("N", "return to setup and place new drones"),
@@ -779,12 +882,12 @@ class WorldRenderer:
         for key, description in items:
             overlay.blit(self.font_bold.render(key, True, CYAN), (card.x + 36, y))
             overlay.blit(self.font.render(description, True, WHITE), (card.x + 160, y))
-            y += 38
+            y += 30
         y += 8
         notes = [
-            "Every oval lies exactly in the current camera line-of-sight plane.",
+            "Every oval lies exactly in the sensor line-of-sight plane.",
             "Its border conservatively contains all allowed projected maneuvers.",
-            "Green/red points show whether our drone can reach each extreme.",
+            "Green oval = 4/4 reachable; amber = partial; red = unreachable.",
             "The bottom-right true range is simulation verification, never guidance input.",
         ]
         for note in notes:

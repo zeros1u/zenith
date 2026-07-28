@@ -31,6 +31,8 @@ Let the camera forward unit vector be **f**. Then:
 
 The target and interceptor define the line of sight. A plane perpendicular to that line is spanned by **r** and **u**, allowing the four oval-extreme calculations to be treated as a 2D reachability problem while the drones remain in a 3D world.
 
+The interactive renderer also has an independent presentation-camera offset. Right-button drag changes presentation yaw/pitch, `Shift` plus right-button drag changes screen roll, and `C` recenters it. These offsets never modify `camera_forward`, detections, tracking, or guidance; they only allow the already-calculated 3D result to be inspected from another angle.
+
 ## 3. Monocular pinhole range
 
 For a known physical target span `S`, focal length `f` expressed in pixels, and measured apparent span `p`:
@@ -180,6 +182,8 @@ radius X        = (support(+X) + support(-X)) t² / 4 × containment factor
 ```
 
 The orange dots show the unchanged-velocity trajectory inside the smallest oval.
+
+The complete border communicates the four reachability tests: green means `4/4`, amber means `1–3/4`, and red means `0/4`. All active prediction horizons remain drawn regardless of reachability. Ovals are hidden only when visual lock is invalid and the system therefore has no current guidance-quality observation.
 
 ## 9. Reachability and maneuver choice
 

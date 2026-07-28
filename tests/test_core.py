@@ -16,6 +16,7 @@ from zenith.math3d import Vec3, angle_between, basis_from_forward
 from zenith.meshes import get_mesh
 from zenith.models import DRONE_SPECS, ROCKET_SPECS, TARGET_SPECS
 from zenith.physics import DroneState, maximum_travel_distance
+from zenith.rendering import AMBER, GREEN, RED, ViewCamera, WorldRenderer
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
 
 
@@ -35,6 +36,40 @@ class InterfaceConfigTests(unittest.TestCase):
         self.assertEqual(DISPLAY_OPTIONS[0], WINDOW_SIZE)
         self.assertNotIn(WINDOW_SIZE, SENSOR_OPTIONS)
         self.assertEqual(SENSOR_OPTIONS[1], (1920, 1080))
+
+    def test_mouse_free_look_does_not_change_sensor_direction(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        sensor_forward = Vec3(
+            sim.camera_forward.x,
+            sim.camera_forward.y,
+            sim.camera_forward.z,
+        )
+        base_camera = renderer.get_view_camera(sim)
+        renderer.rotate_view(120, -45)
+        renderer.rotate_view(80, 0, roll_mode=True)
+        moved_camera = renderer.get_view_camera(sim)
+        self.assertGreater(
+            angle_between(base_camera.forward, moved_camera.forward),
+            math.radians(10),
+        )
+        self.assertNotEqual(moved_camera.roll_rad, 0.0)
+        self.assertEqual(sim.camera_forward, sensor_forward)
+        renderer.reset_view_offset()
+        centered = renderer.get_view_camera(sim)
+        self.assertAlmostEqual(
+            angle_between(base_camera.forward, centered.forward),
+            0.0,
+            places=7,
+        )
+
+    def test_camera_roll_rotates_screen_axes(self) -> None:
+        rolled = ViewCamera(Vec3(), Vec3(0, 0, 1), "TEST", math.pi * 0.5)
+        projected = WorldRenderer._project(Vec3(1, 0, 10), rolled, 1000, 600)
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertAlmostEqual(projected[0], 500, delta=1)
+        self.assertGreater(projected[1], 300)
 
 
 class CameraTests(unittest.TestCase):
@@ -76,6 +111,21 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual([oval.horizon_s for oval in ovals], [1, 2, 3, 5])
         self.assertTrue(all(len(oval.extremes) == 4 for oval in ovals))
         self.assertTrue(all(len(oval.reachable) == 4 for oval in ovals))
+
+    def test_entire_oval_color_reports_four_point_reachability(self) -> None:
+        interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
+        oval = build_prediction_ovals(
+            Vec3(0, 35, 150),
+            Vec3(6, 0, 20),
+            DRONE_SPECS[0],
+            interceptor,
+        )[0]
+        oval.reachable = (True, True, True, True)
+        self.assertEqual(WorldRenderer._oval_reachability_color(oval), GREEN)
+        oval.reachable = (True, False, False, False)
+        self.assertEqual(WorldRenderer._oval_reachability_color(oval), AMBER)
+        oval.reachable = (False, False, False, False)
+        self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
 
     def test_oval_plane_is_perpendicular_to_camera_view(self) -> None:
         interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
