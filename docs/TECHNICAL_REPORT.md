@@ -93,14 +93,14 @@ Therefore, the same half-pixel edge error is minor for a large target and severe
 | 50 px | ±1.0% |
 | 100 px | ±0.5% |
 
-At 1920 horizontal pixels and 75° HFOV, `f ≈ 1251.1 px`. For the 0.70 m-wide FALCON-X1:
+At 1920 horizontal pixels and 90° HFOV, `f = 960 px`. For the 0.70 m-wide FALCON-X1:
 
 | Distance | Nominal apparent width | ±0.5 px relative error |
 |---:|---:|---:|
-| 100 m | 8.76 px | ±5.7% |
-| 250 m | 3.50 px | ±14.3% |
-| 500 m | 1.75 px | ±28.5% |
-| 1000 m | 0.88 px | ±57.1% |
+| 100 m | 6.72 px | ±7.4% |
+| 250 m | 2.69 px | ±18.6% |
+| 500 m | 1.34 px | ±37.2% |
+| 1000 m | 0.67 px | ±74.4% |
 
 This is visible in the application's `F2` analysis screen and in the exported telemetry. A filtered track is essential because direct frame-to-frame differentiation would turn this quantization noise into unusable speed estimates.
 
@@ -112,14 +112,14 @@ Rearranging the focal and pinhole equations gives the horizontal sensor resoluti
 N_min = ceil(2 p_min Z tan(θ/2) / S)
 ```
 
-For `S = 0.70 m`, `θ = 75°`, and a 12 px generic-detection requirement:
+For `S = 0.70 m`, `θ = 90°`, and a conservative 12 px analysis requirement:
 
 | Engagement distance | Minimum horizontal resolution |
 |---:|---:|
-| 100 m | 2,631 px |
-| 250 m | 6,578 px |
-| 500 m | 13,155 px |
-| 1000 m | 26,309 px |
+| 100 m | 3,429 px |
+| 250 m | 8,572 px |
+| 500 m | 17,143 px |
+| 1000 m | 34,286 px |
 
 These are not arbitrary labels: the application recalculates the table for whichever target model is selected. Narrower optics would reduce the resolution requirement but also reduce the searchable field of view.
 
@@ -128,7 +128,7 @@ These are not arbitrary labels: the application recalculates the table for which
 The implemented state machine is:
 
 1. `SEARCHING`
-2. a generic drone with at least 4 px apparent span, or a high-contrast rocket with at least 3 px, becomes `VISUAL LOCK / SIGNAL QUERY`
+2. a generic aerial object with at least 3 px apparent span becomes `VISUAL LOCK / SIGNAL QUERY`
 3. a simulated lookup resolves the known target specification after 0.65 s for drones or 0.42 s for fast incoming rockets
 4. the range estimator, metric track, and oval guidance activate
 5. any later loss becomes `TARGET LOST / SEARCHING`, clears guidance immediately, and extrapolates the filtered image-plane bearing rate for no more than 1.5 seconds
@@ -147,7 +147,7 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds; the gimbal then performs an expanding horizontal scan around that predicted direction. Its world elevation remains inside `-35 to +35 degrees`, avoiding a blind search above or below the horizon. The interceptor turns horizontally toward the predicted search direction while holding the altitude recorded at loss. Reacquisition must come from a new visible image detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
+This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
@@ -247,7 +247,7 @@ The compact authority HUD labels direct capability green, limited turn/brake/gli
 
 `F3` selects an independent spectator camera. The fixed sensor boresight is rendered only onboard; the guidance diamond is a projected world point. Independently clickable windows expose the core panels, presentation settings, estimated-track minimap, and truth-isolated verification. `G` records a +2 s oval and its old virtual camera; truth is projected into that saved frame only at the audit time.
 
-During target loss, player control of our interceptor overrides the automatic body-search turn, but the sensor gimbal continues its bearing-based scan. This separation makes manual flight useful for a demonstration without allowing it to manufacture sensor lock.
+During target loss, player control of our interceptor overrides the automatic body-search turn. Because the camera is fixed to the body, the player must physically turn the interceptor to search. Manual flight cannot manufacture sensor lock.
 
 ## 12. Robustness evidence
 

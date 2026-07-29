@@ -4,7 +4,7 @@ This matrix states exactly what the prototype claims and how that claim is check
 
 | Requirement or question | Implemented behavior | Verification evidence |
 |---|---|---|
-| Camera-only target input | Guidance receives detector bearing/box, the signal-resolved model, pinhole estimate, filtered track, uncertainty, and our integrated state. | Lock-loss tests prove guidance disappears immediately when the image is occluded. |
+| Camera-only target input | Guidance receives detector bearing/box, the signal-resolved model, pinhole estimate, filtered track, uncertainty, and our integrated state. The 90° camera axis is rigidly inherited from the interceptor nose. | Lock-loss tests prove guidance disappears immediately when the image is occluded; the fixed-boresight test proves a target behind the airframe cannot remain locked. |
 | Detect, then query signals | Identity and metric guidance become available only after visual acquisition and the configured lookup delay. | `test_signal_lookup_precedes_identity` |
 | Estimated enemy coordinates | The Target panel shows camera-derived world XYZ. Truth is available only inside the expanded verification window. | Minimum-window widget test and saved-frame verification tests. |
 | Frozen-now oval definition | At 60 Hz, the current sensor pose is treated as fixed and the target's future pixel region is projected into that frame. | Perspective projection and common-plane guidance tests. |

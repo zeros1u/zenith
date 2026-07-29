@@ -28,8 +28,6 @@ from .guidance import (
 from .math3d import (
     Vec3,
     clamp,
-    rotate_towards,
-    world_direction_from_camera,
 )
 from .models import DroneSpec, get_spec
 from .physics import DroneState
@@ -94,9 +92,6 @@ class InterceptionSimulation:
     # lightweight collision sphere, while the segment test still proves an
     # actual close pass rather than a multi-metre "hit."
     CONTACT_TOLERANCE_M = 0.42
-    GIMBAL_SLEW_RATE_DEG_S = 120.0
-    SEARCH_SLEW_RATE_DEG_S = 120.0
-
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
         self.time_s = 0.0
@@ -130,8 +125,9 @@ class InterceptionSimulation:
         )
         if interceptor_spec.flight_model == "rocket":
             # The one-shot interceptors use a pre-launch ballistic loft so the
-            # finite booster and small RCS budget do not pretend to hover.
-            launch_loft = 0.62 if interceptor_spec.code == "SR1" else 1.20
+            # finite booster and small RCS budget do not pretend to hover. The
+            # loft stays inside the fixed nose-camera field of view.
+            launch_loft = 0.25 if interceptor_spec.code == "SR1" else 0.20
             launch_direction = (
                 initial_line + Vec3(0.0, launch_loft, 0.0)
             ).normalized(initial_line)
@@ -163,9 +159,9 @@ class InterceptionSimulation:
             target_velocity,
             orientation=Vec3(0.0, math.pi if incoming_rocket else 0.25, 0.0),
         )
-        self.camera_forward = initial_line
-        self.search_anchor_forward = initial_line
-        self.search_direction = initial_line
+        self.camera_forward = self.interceptor.forward_direction()
+        self.search_anchor_forward = self.camera_forward
+        self.search_direction = self.camera_forward
         self.search_hold_altitude_m = self.config.interceptor_position.y
         self.last_bearing_x_deg = 0.0
         self.last_bearing_y_deg = 0.0
@@ -322,6 +318,10 @@ class InterceptionSimulation:
         self.sensor_occluded = not self.sensor_occluded
         state = "blocked" if self.sensor_occluded else "restored"
         self._event(f"Camera image {state} by test control")
+
+    def _sync_sensor_boresight(self) -> None:
+        """Rigidly mount the sensor optical axis to the interceptor nose."""
+        self.camera_forward = self.interceptor.forward_direction()
 
     def _update_bearing_motion(self, dt: float, reset: bool = False) -> None:
         """Filter image-plane motion without reading target ground truth."""
@@ -512,24 +512,13 @@ class InterceptionSimulation:
         return stabilise.clamp_length(spec.max_accel)
 
     def _update_sensor(self, dt: float) -> None:
-        if self.visual_locked and self.identity_confirmed and self.track.position is not None:
-            predicted_direction = (
-                self.track.position - self.interceptor.position
-            ).normalized(self.camera_forward)
-            self.camera_forward = rotate_towards(
-                self.camera_forward,
-                predicted_direction,
-                math.radians(self.GIMBAL_SLEW_RATE_DEG_S) * dt,
-            )
-        elif self.lost_time_s > 0.0:
-            # Search uses only the last observed image bearing and bearing rate.
-            # It deliberately does not point at simulation truth.
+        # The camera is not a target-following gimbal. Its FOV can move only
+        # when the interceptor airframe turns.
+        self._sync_sensor_boresight()
+        if self.lost_time_s > 0.0:
+            # Autonomy may turn the airframe using only the last observed image
+            # bearing and bearing rate; it never points the camera using truth.
             self.search_direction = self._predicted_search_direction()
-            self.camera_forward = rotate_towards(
-                self.camera_forward,
-                self.search_direction,
-                math.radians(self.SEARCH_SLEW_RATE_DEG_S) * dt,
-            )
 
         self.detection = detect_box(
             self.target,
@@ -546,7 +535,7 @@ class InterceptionSimulation:
             # than the initial generic-object / signal-query threshold.
             minimum_lock_pixels = 2.0 if was_locked else 2.5
         else:
-            minimum_lock_pixels = 3.0 if incoming_rocket else 4.0
+            minimum_lock_pixels = 3.0
         signal_delay = (
             self.ROCKET_SIGNAL_DELAY_S
             if incoming_rocket
@@ -628,20 +617,6 @@ class InterceptionSimulation:
                     self.track.position_sigma_m,
                     min(12.0, self.range_estimate.sigma_m),
                 )
-
-                camera_ray = Vec3(
-                    math.tan(math.radians(self.detection.bearing_x_deg)),
-                    math.tan(math.radians(self.detection.bearing_y_deg)),
-                    1.0,
-                )
-                measured_bearing = world_direction_from_camera(
-                    camera_ray, self.camera_forward
-                )
-                self.camera_forward = rotate_towards(
-                    self.camera_forward,
-                    measured_bearing,
-                    math.radians(self.GIMBAL_SLEW_RATE_DEG_S) * dt,
-                )
         elif self.identity_confirmed:
             self.status = "TARGET LOST / SEARCHING"
 
@@ -684,6 +659,7 @@ class InterceptionSimulation:
             # crashed body receives exactly one gravity integration per tick.
             self.interceptor.integrate(Vec3(), dt)
             self.target.integrate(Vec3(), dt)
+            self._sync_sensor_boresight()
             self._update_prediction_check()
             self.status = self.success_message
             if self.explosion_age_s > 5.0:
@@ -763,6 +739,7 @@ class InterceptionSimulation:
         )
         self.interceptor.integrate(interceptor_command, dt, interceptor_yaw)
         self.target.integrate(target_command, dt, target_yaw)
+        self._sync_sensor_boresight()
         self._update_prediction_check()
         if (
             self.config.scenario == "rotating"

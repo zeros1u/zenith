@@ -101,7 +101,7 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         75.0,
         19.0,
         24.0,
-        25.0,
+        30.0,
         0.0015,
         "High-agility interceptor",
         "talon_delta",

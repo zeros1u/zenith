@@ -317,7 +317,7 @@ class SetupScreen:
             )
 
         options_y = button_y + 68
-        surface.blit(self.small.render("MONOCULAR SENSOR RESOLUTION // 75° HFOV", True, MUTED), (left + 4, options_y))
+        surface.blit(self.small.render("MONOCULAR SENSOR RESOLUTION // 90 DEG HFOV", True, MUTED), (left + 4, options_y))
         for index, resolution in enumerate(SENSOR_OPTIONS):
             self._button(
                 surface,
@@ -416,7 +416,7 @@ class SetupScreen:
             interceptor_position=own,
             target_position=target,
             scenario=SCENARIOS[self.scenario_index][0],
-            camera=CameraModel(resolution[0], resolution[1], 75.0),
+            camera=CameraModel(resolution[0], resolution[1], 90.0),
         )
 
 

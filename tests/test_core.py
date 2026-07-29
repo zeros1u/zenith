@@ -61,6 +61,7 @@ class InterfaceConfigTests(unittest.TestCase):
         self.assertNotIn(WINDOW_SIZE, SENSOR_OPTIONS)
         self.assertEqual(SENSOR_OPTIONS[1], (1920, 1080))
         self.assertEqual(TIME_SCALES[DEFAULT_TIME_SCALE_INDEX], 0.5)
+        self.assertEqual(CameraModel().horizontal_fov_deg, 90.0)
 
     def test_mouse_free_look_does_not_change_sensor_direction(self) -> None:
         sim = InterceptionSimulation(SimulationConfig())
@@ -703,6 +704,37 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(sim.visual_locked)
         self.assertIsNotNone(sim.guidance)
         self.assertGreaterEqual(sim.reacquisition_count, 1)
+
+    def test_sensor_is_fixed_to_nose_and_cannot_lock_behind_airframe(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
+        for _ in range(150):
+            sim.step()
+            if sim.identity_confirmed and sim.visual_locked:
+                break
+        self.assertTrue(sim.visual_locked)
+
+        away = (
+            sim.interceptor.position - sim.target.position
+        ).normalized(Vec3(0, 0, -1))
+        sim.interceptor.velocity = away * max(
+            20.0,
+            sim.interceptor.velocity.length(),
+        )
+        sim.interceptor.orientation = Vec3(
+            -math.asin(clamp(away.y, -1.0, 1.0)),
+            math.atan2(away.x, away.z),
+            0.0,
+        )
+        sim.step()
+
+        nose = sim.interceptor.forward_direction()
+        target_direction = (
+            sim.target.position - sim.interceptor.position
+        ).normalized()
+        self.assertGreater(sim.camera_forward.dot(nose), 0.999999)
+        self.assertLess(sim.camera_forward.dot(target_direction), 0.0)
+        self.assertFalse(sim.visual_locked)
+        self.assertIsNone(sim.guidance)
 
     def test_lost_target_search_is_horizon_limited(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="evasive"))

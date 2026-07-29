@@ -40,7 +40,7 @@ Point out:
 - the exact target coordinate never enters the guidance function;
 - pressing `F5` exports the camera estimate and truth comparison for every sampled frame.
 
-Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The gimbal scans from the last seen bearing without using target truth. Press `O` again; only a new image detection can reacquire lock and restart guidance.
+Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The fixed camera cannot follow the missing target. Autonomy turns the interceptor body using the last image bearing and bearing rate, without target truth. Press `O` again; only a target that physically re-enters the nose-mounted camera FOV can reacquire lock and restart guidance.
 
 Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered sensor presentation.
 

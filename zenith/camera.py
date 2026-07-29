@@ -22,7 +22,7 @@ from .physics import DroneState
 class CameraModel:
     width_px: int = 1920
     height_px: int = 1080
-    horizontal_fov_deg: float = 75.0
+    horizontal_fov_deg: float = 90.0
 
     @property
     def focal_px(self) -> float:

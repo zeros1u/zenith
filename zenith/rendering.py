@@ -236,7 +236,7 @@ class WorldRenderer:
                 base = ViewCamera(
                     sim.interceptor.position,
                     sim.camera_forward,
-                    "ONBOARD / GIMBAL",
+                    "ONBOARD / FIXED BORESIGHT",
                 )
             else:
                 base = ViewCamera(
@@ -1605,7 +1605,14 @@ class WorldRenderer:
 
         overlay.blit(self.font_bold.render("MINIMUM HORIZONTAL CAMERA RESOLUTION", True, AMBER), (right_x, y + 12))
         y += 44
-        overlay.blit(self.font_tiny.render("12 px target requirement // 75° horizontal FOV", True, MUTED), (right_x, y))
+        overlay.blit(
+            self.font_tiny.render(
+                f"12 px analysis requirement // {camera.horizontal_fov_deg:.0f} DEG horizontal FOV",
+                True,
+                MUTED,
+            ),
+            (right_x, y),
+        )
         y += 24
         for distance in (100, 250, 500, 1000):
             resolution = minimum_horizontal_resolution(
