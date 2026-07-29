@@ -25,6 +25,7 @@ Point to the 1, 2, 3, and 5 second ovals:
 - propulsion support, perspective, and track uncertainty make the border an outer bound under the stated model;
 - four large points remain the cardinal explanation, while all 96 rendered edge directions are tested;
 - green edge segments pass our reachability check, red segments fail, a mixed edge is only partially reachable, and grey reports an unbounded camera crossing;
+- only a completely green loop receives a faint green interior tint; red never fills the center because an unreachable outer edge does not make every interior point unreachable;
 - an unreachable oval remains visible and red instead of disappearing;
 - the largest green oval uses a confidence-weighted likely-motion point limited to 65% of its radius;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
@@ -56,7 +57,7 @@ Use `N` to show the selectable behaviors and threats:
 - evasive tests changing acceleration direction;
 - airbrake tests nonlinear speed changes;
 - rotating target tests apparent-size changes;
-- tricky AI assumes the enemy knows our approach and reacts with physically bounded jinks, vertical breaks, sprints, speed shifts, and brake traps;
+- tricky AI assumes the enemy knows our approach and reacts with physically bounded jinks, vertical breaks, sprints, speed shifts, and brake traps; as a real stress case it can sometimes escape a less favorable matchup;
 - rocket attack selects a fast incoming target with rocket-specific physics and status.
 
 The seven-scenario verifier can be shown from a terminal:
@@ -105,7 +106,11 @@ A naive fixed-width calculation is biased. ZENITH projects all eight corners of 
 
 ### “Where are YOLO or DINO?”
 
-The current milestone uses a deterministic synthetic detector with the same bounding-box output a generic detector would provide. Identity comes from signal lookup, as required by the project idea. YOLO/DINO remain planned adapters; the camera, tracking, guidance, UI, and verification layers do not depend on a specific detector.
+No trained recognition model is bundled yet. The current milestone uses a deterministic synthetic detector/pose adapter with the same box, bearing, confidence, and pose outputs that real models would provide. Identity comes from signal lookup, as required by the project idea. A future YOLO plus pose-estimation adapter can replace this boundary without changing the camera, tracking, guidance, UI, or verification layers.
+
+### “Why can Wraith-S miss even though it is fastest?”
+
+Maximum speed is not the same as interception agility. Wraith-S reaches `82 m/s`, but Talon-R has more lateral acceleration and a higher turn-rate limit. ZENITH now schedules fixed-wing closing speed before terminal range and cuts throttle to use passive drag; it does not invent reverse thrust or automatically deploy an airbrake based on speed.
 
 ### “Are the vehicles still boxes?”
 
@@ -121,7 +126,7 @@ Yes. `Tab` cycles from autonomy to our interceptor, then to the target, then bac
 
 ### “Does the Smart Evader cheat?”
 
-Only its explicitly labeled `TRICKY AI` target autopilot is allowed to know our true approach, because that test assumes an informed enemy. It uses that knowledge to choose its own deterministic maneuver, then obeys the target's normal acceleration, speed, turn, airbrake, drag, and gravity limits. The defense camera, tracker, ovals, and guidance receive no truth from it.
+Only its explicitly labeled `TRICKY AI` target autopilot is allowed to know our true range and closing approach, because that test assumes an informed enemy. It chooses its own deterministic maneuver, then obeys the target's normal acceleration, speed, turn, airbrake, drag, and gravity limits. It can sometimes genuinely escape; the standard scenarios remain the guaranteed demonstration cases. The defense camera, tracker, ovals, and guidance receive no truth from it.
 
 ### “Does mouse-wheel zoom improve detection?”
 

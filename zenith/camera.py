@@ -49,6 +49,7 @@ class Detection:
     confidence: float
     camera_depth: float
     projected_vertices: tuple[tuple[float, float], ...]
+    pose_estimate: Vec3 | None = None
 
 
 @dataclass(slots=True)
@@ -82,6 +83,7 @@ def detect_box(
     camera_position: Vec3,
     camera_forward: Vec3,
     camera: CameraModel,
+    timestamp_s: float = 0.0,
 ) -> Detection:
     focal = camera.focal_px
     projected: list[tuple[float, float]] = []
@@ -134,6 +136,16 @@ def detect_box(
         1.0,
     )
     confidence = size_confidence * edge_factor
+    # This belongs to the synthetic image-recognition adapter, not guidance:
+    # it represents a pose model's output and is deliberately imperfect.
+    pose_error = math.radians(
+        (1.0 - confidence) * 4.0 * math.sin(timestamp_s * 2.3)
+    )
+    pose_estimate = Vec3(
+        target.orientation.x + pose_error * 0.35,
+        target.orientation.y + pose_error,
+        target.orientation.z - pose_error * 0.2,
+    )
     return Detection(
         in_sensor and max(width, height) >= 2.0,
         (left, top, right, bottom),
@@ -145,6 +157,7 @@ def detect_box(
         confidence,
         center_cam.z,
         tuple(projected),
+        pose_estimate,
     )
 
 

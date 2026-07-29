@@ -12,6 +12,8 @@ The defense guidance algorithm does not read simulated target coordinates. Simul
 
 Our interceptor's position and velocity are propagated from its own commanded acceleration, which represents normal onboard inertial/state estimation. No external target range sensor is modeled.
 
+No trained neural detector is claimed in this milestone. A deterministic synthetic camera adapter uses truth only to generate a detector-style 2D box, bearing, confidence, and imperfect visual pose output. All defense-side estimation after that boundary consumes those outputs rather than target state.
+
 The optional `TRICKY AI` adversary is an explicit test-harness exception to this truth boundary. That scenario assumes the enemy knows about the interceptor, so only the target's own autopilot reads true relative range and closing speed to choose a maneuver. It cannot write to the detector, target track, oval solver, or interceptor command.
 
 ## 2. Coordinate system
@@ -66,7 +68,7 @@ A width-only estimate fails when a rectangular target rotates. For box dimension
 Sx(ψ) = |W cos ψ| + |L sin ψ|
 ```
 
-ZENITH uses all eight known-model corners and a visual pose estimate to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The full fit matters at terminal distance because different corners no longer have equal depth.
+ZENITH uses all eight known-model corners and the synthetic detector adapter's imperfect visual pose output to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The range estimator does not read target orientation directly. The full fit matters at terminal distance because different corners no longer have equal depth.
 
 The display retains a naive width-only result internally, allowing the compensated method to be compared later when realistic models and a pose detector are connected.
 
@@ -127,6 +129,8 @@ These are not arbitrary labels: the application recalculates the table for which
 
 ## 6. Detection and signal sequence
 
+The current `detect_box` backend is not YOLO, DINO, or another trained recognizer. It is a deterministic simulation adapter with the same output boundary expected from a generic detector plus pose estimator. This makes the camera-to-guidance software testable now without presenting synthetic detections as a trained AI model.
+
 The implemented state machine is:
 
 1. `SEARCHING`
@@ -149,7 +153,7 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
+This reduces range-quantization jitter without secretly substituting ground truth. Filter gains rise with detector confidence so a large terminal image can follow a real maneuver faster than a distant few-pixel image. Target velocity and acceleration come from successive camera-derived position measurements, never from the target body's velocity fields. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`, while altitude and approximately half of the selected vehicle's maximum speed are regulated. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
@@ -187,7 +191,7 @@ radius X        = (support(+X) + support(-X)) t² / 4 × containment factor
 
 The orange dots show the unchanged-velocity trajectory inside the smallest oval.
 
-Four large cardinal points remain visible, but their connecting diamond does not cover diagonal ellipse points. The actual decision evaluates all 96 directions that render the border. Each passing border segment is green and each failing segment is red; only a complete green `96/96` loop is selectable. Grey reports an invalid/unbounded horizon. Cardinal colors remain a readable summary and amber remains the unchanged-motion trajectory.
+Four large cardinal points remain visible, but their connecting diamond does not cover diagonal ellipse points. The actual decision evaluates all 96 directions that render the border. Each passing border segment is green and each failing segment is red; only a complete green `96/96` loop is selectable and receives a faint green fill. Red is never used to fill an oval because a failed outer edge does not imply that its center or all interior points are unreachable. Grey reports an invalid/unbounded horizon. Cardinal colors remain a readable summary and amber remains the unchanged-motion trajectory.
 
 ## 9. Reachability and maneuver choice
 
@@ -207,7 +211,7 @@ The decision order follows the project idea:
 4. if none pass, report `NO GUARANTEED OVAL` and use the unchanged-motion 1 s point;
 5. when one-second reach enters the smallest region, enter terminal collision lead; `0.75 s` TTC is the safety fallback.
 
-Terminal pursuit solves the constant-velocity intercept equation. Against a co-directional drone it controls closing speed while matching target lateral velocity. Against an incoming rocket it keeps the interceptor nose-on instead of asking a fixed-wing craft to reverse and velocity-match the threat.
+Terminal pursuit solves the constant-velocity intercept equation. Against a co-directional drone it controls closing speed while matching target lateral velocity. Fixed-wing interceptors receive an earlier, lower closing-speed schedule because they cannot stop or reverse like a multirotor; negative axial demand cuts throttle and passive drag slows the vehicle. Automatic guidance does not activate an airbrake merely because speed crosses a threshold. Against an incoming rocket it keeps the interceptor nose-on instead of asking a fixed-wing craft to reverse and velocity-match the threat.
 
 ## 10. Physics
 
@@ -223,7 +227,7 @@ velocity(t+Δt) = clamp(velocity + acceleration Δt, max_speed)
 position(t+Δt) = position + velocity Δt
 ```
 
-Actual propulsion acceleration, gravity, passive quadratic drag, model-specific airbrakes, maximum speed, and ground contact are continuous. Wing lift uses an explicit model stall speed and lift-efficiency factor:
+Actual propulsion acceleration, gravity, passive quadratic drag, explicitly commanded/scenario-specific airbrakes, maximum speed, and ground contact are continuous. A vectored craft decomposes vertical and horizontal thrust before applying the tilt limit, so a requested descent cannot be reflected into an artificial upward-thrust spike. Wing lift uses an explicit model stall speed and lift-efficiency factor:
 
 ```text
 airflow factor = clamp((speed / stall_speed)², 0, 1)
@@ -270,7 +274,7 @@ Rotation is handled by known-model pose-compensated physical spans. Maneuvers ar
 ## 13. Known prototype boundaries
 
 - Six original low-poly drone meshes and two original rocket meshes are bundled. The SMART EVADER uses a saucer body, pointed +Z nose, stabilizers, keel, and twin rear drives so its direction remains unambiguous. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
-- The generic detector backend deterministically emits the synthetic camera bounding box. It represents the output contract of YOLO/DINO, not a trained neural network.
+- The generic detector backend deterministically emits a synthetic camera box, bearing, confidence, and imperfect pose estimate. It represents a future detector/pose output contract, not a trained neural network.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
 - The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
 - The lift model is not CFD. Production aerodynamics require measured lift/drag curves, mass, wing area, angle of attack, wind, control-surface dynamics, and flight-test validation.

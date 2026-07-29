@@ -28,6 +28,7 @@ from .guidance import (
 from .math3d import (
     Vec3,
     clamp,
+    world_direction_from_camera,
 )
 from .models import DroneSpec, get_spec
 from .physics import DroneState
@@ -407,41 +408,96 @@ class InterceptionSimulation:
             math.cos(predicted_yaw) * horizontal,
         ).normalized(anchor)
 
-    def _lost_search_command(self) -> Vec3:
-        """Turn toward the predicted horizontal bearing while holding altitude."""
-        if not self._bearing_sample_valid:
-            return Vec3()
+    def _cruise_command(
+        self,
+        desired_direction: Vec3,
+        hold_altitude_m: float,
+        speed_fraction: float = 0.5,
+    ) -> Vec3:
+        """Regulate a level search cruise without target range information."""
         spec = self.interceptor.spec
-        horizontal_direction = Vec3(
-            self.search_direction.x,
+        direction = Vec3(
+            desired_direction.x,
             0.0,
-            self.search_direction.z,
+            desired_direction.z,
         ).normalized(self.interceptor.forward_direction())
+        horizontal_velocity = Vec3(
+            self.interceptor.velocity.x,
+            0.0,
+            self.interceptor.velocity.z,
+        )
+        desired_speed = spec.max_speed * clamp(speed_fraction, 0.25, 0.7)
+        horizontal_request = (
+            direction * desired_speed - horizontal_velocity
+        ) * 1.15
+        horizontal_request = horizontal_request.clamp_length(
+            max(spec.max_accel, spec.lateral_accel)
+        )
+        vertical_request = clamp(
+            (hold_altitude_m - self.interceptor.position.y) * 1.4
+            - self.interceptor.velocity.y * 1.1,
+            -spec.lateral_accel,
+            spec.lateral_accel,
+        )
+        if spec.flight_model in ("fixed_wing", "rocket"):
+            vertical_request += max(
+                0.0,
+                9.81 - self.interceptor.lift_acceleration.y,
+            )
+        command = horizontal_request + Vec3(0.0, vertical_request, 0.0)
+        command_limit = max(spec.max_accel, spec.lateral_accel)
+        if spec.flight_model in ("fixed_wing", "rocket"):
+            command_limit = math.hypot(
+                max(spec.max_accel, spec.brake_accel),
+                spec.lateral_accel,
+            )
+        return command.clamp_length(command_limit)
+
+    def _bearing_only_cruise_command(self) -> Vec3:
+        """Use only image bearing while identity/range are still unavailable."""
+        camera_vector = Vec3(
+            math.tan(math.radians(self.detection.bearing_x_deg)),
+            math.tan(math.radians(self.detection.bearing_y_deg)),
+            1.0,
+        )
+        observed_direction = world_direction_from_camera(
+            camera_vector,
+            self.camera_forward,
+        )
+        return self._cruise_command(
+            observed_direction,
+            self.search_hold_altitude_m,
+            0.5,
+        )
+
+    def _lost_search_command(self) -> Vec3:
+        """Search from image history while holding altitude and half-speed cruise."""
         current_forward = Vec3(
             self.interceptor.velocity.x,
             0.0,
             self.interceptor.velocity.z,
         ).normalized(self.interceptor.forward_direction())
-        turn_direction = (
-            horizontal_direction
-            - current_forward * horizontal_direction.dot(current_forward)
-        )
+        if not self._bearing_sample_valid:
+            return self._cruise_command(
+                current_forward,
+                self.search_hold_altitude_m,
+                0.5,
+            )
+        horizontal_direction = Vec3(
+            self.search_direction.x,
+            0.0,
+            self.search_direction.z,
+        ).normalized(current_forward)
         turn_ramp = clamp(self.lost_time_s / 0.8, 0.0, 1.0)
-        horizontal_turn = (
-            turn_direction.normalized()
-            * spec.lateral_accel
-            * turn_direction.length()
-            * turn_ramp
+        blended_direction = (
+            current_forward * (1.0 - turn_ramp)
+            + horizontal_direction * turn_ramp
+        ).normalized(current_forward)
+        return self._cruise_command(
+            blended_direction,
+            self.search_hold_altitude_m,
+            0.5,
         )
-        vertical_request = clamp(
-            (self.search_hold_altitude_m - self.interceptor.position.y) * 1.4
-            - self.interceptor.velocity.y * 1.1,
-            -spec.lateral_accel,
-            spec.lateral_accel,
-        )
-        return (
-            horizontal_turn + Vec3(0.0, vertical_request, 0.0)
-        ).clamp_length(max(spec.max_accel, spec.lateral_accel))
 
     @staticmethod
     def _empty_detection(depth: float = 0.0) -> Detection:
@@ -473,7 +529,8 @@ class InterceptionSimulation:
         target_altitude = self.config.target_position.y
         stabilise = Vec3(
             0.0,
-            (target_altitude - self.target.position.y) * 0.35,
+            (target_altitude - self.target.position.y) * 0.55
+            - velocity.y * 1.15,
             cruise_z - velocity.z,
         )
         stabilise = stabilise * 0.7
@@ -491,8 +548,8 @@ class InterceptionSimulation:
             return (
                 stabilise
                 + Vec3(
-                    math.sin(self.time_s * 1.55) * spec.lateral_accel * 0.62,
-                    math.sin(self.time_s * 0.83) * spec.lateral_accel * 0.16,
+                    math.sin(self.time_s * 1.55) * spec.lateral_accel * 0.10,
+                    math.sin(self.time_s * 0.83) * spec.lateral_accel * 0.04,
                     0.0,
                 )
             ).clamp_length(spec.max_accel)
@@ -512,7 +569,9 @@ class InterceptionSimulation:
                 Vec3(-1.0, 0.28, 0.0),
                 Vec3(0.72, -0.18, -0.2),
             )
-            evade = directions[phase].normalized() * spec.lateral_accel * 0.82
+            # The baseline evasive script remains deliberately moderate; the
+            # separate TRICKY AI mode is the full threat-aware stress test.
+            evade = directions[phase].normalized() * spec.lateral_accel * 0.15
             return (stabilise + evade).clamp_length(spec.max_accel)
         if scenario == "braking":
             cycle = self.time_s % 7.0
@@ -627,10 +686,12 @@ class InterceptionSimulation:
             snap_sign = -1.0 if decision == "SNAP LEFT" else 1.0
             maneuver = side * snap_sign * authority + away * authority * 0.20
 
-        # SMART EVADER is the full-authority demonstrator. Other catalogue
-        # craft can use the same intelligence mode, but retain a small control
-        # reserve instead of unrealistically riding every actuator limit.
-        if spec.code != "SEV":
+        # SMART EVADER has the richest actuator set, but even it keeps a
+        # repeatable demonstration reserve. Other catalogue craft use the same
+        # controller scaled to their published lateral authority.
+        if spec.code == "SEV":
+            maneuver = maneuver * 0.66
+        else:
             maneuver = maneuver * min(
                 0.66,
                 18.0 / max(spec.lateral_accel, 0.001),
@@ -660,6 +721,7 @@ class InterceptionSimulation:
             self.interceptor.position,
             self.camera_forward,
             self.config.camera,
+            self.time_s,
         )
         if self.sensor_occluded:
             self.detection = self._empty_detection(self.detection.camera_depth)
@@ -721,22 +783,19 @@ class InterceptionSimulation:
                 # A stale metric track must not silently become a current lock.
                 # Reacquisition begins a fresh camera-derived velocity estimate.
                 self.track = TargetTrack()
-            # A known-model pose solver supplies orientation. Image-size-dependent
-            # deterministic error keeps the simulation repeatable.
-            pose_error = math.radians(
-                (1.0 - self.detection.confidence) * 4.0 * math.sin(self.time_s * 2.3)
-            )
-            pose_estimate = Vec3(
-                self.target.orientation.x + pose_error * 0.35,
-                self.target.orientation.y + pose_error,
-                self.target.orientation.z - pose_error * 0.2,
-            )
-            self.range_estimate = estimate_range(
-                self.detection,
-                self.target.spec,
-                pose_estimate,
-                self.camera_forward,
-                self.config.camera,
+            # Pose comes from the synthetic image-recognition output. The
+            # estimator does not read the target state directly.
+            pose_estimate = self.detection.pose_estimate
+            self.range_estimate = (
+                estimate_range(
+                    self.detection,
+                    self.target.spec,
+                    pose_estimate,
+                    self.camera_forward,
+                    self.config.camera,
+                )
+                if pose_estimate is not None
+                else None
             )
             if self.range_estimate is not None:
                 estimated_position = position_from_detection(
@@ -746,8 +805,8 @@ class InterceptionSimulation:
                     self.range_estimate.distance_m,
                 )
                 self.last_estimated_position = estimated_position
-                self.track.update(estimated_position, self.time_s)
                 self.track.confidence = self.detection.confidence
+                self.track.update(estimated_position, self.time_s)
                 self.track.position_sigma_m = max(
                     self.track.position_sigma_m,
                     min(12.0, self.range_estimate.sigma_m),
@@ -837,10 +896,7 @@ class InterceptionSimulation:
         elif self.visual_locked:
             # Bearing-only pursuit while the signal lookup runs.
             self.guidance = None
-            advisory_command = (
-                self.camera_forward * self.interceptor.spec.max_speed
-                - self.interceptor.velocity
-            ).clamp_length(self.interceptor.spec.max_accel)
+            advisory_command = self._bearing_only_cruise_command()
         else:
             self.guidance = None
             advisory_command = self._lost_search_command()

@@ -132,7 +132,7 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         "SMART EVADER",
         (76, 236, 214),
         Vec3(1.45, 0.38, 1.62),
-        86.0,
+        74.0,
         24.0,
         30.0,
         24.0,

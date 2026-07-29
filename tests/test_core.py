@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from unittest.mock import patch
 
 import pygame
 
@@ -14,6 +15,7 @@ from app import (
 )
 from zenith.camera import (
     CameraModel,
+    Detection,
     detect_box,
     estimate_range,
     minimum_horizontal_resolution,
@@ -231,13 +233,45 @@ class CameraTests(unittest.TestCase):
         origin = Vec3(0, 30, 0)
         forward = (target.position - origin).normalized()
         detection = detect_box(target, origin, forward, camera)
-        estimate = estimate_range(detection, spec, target.orientation, forward, camera)
+        self.assertIsNotNone(detection.pose_estimate)
+        estimate = estimate_range(
+            detection,
+            spec,
+            detection.pose_estimate or Vec3(),
+            forward,
+            camera,
+        )
         self.assertIsNotNone(estimate)
         assert estimate is not None
         error = abs(estimate.distance_m - origin.distance_to(target.position))
         # At this distance the target is only a few pixels wide. The error must
         # remain inside the estimator's explicit pixel-quantisation uncertainty.
         self.assertLess(error, estimate.sigma_m)
+
+    def test_simulation_consumes_reported_pose_not_target_orientation(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
+        sim.identity_confirmed = True
+        reported_pose = Vec3(0.12, -0.34, 0.56)
+        detector_output = Detection(
+            True,
+            (950.0, 535.0, 970.0, 545.0),
+            (960.0, 540.0),
+            20.0,
+            10.0,
+            0.0,
+            0.0,
+            1.0,
+            100.0,
+            (),
+            reported_pose,
+        )
+        with (
+            patch("zenith.simulation.detect_box", return_value=detector_output),
+            patch("zenith.simulation.estimate_range", return_value=None)
+            as range_solver,
+        ):
+            sim._update_sensor(1.0 / 60.0)
+        self.assertEqual(range_solver.call_args.args[2], reported_pose)
 
     def test_minimum_resolution_scales_linearly(self) -> None:
         first = minimum_horizontal_resolution(100, 0.7, 75, 12)
@@ -281,7 +315,13 @@ class GuidanceTests(unittest.TestCase):
         edge_colors = WorldRenderer._oval_edge_colors(oval)
         self.assertEqual(edge_colors.count(GREEN), len(edge) - 1)
         self.assertEqual(edge_colors.count(RED), 1)
+        # A blocked outer edge must never paint a misleading red interior over
+        # a smaller green oval.
+        self.assertIsNone(WorldRenderer._oval_fill_color(oval))
+        oval.edge_reachable = tuple(True for _ in oval.edge_points)
+        self.assertEqual(WorldRenderer._oval_fill_color(oval), GREEN)
         oval.reachable = (False, False, False, False)
+        oval.edge_reachable = tuple(False for _ in oval.edge_points)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
 
     def test_oval_plane_is_perpendicular_to_camera_view(self) -> None:
@@ -508,6 +548,25 @@ class PropulsionTests(unittest.TestCase):
         self.assertLess(unpowered.position.y, powered.position.y - 3.0)
         self.assertEqual(unpowered.engine_output, 0.0)
 
+    def test_downward_vectored_command_cannot_reflect_into_a_climb(self) -> None:
+        for spec in (DRONE_SPECS[2], DRONE_SPECS[5]):
+            with self.subTest(vehicle=spec.name):
+                state = DroneState(
+                    spec,
+                    Vec3(0, 100, 0),
+                    Vec3(0, 0, 18),
+                )
+                initial_altitude = state.position.y
+                downward_turn = Vec3(
+                    spec.lateral_accel,
+                    -spec.max_accel,
+                    spec.lateral_accel * 0.5,
+                )
+                for _ in range(60):
+                    state.integrate(downward_turn, 1.0 / 60.0)
+                self.assertLess(state.position.y, initial_altitude - 0.5)
+                self.assertLess(state.velocity.y, 0.0)
+
     def test_horizontal_wing_glides_slower_than_unlifted_rocket_falls(self) -> None:
         wing = DroneState(
             DRONE_SPECS[1],
@@ -718,9 +777,13 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(all(spec.vehicle_type == "rocket" for spec in ROCKET_SPECS))
         self.assertEqual(INTERCEPTOR_SPECS, TARGET_SPECS)
         smart_evader = next(spec for spec in DRONE_SPECS if spec.code == "SEV")
+        wraith = next(spec for spec in DRONE_SPECS if spec.code == "WRS")
         self.assertEqual(smart_evader.name, "SMART EVADER")
         self.assertEqual(smart_evader.mesh_id, "smart_evader_ufo")
-        self.assertGreater(smart_evader.max_speed, DRONE_SPECS[3].max_speed)
+        self.assertEqual(wraith.max_speed, max(spec.max_speed for spec in DRONE_SPECS))
+        self.assertGreater(smart_evader.max_accel, wraith.max_accel)
+        self.assertGreater(smart_evader.brake_accel, wraith.brake_accel)
+        self.assertGreater(smart_evader.max_turn_rate_deg, wraith.max_turn_rate_deg)
 
     def test_every_vehicle_has_a_polygon_mesh(self) -> None:
         for spec in TARGET_SPECS:
@@ -838,7 +901,7 @@ class ProjectTests(unittest.TestCase):
         )
         decisions: set[str] = set()
         airbrake_seen = False
-        for _ in range(60 * 8):
+        for _ in range(60 * 15):
             first.step()
             second.step()
             decisions.add(first.evader_decision)
@@ -871,7 +934,9 @@ class ProjectTests(unittest.TestCase):
                         break
                 self.assertTrue(sim.hit)
 
-    def test_tricky_mode_remains_interceptable_for_every_drone(self) -> None:
+    def test_tricky_mode_is_a_real_but_bounded_stress_case(self) -> None:
+        intercepted = 0
+        escaped = 0
         for target in DRONE_SPECS:
             with self.subTest(target=target.name):
                 sim = InterceptionSimulation(
@@ -881,8 +946,59 @@ class ProjectTests(unittest.TestCase):
                     sim.step()
                     if sim.hit:
                         break
-                self.assertTrue(sim.hit)
                 self.assertGreater(sim.evader_decision_index, 1)
+                self.assertLessEqual(
+                    sim.target.velocity.length(),
+                    sim.target.spec.max_speed + 1e-7,
+                )
+                if sim.hit:
+                    intercepted += 1
+                else:
+                    escaped += 1
+                    self.assertFalse(sim.target.crashed)
+        self.assertGreaterEqual(intercepted, 4)
+        self.assertGreaterEqual(escaped, 1)
+
+    def test_every_drone_interceptor_hits_the_baseline_evasive_target(self) -> None:
+        for interceptor in DRONE_SPECS:
+            with self.subTest(interceptor=interceptor.name):
+                sim = InterceptionSimulation(
+                    SimulationConfig(
+                        interceptor_code=interceptor.code,
+                        target_code="FX1",
+                        scenario="evasive",
+                    )
+                )
+                for _ in range(60 * 35):
+                    sim.step()
+                    if sim.hit:
+                        break
+                self.assertTrue(sim.hit)
+
+    def test_no_detection_cruise_holds_altitude_at_half_speed(self) -> None:
+        for interceptor in DRONE_SPECS:
+            with self.subTest(interceptor=interceptor.name):
+                sim = InterceptionSimulation(
+                    SimulationConfig(
+                        interceptor_code=interceptor.code,
+                        scenario="steady",
+                    )
+                )
+                initial_altitude = sim.interceptor.position.y
+                sim.toggle_sensor_occlusion()
+                for _ in range(60 * 10):
+                    sim.step()
+                self.assertFalse(sim.interceptor.crashed)
+                self.assertAlmostEqual(
+                    sim.interceptor.position.y,
+                    initial_altitude,
+                    delta=1.5,
+                )
+                self.assertAlmostEqual(
+                    sim.interceptor.velocity.length(),
+                    interceptor.max_speed * 0.5,
+                    delta=2.5,
+                )
 
     def test_success_state_persists_during_crash(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))

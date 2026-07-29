@@ -56,8 +56,20 @@ class TargetTrack:
         residual = measured_position - predicted
         residual_length = residual.length()
         previous_velocity = self.velocity
-        alpha = clamp(0.13 + dt * 0.8, 0.13, 0.24)
-        beta = clamp(0.006 + dt * 0.05, 0.006, 0.018)
+        # A distant few-pixel target needs heavy smoothing, while a large,
+        # high-confidence terminal image can follow real maneuvers much more
+        # quickly. Both gains still depend only on detector output.
+        image_quality = clamp(self.confidence, 0.0, 1.0)
+        alpha = clamp(
+            0.13 + image_quality * 0.42 + dt * 0.8,
+            0.13,
+            0.62,
+        )
+        beta = clamp(
+            0.006 + image_quality * 0.070 + dt * 0.05,
+            0.006,
+            0.085,
+        )
         self.position = predicted + residual * alpha
         self.velocity = self.velocity + residual * (beta / dt)
         raw_acceleration = (self.velocity - previous_velocity) / dt
@@ -573,6 +585,20 @@ def solve_guidance(
 
     aim = Vec3(aim.x, max(2.0, aim.y), aim.z)
     to_aim = aim - interceptor.position
+    if interceptor.spec.flight_model == "fixed_wing":
+        # A wing cannot stop or reverse like a multirotor. Limit relative
+        # closing early enough that passive drag, steering, and throttle
+        # scheduling can prevent a high-speed fly-through without inventing
+        # reverse thrust or a speed-triggered brake.
+        maximum_closing = max(
+            12.0,
+            min(22.0, interceptor.spec.max_speed * 0.30),
+        )
+    else:
+        maximum_closing = max(
+            18.0,
+            min(32.0, interceptor.spec.max_speed * 0.62),
+        )
     if mode == "TERMINAL PURSUIT":
         aim_direction = to_aim.normalized(line)
         incoming_target = track.velocity.dot(line) < -5.0
@@ -584,14 +610,27 @@ def solve_guidance(
                 aim_direction * interceptor.spec.max_speed
             )
         else:
-            desired_closing = clamp(distance * 0.95 + 6.0, 15.0, 52.0)
+            # Approach speed falls continuously with range. This avoids the
+            # fast fixed-wing craft racing through the camera target and then
+            # attempting an impossible turn back after a near miss.
+            desired_closing = clamp(
+                distance * 0.45 + 5.0,
+                6.0,
+                maximum_closing,
+            )
             desired_velocity = (
                 track.velocity + aim_direction * desired_closing
             ).clamp_length(interceptor.spec.max_speed)
     else:
-        desired_velocity = (
-            to_aim.normalized(line) * interceptor.spec.max_speed
+        desired_closing = clamp(
+            distance * 0.18 + 10.0,
+            10.0,
+            maximum_closing,
         )
+        desired_velocity = (
+            track.velocity
+            + to_aim.normalized(line) * desired_closing
+        ).clamp_length(interceptor.spec.max_speed)
     command = (desired_velocity - interceptor.velocity) * 2.8
 
     # A small proportional-navigation term damps sideways line-of-sight motion.

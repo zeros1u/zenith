@@ -177,19 +177,30 @@ class DroneState:
         command = (horizontal + vertical) * demand_scale
         gravity = WORLD_UP * -9.81
         gravity_compensation = -gravity
-        desired_thrust = (
-            command + gravity_compensation
-            if self.engine_enabled
-            else Vec3()
-        )
-
-        # A rotorcraft cannot point unlimited thrust sideways while maintaining
-        # altitude. Clamp the thrust cone, then slew it instead of teleporting it.
+        # A rotorcraft cannot thrust downward or point unlimited thrust
+        # sideways while maintaining altitude. Work in vertical/horizontal
+        # components so a requested descent cannot be reflected through the
+        # tilt cone into a large *upward* thrust vector.
         max_tilt = math.radians(58.0 if self.spec.flight_model == "multirotor" else 46.0)
-        desired_direction = rotate_towards(
-            WORLD_UP, desired_thrust.normalized(WORLD_UP), max_tilt
-        )
-        desired_thrust = desired_direction * desired_thrust.length()
+        if self.engine_enabled:
+            requested_vertical_thrust = max(
+                0.0,
+                command.y + gravity_compensation.y,
+            )
+            maximum_horizontal_thrust = (
+                requested_vertical_thrust * math.tan(max_tilt)
+            )
+            requested_horizontal_thrust = Vec3(
+                command.x,
+                0.0,
+                command.z,
+            ).clamp_length(maximum_horizontal_thrust)
+            desired_thrust = (
+                requested_horizontal_thrust
+                + WORLD_UP * requested_vertical_thrust
+            )
+        else:
+            desired_thrust = Vec3()
         current_thrust = (
             self.thrust_vector
             if self.thrust_vector.length() > 0.1
@@ -274,7 +285,10 @@ class DroneState:
         )
 
         axial_request = command.dot(forward)
-        minimum_axial = 0.0 if self.spec.flight_model == "rocket" else -self.spec.brake_accel
+        # Directional engines never provide reverse thrust. A negative request
+        # reduces propulsion to zero; passive drag slows the craft, and an
+        # explicitly enabled airbrake adds the published brake acceleration.
+        minimum_axial = 0.0
         maximum_axial = self.spec.max_accel if self.engine_enabled else 0.0
         if self.spec.flight_model == "rocket":
             # A literal single-stage booster ignites at launch and burns at

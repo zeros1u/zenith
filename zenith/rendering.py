@@ -660,6 +660,13 @@ class WorldRenderer:
             for reachable in oval.edge_reachable
         )
 
+    @staticmethod
+    def _oval_fill_color(
+        oval: PredictionOval,
+    ) -> tuple[int, int, int] | None:
+        """Tint only a region whose complete boundary passed reachability."""
+        return GREEN if oval.fully_reachable else None
+
     def _draw_predictions(
         self,
         surface: pygame.Surface,
@@ -691,12 +698,15 @@ class WorldRenderer:
 
         # A faint fill makes the nested prediction regions readable against
         # both sky and ground while leaving the synthetic target unobscured.
+        # Only a fully reachable oval is filled: a red *edge* does not imply
+        # that every point inside it is unreachable.
         for oval, projected_edge in projected_ovals:
+            fill_color = self._oval_fill_color(oval)
             if (
-                len(projected_edge) >= 3
+                fill_color is not None
+                and len(projected_edge) >= 3
                 and all(point is not None for point in projected_edge)
             ):
-                color = self._oval_reachability_color(oval)
                 polygon = [
                     point[:2]
                     for point in projected_edge
@@ -711,7 +721,7 @@ class WorldRenderer:
                     max(xs) - min(xs) <= surface_size[0] * 2
                     and max(ys) - min(ys) <= surface_size[1] * 2
                 ):
-                    pygame.draw.polygon(fill_layer, (*color, 12), polygon)
+                    pygame.draw.polygon(fill_layer, (*fill_color, 14), polygon)
         surface.blit(fill_layer, (0, 0))
 
         for oval, projected_edge in projected_ovals:
@@ -821,9 +831,15 @@ class WorldRenderer:
                         f"+{oval.horizon_s:.0f}s  GREEN "
                         f"{oval.edge_reachable_count}/{oval.edge_total}"
                     )
+                elif oval.edge_reachable_count:
+                    label = (
+                        f"+{oval.horizon_s:.0f}s  MIXED "
+                        f"{oval.edge_reachable_count}/{oval.edge_total} GREEN "
+                        f"| CARDINAL {oval.cardinal_reachable_count}/4"
+                    )
                 else:
                     label = (
-                        f"+{oval.horizon_s:.0f}s  BLOCKED "
+                        f"+{oval.horizon_s:.0f}s  RED / BLOCKED "
                         f"{oval.edge_reachable_count}/{oval.edge_total} "
                         f"| CARDINAL {oval.cardinal_reachable_count}/4"
                     )
@@ -2103,7 +2119,7 @@ class WorldRenderer:
                 (
                     "SENSOR PIPELINE",
                     [
-                        "The synthetic monocular camera first returns only a 2D box, bearing, apparent pixel size, and confidence.",
+                        "No trained neural detector is bundled: a deterministic synthetic adapter returns a 2D box, bearing, pixel size, confidence, and visual pose estimate.",
                         "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
                         "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
                         f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
@@ -2152,8 +2168,9 @@ class WorldRenderer:
                 (
                     "COLOR AND COMPLETE-EDGE RULE",
                     [
-                        "GREEN border: every one of the 96 displayed edge directions is reachable; this oval may be selected.",
-                        "RED border: no edge directions are reachable. A mixed red/green border shows exactly which edge portions pass.",
+                        "Each GREEN segment is an edge point our vehicle can reach by that horizon; each RED segment is one it cannot.",
+                        "A mixed red/green border is partial. Only a 96/96 green loop is selectable and receives a faint green interior tint.",
+                        "RED never fills an oval: a blocked edge does not mean its center or every interior point is blocked.",
                         "Four large cardinal markers remain as a simple 4/4 explanation, but they do not decide the border color.",
                         "AMBER dots are the unchanged-velocity trajectory, not a partially valid oval.",
                     ],
@@ -2181,6 +2198,7 @@ class WorldRenderer:
                         "Gravity is always 9.81 m/s2 downward for every airborne vehicle.",
                         "Rotorcraft hover only because their powered thrust explicitly counters gravity; cutting the engine removes that support.",
                         "Drag grows with speed. Airbrakes add continuous opposing acceleration instead of deleting speed instantly.",
+                        "Autonomous fixed wings schedule throttle and closing speed early; they never use reverse thrust or an automatic speed-triggered brake.",
                         "X cuts or restarts controllable drone engines; a solid rocket booster cannot be cut or restarted.",
                     ],
                 ),
@@ -2222,7 +2240,7 @@ class WorldRenderer:
                         "Range, target track, guidance, and ovals become invalid immediately.",
                         "The last filtered image-bearing motion is extrapolated for at most 1.5 seconds.",
                         "After that, the camera widens a horizontal scan while staying within +/-35 degrees of the world horizon.",
-                        "Autonomous body search turns horizontally and holds the altitude recorded at loss.",
+                        "Autonomous body search turns horizontally, holds altitude, and regulates about half of the selected vehicle's maximum speed.",
                         "Only a new detector result can reacquire; target truth is never used to point the search.",
                     ],
                 ),
@@ -2240,7 +2258,7 @@ class WorldRenderer:
                     [
                         "Defense guidance never reads target truth; truth only renders the synthetic image, resolves contact, and supports verification.",
                         "TRICKY AI is the declared exception: only its target autopilot knows our approach; it cannot feed our sensor or guidance.",
-                        "Detector, signal lookup, meshes, and aerodynamics are deterministic presentation adapters, not deployed hardware.",
+                        "The detector/pose output, signal lookup, meshes, and aerodynamics are deterministic presentation adapters, not trained/deployed hardware.",
                         "CHECK 2s records an old camera frame and evaluates truth at T+2.",
                     ],
                 ),
