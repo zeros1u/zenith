@@ -140,15 +140,19 @@ Run all six deterministic behavior tests:
 ```powershell
 python verify_prototype.py --duration 30 --csv artifacts\verification.csv
 python -m unittest discover -v
+python benchmark_performance.py
 ```
 
 The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated suite additionally checks all 96 edge directions, diagonal failure despite `4/4` cardinals, weighted-point limits, camera-crossing invalidation, saved-frame two-second containment across every drone behavior, collapsible widgets/minimum-window rendering, onboard-only boresight, finite rocket burnout/RCS, both rockets as interceptors and targets, visual lock loss/reacquisition, gravity/aerodynamics, and every default interception scenario.
+
+The benchmark runs the same evasive simulation and complete 1050 × 700 software-rendering path repeatedly without opening a window. Its numbers are machine-dependent; it does not reduce the fixed 60 Hz physics rate or skip any of the 96 displayed edge checks.
 
 ## Project structure
 
 ```text
 app.py                    Desktop UI, setup screen, controls, CSV export
 verify_prototype.py       Deterministic six-scenario verification
+benchmark_performance.py  Repeatable physics/guidance/render benchmark
 zenith/
   camera.py               Pinhole camera, detector output, range estimator
   controls.py             Manual authority modes and assisted flight requests

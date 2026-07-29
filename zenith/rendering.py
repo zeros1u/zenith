@@ -41,6 +41,21 @@ class ViewCamera:
     roll_rad: float = 0.0
 
 
+@dataclass(slots=True)
+class _ProjectionState:
+    camera: ViewCamera
+    width: int
+    height: int
+    fov_deg: float
+    position: Vec3
+    right: Vec3
+    up: Vec3
+    forward: Vec3
+    roll_cos: float
+    roll_sin: float
+    focal_px: float
+
+
 class WorldRenderer:
     def __init__(self) -> None:
         pygame.font.init()
@@ -71,6 +86,7 @@ class WorldRenderer:
         self.verification_visible = False
         self.aim_aids_visible = True
         self.click_regions: dict[str, pygame.Rect] = {}
+        self._projection_state: _ProjectionState | None = None
 
     def cycle_view(self) -> None:
         self.view_mode = (self.view_mode + 1) % 3
@@ -314,32 +330,176 @@ class WorldRenderer:
         y = int(height * 0.5 - focal * relative.y / relative.z)
         return x, y, relative.z
 
+    def _prepare_projection(
+        self,
+        camera: ViewCamera,
+        width: int,
+        height: int,
+        fov_deg: float = 72.0,
+    ) -> _ProjectionState:
+        state = self._projection_state
+        if (
+            state is not None
+            and state.camera is camera
+            and state.width == width
+            and state.height == height
+            and state.fov_deg == fov_deg
+        ):
+            return state
+        right, up, forward = basis_from_forward(camera.forward)
+        state = _ProjectionState(
+            camera,
+            width,
+            height,
+            fov_deg,
+            camera.position,
+            right,
+            up,
+            forward,
+            math.cos(camera.roll_rad),
+            math.sin(camera.roll_rad),
+            width / (2.0 * math.tan(math.radians(fov_deg) * 0.5)),
+        )
+        self._projection_state = state
+        return state
+
+    @staticmethod
+    def _camera_space(
+        point: Vec3,
+        state: _ProjectionState,
+    ) -> tuple[float, float, float]:
+        dx = point.x - state.position.x
+        dy = point.y - state.position.y
+        dz = point.z - state.position.z
+        x = dx * state.right.x + dy * state.right.y + dz * state.right.z
+        y = dx * state.up.x + dy * state.up.y + dz * state.up.z
+        depth = (
+            dx * state.forward.x
+            + dy * state.forward.y
+            + dz * state.forward.z
+        )
+        if abs(state.camera.roll_rad) > 1e-8:
+            x, y = (
+                x * state.roll_cos + y * state.roll_sin,
+                -x * state.roll_sin + y * state.roll_cos,
+            )
+        return x, y, depth
+
+    @staticmethod
+    def _screen_from_camera(
+        point: tuple[float, float, float],
+        state: _ProjectionState,
+    ) -> tuple[int, int, float]:
+        x, y, depth = point
+        return (
+            int(state.width * 0.5 + state.focal_px * x / depth),
+            int(state.height * 0.5 - state.focal_px * y / depth),
+            depth,
+        )
+
+    def _project_cached(
+        self,
+        point: Vec3,
+        camera: ViewCamera,
+        width: int,
+        height: int,
+        fov_deg: float = 72.0,
+    ) -> tuple[int, int, float] | None:
+        state = self._prepare_projection(camera, width, height, fov_deg)
+        camera_point = self._camera_space(point, state)
+        if camera_point[2] <= 0.08:
+            return None
+        return self._screen_from_camera(camera_point, state)
+
     def _draw_ground_grid(
         self, surface: pygame.Surface, camera: ViewCamera, usable_height: int
     ) -> None:
         width, height = surface.get_size()
         grid_color = (48, 90, 83)
         major_color = (55, 111, 100)
+        state = self._prepare_projection(camera, width, height)
+
+        def clip_screen_line(
+            first: tuple[float, float],
+            second: tuple[float, float],
+        ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+            """Liang-Barsky clipping avoids SDL overflow near the camera plane."""
+            x0, y0 = first
+            dx = second[0] - x0
+            dy = second[1] - y0
+            lower, upper = 0.0, 1.0
+            for direction, distance in (
+                (-dx, x0),
+                (dx, width - 1 - x0),
+                (-dy, y0),
+                (dy, usable_height - 1 - y0),
+            ):
+                if abs(direction) < 1e-12:
+                    if distance < 0.0:
+                        return None
+                    continue
+                ratio = distance / direction
+                if direction < 0.0:
+                    if ratio > upper:
+                        return None
+                    lower = max(lower, ratio)
+                else:
+                    if ratio < lower:
+                        return None
+                    upper = min(upper, ratio)
+            return (
+                (int(x0 + dx * lower), int(y0 + dy * lower)),
+                (int(x0 + dx * upper), int(y0 + dy * upper)),
+            )
+
+        def draw_world_line(
+            start: Vec3,
+            end: Vec3,
+            color: tuple[int, int, int],
+        ) -> None:
+            first = self._camera_space(start, state)
+            second = self._camera_space(end, state)
+            near = 0.08
+            if first[2] <= near and second[2] <= near:
+                return
+            if first[2] <= near:
+                amount = (near - first[2]) / (second[2] - first[2])
+                first = (
+                    first[0] + (second[0] - first[0]) * amount,
+                    first[1] + (second[1] - first[1]) * amount,
+                    near,
+                )
+            elif second[2] <= near:
+                amount = (near - second[2]) / (first[2] - second[2])
+                second = (
+                    second[0] + (first[0] - second[0]) * amount,
+                    second[1] + (first[1] - second[1]) * amount,
+                    near,
+                )
+            first_screen = (
+                state.width * 0.5 + state.focal_px * first[0] / first[2],
+                state.height * 0.5 - state.focal_px * first[1] / first[2],
+            )
+            second_screen = (
+                state.width * 0.5 + state.focal_px * second[0] / second[2],
+                state.height * 0.5 - state.focal_px * second[1] / second[2],
+            )
+            clipped = clip_screen_line(first_screen, second_screen)
+            if clipped:
+                pygame.draw.line(surface, color, clipped[0], clipped[1], 1)
+
         for x in range(-400, 401, 25):
-            points = []
-            for z in range(-100, 901, 20):
-                projected = self._project(Vec3(x, 0, z), camera, width, height)
-                if projected and -100 < projected[0] < width + 100 and projected[1] < usable_height:
-                    points.append(projected[:2])
-            if len(points) >= 2:
-                pygame.draw.lines(
-                    surface, major_color if x == 0 else grid_color, False, points, 1
-                )
+            draw_world_line(
+                Vec3(x, 0, -100),
+                Vec3(x, 0, 900),
+                major_color if x == 0 else grid_color,
+            )
         for z in range(-100, 901, 25):
-            points = []
-            for x in range(-400, 401, 20):
-                projected = self._project(Vec3(x, 0, z), camera, width, height)
-                if projected and -100 < projected[0] < width + 100 and projected[1] < usable_height:
-                    points.append(projected[:2])
-            if len(points) >= 2:
-                pygame.draw.lines(
-                    surface, major_color if z == 0 else grid_color, False, points, 1
-                )
+            draw_world_line(
+                Vec3(-400, 0, z),
+                Vec3(400, 0, z),
+                major_color if z == 0 else grid_color,
+            )
 
     def _draw_polyline_3d(
         self,
@@ -352,7 +512,7 @@ class WorldRenderer:
         width, height = surface.get_size()
         segment: list[tuple[int, int]] = []
         for point in points:
-            projected = self._project(point, camera, width, height)
+            projected = self._project_cached(point, camera, width, height)
             if projected is None:
                 if len(segment) > 1:
                     pygame.draw.lines(surface, color, False, segment, width_px)
@@ -376,7 +536,10 @@ class WorldRenderer:
     ) -> tuple[int, int, int, int] | None:
         width, height = surface.get_size()
         vertices = model_vertices(state.spec, state.orientation, state.position)
-        projected = [self._project(vertex, camera, width, height) for vertex in vertices]
+        projected = [
+            self._project_cached(vertex, camera, width, height)
+            for vertex in vertices
+        ]
         if any(point is None for point in projected):
             return None
         projected_ok = [point for point in projected if point is not None]
@@ -470,7 +633,11 @@ class WorldRenderer:
                 3 if selected else 2,
             )
             for point, reachable in zip(oval.extremes, oval.reachable):
-                projected = self._project(point, camera, *surface.get_size())
+                projected = self._project_cached(
+                    point,
+                    camera,
+                    *surface.get_size(),
+                )
                 if projected:
                     pygame.draw.circle(
                         surface, GREEN if reachable else RED, projected[:2], 3, 1
@@ -480,7 +647,7 @@ class WorldRenderer:
                 + oval.plane_x * (oval.radius_x * 0.68)
                 + oval.plane_y * (oval.radius_y * 0.68)
             )
-            label_projected = self._project(
+            label_projected = self._project_cached(
                 label_anchor,
                 camera,
                 *surface.get_size(),
@@ -524,12 +691,20 @@ class WorldRenderer:
             for step in range(1, 11)
         ] if sim.track.position else []
         for point in ballistic_points:
-            projected = self._project(point, camera, *surface.get_size())
+            projected = self._project_cached(
+                point,
+                camera,
+                *surface.get_size(),
+            )
             if projected:
                 pygame.draw.circle(surface, AMBER, projected[:2], 2)
 
         aim = (
-            self._project(sim.guidance.aim_point, camera, *surface.get_size())
+            self._project_cached(
+                sim.guidance.aim_point,
+                camera,
+                *surface.get_size(),
+            )
             if self.aim_aids_visible
             else None
         )
@@ -594,7 +769,11 @@ class WorldRenderer:
             ).normalized()
             speed = 4.0 + (index % 7) * 1.15
             particle = origin + direction * speed * age + Vec3(0, 2.4 * age - 2.8 * age * age, 0)
-            projected = self._project(particle, camera, *surface.get_size())
+            projected = self._project_cached(
+                particle,
+                camera,
+                *surface.get_size(),
+            )
             if projected:
                 fade = clamp(1.0 - age / 2.5, 0.0, 1.0)
                 color = (
@@ -624,7 +803,11 @@ class WorldRenderer:
         start = controlled.position
         end = start + request.normalized() * length
         self._draw_polyline_3d(surface, [start, end], camera, CYAN, 3)
-        projected = self._project(end, camera, *surface.get_size())
+        projected = self._project_cached(
+            end,
+            camera,
+            *surface.get_size(),
+        )
         if projected:
             pygame.draw.circle(surface, CYAN, projected[:2], 5, 2)
             surface.blit(
@@ -1252,7 +1435,7 @@ class WorldRenderer:
                 if check.evaluated and check.projected_truth is not None
                 else sim.target.position
             )
-            projected = self._project(
+            projected = self._project_cached(
                 marker_position,
                 recorded_camera,
                 inset_rect.width,

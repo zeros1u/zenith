@@ -97,6 +97,26 @@ class InterfaceConfigTests(unittest.TestCase):
         self.assertAlmostEqual(projected[0], 500, delta=1)
         self.assertGreater(projected[1], 300)
 
+    def test_cached_projection_matches_reference_projection(self) -> None:
+        renderer = WorldRenderer()
+        camera = ViewCamera(
+            Vec3(4.0, 12.0, -7.0),
+            Vec3(0.2, -0.08, 1.0),
+            "CACHE TEST",
+            0.31,
+        )
+        for point in (
+            Vec3(-8.0, 4.0, 20.0),
+            Vec3(5.0, 18.0, 80.0),
+            Vec3(42.0, 1.0, 190.0),
+            Vec3(4.0, 12.0, -20.0),
+        ):
+            with self.subTest(point=point):
+                self.assertEqual(
+                    renderer._project_cached(point, camera, 1050, 700),
+                    WorldRenderer._project(point, camera, 1050, 700),
+                )
+
     def test_manual_takeover_camera_follows_selected_vehicle(self) -> None:
         sim = InterceptionSimulation(SimulationConfig())
         renderer = WorldRenderer()

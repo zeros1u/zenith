@@ -8,7 +8,6 @@ import math
 from .math3d import (
     Vec3,
     WORLD_UP,
-    angle_between,
     basis_from_forward,
     clamp,
     lerp_vec,
@@ -18,6 +17,14 @@ from .physics import DroneState, maximum_travel_distance
 
 
 PREDICTION_HORIZONS = (1.0, 2.0, 3.0, 5.0)
+PREDICTION_EDGE_COUNT = 96
+PREDICTION_EDGE_DIRECTIONS = tuple(
+    (
+        math.cos(math.tau * index / PREDICTION_EDGE_COUNT),
+        math.sin(math.tau * index / PREDICTION_EDGE_COUNT),
+    )
+    for index in range(PREDICTION_EDGE_COUNT)
+)
 
 
 @dataclass(slots=True)
@@ -144,6 +151,85 @@ class GuidanceSolution:
     terminal_trigger: str | None = None
 
 
+@dataclass(slots=True)
+class _ReachabilityContext:
+    position: Vec3
+    velocity: Vec3
+    spec: DroneSpec
+    heading: Vec3
+    turn_rate_rad_s: float
+    collision_radius: float
+    powered_time_s: float | None
+
+    @classmethod
+    def from_state(cls, interceptor: DroneState) -> "_ReachabilityContext":
+        speed = interceptor.velocity.length()
+        heading = interceptor.velocity.normalized(
+            interceptor.forward_direction()
+        )
+        directional = interceptor.spec.flight_model in ("fixed_wing", "rocket")
+        turn_rate = (
+            min(
+                math.radians(interceptor.spec.max_turn_rate_deg),
+                interceptor.spec.lateral_accel / speed,
+            )
+            if directional and speed > 1.0
+            else 0.0
+        )
+        return cls(
+            interceptor.position,
+            interceptor.velocity,
+            interceptor.spec,
+            heading,
+            turn_rate,
+            interceptor.spec.collision_radius,
+            (
+                interceptor.main_burn_remaining_s
+                if interceptor.spec.flight_model == "rocket"
+                else None
+            ),
+        )
+
+    def contains(self, point: Vec3, horizon_s: float) -> bool:
+        dx = point.x - self.position.x
+        dy = point.y - self.position.y
+        dz = point.z - self.position.z
+        distance_squared = dx * dx + dy * dy + dz * dz
+        if distance_squared <= self.collision_radius * self.collision_radius:
+            return True
+        distance = math.sqrt(distance_squared)
+        inverse_distance = 1.0 / distance
+        direction_x = dx * inverse_distance
+        direction_y = dy * inverse_distance
+        direction_z = dz * inverse_distance
+        along_speed = (
+            self.velocity.x * direction_x
+            + self.velocity.y * direction_y
+            + self.velocity.z * direction_z
+        )
+        effective_horizon = horizon_s
+        if self.turn_rate_rad_s > 0.0:
+            heading_dot = clamp(
+                self.heading.x * direction_x
+                + self.heading.y * direction_y
+                + self.heading.z * direction_z,
+                -1.0,
+                1.0,
+            )
+            turn_time = math.acos(heading_dot) / max(
+                self.turn_rate_rad_s,
+                1e-6,
+            )
+            effective_horizon = max(0.0, horizon_s - turn_time * 0.55)
+        available = maximum_travel_distance(
+            along_speed,
+            self.spec,
+            effective_horizon,
+            self.powered_time_s,
+        )
+        return distance <= available * 0.96 + self.collision_radius
+
+
 def _acceleration_support(spec: DroneSpec, forward: Vec3, direction: Vec3) -> float:
     """Maximum acceleration component allowed in one world direction."""
     axis = direction.normalized()
@@ -163,37 +249,11 @@ def _acceleration_support(spec: DroneSpec, forward: Vec3, direction: Vec3) -> fl
 
 
 def point_is_reachable(interceptor: DroneState, point: Vec3, horizon_s: float) -> bool:
-    offset = point - interceptor.position
-    distance = offset.length()
-    if distance <= interceptor.spec.collision_radius:
-        return True
-    direction = offset.normalized()
-    along_speed = interceptor.velocity.dot(direction)
-    effective_horizon = horizon_s
-    if (
-        interceptor.spec.flight_model in ("fixed_wing", "rocket")
-        and interceptor.velocity.length() > 1.0
-    ):
-        heading = interceptor.velocity.normalized()
-        turn_rate = min(
-            math.radians(interceptor.spec.max_turn_rate_deg),
-            interceptor.spec.lateral_accel / interceptor.velocity.length(),
-        )
-        turn_time = angle_between(heading, direction) / max(turn_rate, 1e-6)
-        effective_horizon = max(0.0, horizon_s - turn_time * 0.55)
-    available = maximum_travel_distance(
-        along_speed,
-        interceptor.spec,
-        effective_horizon,
-        (
-            interceptor.main_burn_remaining_s
-            if interceptor.spec.flight_model == "rocket"
-            else None
-        ),
+    """Whether the physical interceptor can reach one world point in time."""
+    return _ReachabilityContext.from_state(interceptor).contains(
+        point,
+        horizon_s,
     )
-    # Reserve covers drag and the difference between ideal path length and the
-    # rate-limited vehicle trajectory.
-    return distance <= available * 0.96 + interceptor.spec.collision_radius
 
 
 def _project_to_target_plane(
@@ -226,6 +286,7 @@ def build_prediction_ovals(
     ).normalized(Vec3(0, 0, 1))
     plane_x, plane_y, plane_normal = basis_from_forward(line_of_sight)
     target_forward = target_velocity.normalized(line_of_sight)
+    reachability = _ReachabilityContext.from_state(interceptor)
     plane_depth = max(
         0.01,
         (target_position - interceptor.position).dot(plane_normal),
@@ -311,7 +372,7 @@ def build_prediction_ovals(
             center - plane_y * radius_y,
         )
         reachable = tuple(
-            point_is_reachable(interceptor, point, horizon)
+            reachability.contains(point, horizon)
             and invalid_reason is None
             for point in extremes
         )
@@ -324,18 +385,23 @@ def build_prediction_ovals(
         # than assuming the four cardinal points cover diagonal escape routes.
         # The renderer uses the same 96-segment border. Reachability evaluates
         # every displayed segment direction rather than only four cardinals.
-        edge_count = 96
-        edge_points = tuple(
-            center
-            + plane_x * (math.cos(math.tau * index / edge_count) * radius_x)
-            + plane_y * (math.sin(math.tau * index / edge_count) * radius_y)
-            for index in range(edge_count)
-        )
-        edge_reachable = tuple(
-            invalid_reason is None
-            and point_is_reachable(interceptor, point, horizon)
-            for point in edge_points
-        )
+        edge_points_list: list[Vec3] = []
+        edge_reachable_list: list[bool] = []
+        for cosine, sine in PREDICTION_EDGE_DIRECTIONS:
+            x_scale = cosine * radius_x
+            y_scale = sine * radius_y
+            point = Vec3(
+                center.x + plane_x.x * x_scale + plane_y.x * y_scale,
+                center.y + plane_x.y * x_scale + plane_y.y * y_scale,
+                center.z + plane_x.z * x_scale + plane_y.z * y_scale,
+            )
+            edge_points_list.append(point)
+            edge_reachable_list.append(
+                invalid_reason is None
+                and reachability.contains(point, horizon)
+            )
+        edge_points = tuple(edge_points_list)
+        edge_reachable = tuple(edge_reachable_list)
         result.append(
             PredictionOval(
                 horizon,
