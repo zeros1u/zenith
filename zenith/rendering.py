@@ -30,6 +30,7 @@ WHITE = (224, 238, 244)
 MUTED = (130, 156, 170)
 PANEL = (5, 16, 25, 238)
 INFO_PAGE_COUNT = 4
+GREY = (102, 119, 128)
 
 
 @dataclass(slots=True)
@@ -54,10 +55,22 @@ class WorldRenderer:
         self.view_mode = 0
         self.interceptor_trail: list[Vec3] = []
         self.target_trail: list[Vec3] = []
+        self.estimated_target_trail: list[Vec3] = []
         self._trail_timer = 0.0
         self.look_yaw_rad = 0.0
         self.look_pitch_rad = 0.0
         self.look_roll_rad = 0.0
+        self.panel_expanded = {
+            "target": True,
+            "calculations": False,
+            "own": True,
+            "relative": True,
+        }
+        self.minimap_visible = False
+        self.settings_visible = False
+        self.verification_visible = False
+        self.aim_aids_visible = True
+        self.click_regions: dict[str, pygame.Rect] = {}
 
     def cycle_view(self) -> None:
         self.view_mode = (self.view_mode + 1) % 3
@@ -116,8 +129,67 @@ class WorldRenderer:
         self.target_trail.append(
             Vec3(sim.target.position.x, sim.target.position.y, sim.target.position.z)
         )
+        if sim.track.position is not None and sim.visual_locked:
+            self.estimated_target_trail.append(
+                Vec3(
+                    sim.track.position.x,
+                    sim.track.position.y,
+                    sim.track.position.z,
+                )
+            )
         self.interceptor_trail = self.interceptor_trail[-180:]
         self.target_trail = self.target_trail[-180:]
+        self.estimated_target_trail = self.estimated_target_trail[-180:]
+
+    def handle_left_click(
+        self,
+        position: tuple[int, int],
+        sim: InterceptionSimulation,
+    ) -> str | None:
+        """Handle the clickable HUD without coupling renderer state to app state."""
+        for key, rect in reversed(tuple(self.click_regions.items())):
+            if not rect.collidepoint(position):
+                continue
+            if key.startswith("panel:"):
+                panel = key.split(":", 1)[1]
+                self.panel_expanded[panel] = not self.panel_expanded[panel]
+                return "handled"
+            if key == "minimap":
+                self.minimap_visible = not self.minimap_visible
+                return "handled"
+            if key == "settings":
+                self.settings_visible = not self.settings_visible
+                return "handled"
+            if key == "verification":
+                self.verification_visible = not self.verification_visible
+                return "handled"
+            if key == "aim_aids":
+                self.aim_aids_visible = not self.aim_aids_visible
+                return "handled"
+            if key == "terminal_mode":
+                sim.terminal_mode = (
+                    "TTC_1S"
+                    if sim.terminal_mode == "ONE_SECOND_ENVELOPE"
+                    else "ONE_SECOND_ENVELOPE"
+                )
+                return "handled"
+            if key == "capture_check":
+                self.verification_visible = True
+                sim.capture_prediction_check()
+                return "handled"
+            if key == "clear_check":
+                sim.clear_prediction_check()
+                return "handled"
+            if key == "panels_reset":
+                self.panel_expanded = {
+                    "target": True,
+                    "calculations": False,
+                    "own": True,
+                    "relative": True,
+                }
+                return "handled"
+            return key
+        return None
 
     def _build_background(self, size: tuple[int, int]) -> pygame.Surface:
         surface = pygame.Surface(size)
@@ -354,6 +426,8 @@ class WorldRenderer:
 
     @staticmethod
     def _oval_points(oval: PredictionOval, count: int = 72) -> list[Vec3]:
+        if oval.edge_points:
+            return [*oval.edge_points, oval.edge_points[0]]
         return [
             oval.center
             + oval.plane_x * (math.cos(math.tau * index / count) * oval.radius_x)
@@ -365,10 +439,11 @@ class WorldRenderer:
     def _oval_reachability_color(
         oval: PredictionOval,
     ) -> tuple[int, int, int]:
+        if oval.invalid_reason:
+            return GREY
         if oval.fully_reachable:
             return GREEN
-        # The decision rule requires all four extremes. A partial oval is
-        # therefore unavailable, not "almost selected."
+        # All rendered edge directions must pass, not only four cardinals.
         return RED
 
     def _draw_predictions(
@@ -384,7 +459,7 @@ class WorldRenderer:
             selected = (
                 selected_horizon is not None
                 and abs(oval.horizon_s - selected_horizon) < 0.02
-                and sim.guidance.mode == "OVAL CENTER"
+                and sim.guidance.mode == "WEIGHTED OVAL"
             )
             draw_color = self._oval_reachability_color(oval)
             self._draw_polyline_3d(
@@ -400,20 +475,43 @@ class WorldRenderer:
                     pygame.draw.circle(
                         surface, GREEN if reachable else RED, projected[:2], 3, 1
                     )
-            center_projected = self._project(oval.center, camera, *surface.get_size())
-            if center_projected:
-                reachable_count = sum(oval.reachable)
-                if selected:
-                    label = f"SELECTED +{oval.horizon_s:.0f}s  4/4"
+            label_anchor = (
+                oval.center
+                + oval.plane_x * (oval.radius_x * 0.68)
+                + oval.plane_y * (oval.radius_y * 0.68)
+            )
+            label_projected = self._project(
+                label_anchor,
+                camera,
+                *surface.get_size(),
+            )
+            if label_projected:
+                if oval.invalid_reason:
+                    label = (
+                        f"+{oval.horizon_s:.0f}s  UNBOUNDED / "
+                        f"{oval.invalid_reason}"
+                    )
+                elif selected:
+                    label = (
+                        f"SELECTED +{oval.horizon_s:.0f}s  "
+                        f"EDGE {oval.edge_reachable_count}/{oval.edge_total}"
+                    )
                 elif oval.fully_reachable:
-                    label = f"+{oval.horizon_s:.0f}s  REACHABLE 4/4"
+                    label = (
+                        f"+{oval.horizon_s:.0f}s  GREEN "
+                        f"{oval.edge_reachable_count}/{oval.edge_total}"
+                    )
                 else:
                     label = (
                         f"+{oval.horizon_s:.0f}s  BLOCKED "
-                        f"{reachable_count}/4"
+                        f"{oval.edge_reachable_count}/{oval.edge_total} "
+                        f"| CARDINAL {oval.cardinal_reachable_count}/4"
                     )
                 text = self.font_tiny.render(label, True, draw_color)
-                surface.blit(text, (center_projected[0] + 5, center_projected[1] + 2))
+                surface.blit(
+                    text,
+                    (label_projected[0] + 5, label_projected[1] - 8),
+                )
 
         ballistic_points = [
             sim.track.position
@@ -430,12 +528,19 @@ class WorldRenderer:
             if projected:
                 pygame.draw.circle(surface, AMBER, projected[:2], 2)
 
-        aim = self._project(sim.guidance.aim_point, camera, *surface.get_size())
+        aim = (
+            self._project(sim.guidance.aim_point, camera, *surface.get_size())
+            if self.aim_aids_visible
+            else None
+        )
         if aim:
             x, y = aim[:2]
-            pygame.draw.line(surface, WHITE, (x - 8, y), (x + 8, y), 1)
-            pygame.draw.line(surface, WHITE, (x, y - 8), (x, y + 8), 1)
-            surface.blit(self.font_tiny.render("AIM", True, WHITE), (x + 10, y - 7))
+            diamond = ((x, y - 9), (x + 9, y), (x, y + 9), (x - 9, y))
+            pygame.draw.polygon(surface, WHITE, diamond, 2)
+            surface.blit(
+                self.font_tiny.render("AIM", True, WHITE),
+                (x + 12, y - 7),
+            )
 
     def _draw_detection_brackets(
         self,
@@ -631,10 +736,21 @@ class WorldRenderer:
         self._draw_explosion(surface, sim, camera)
         self._draw_detection_brackets(surface, target_bounds, sim)
         self._draw_camera_occlusion(surface, sim)
-        self._draw_reticle(surface)
+        self._draw_reticle(surface, sim)
         return camera
 
-    def _draw_reticle(self, surface: pygame.Surface) -> None:
+    def _draw_reticle(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        if (
+            self.view_mode != 0
+            or self.free_look_active
+            or sim.control_mode is not ControlMode.AUTO
+            or not self.aim_aids_visible
+        ):
+            return
         width, height = surface.get_size()
         center = (width // 2, (height - 180) // 2)
         color = (109, 162, 171)
@@ -643,6 +759,8 @@ class WorldRenderer:
         pygame.draw.line(surface, color, (center[0] + 10, center[1]), (center[0] + 31, center[1]), 1)
         pygame.draw.line(surface, color, (center[0], center[1] - 31), (center[0], center[1] - 10), 1)
         pygame.draw.line(surface, color, (center[0], center[1] + 10), (center[0], center[1] + 31), 1)
+        label = self.font_tiny.render("SENSOR BORESIGHT", True, color)
+        surface.blit(label, (center[0] + 35, center[1] - 7))
 
     def _panel(
         self,
@@ -754,7 +872,8 @@ class WorldRenderer:
                 GREEN
                 if powered and flight_model in ("multirotor", "vectored_vtol")
                 else AMBER
-                if flight_model in ("fixed_wing", "rocket")
+                if flight_model == "fixed_wing"
+                or (flight_model == "rocket" and controlled.rcs_remaining_s > 0.0)
                 or (flight_model == "vectored_vtol" and wingborne)
                 else RED,
             ),
@@ -762,7 +881,10 @@ class WorldRenderer:
                 "VERT",
                 GREEN
                 if powered and flight_model in ("multirotor", "vectored_vtol")
-                else AMBER if wingborne else RED,
+                else AMBER
+                if wingborne
+                or (flight_model == "rocket" and controlled.rcs_remaining_s > 0.0)
+                else RED,
             ),
             (
                 "BRAKE",
@@ -792,11 +914,19 @@ class WorldRenderer:
             if controlled.airbrake
             else "N/A" if flight_model == "rocket" else "OFF"
         )
-        panel.blit(
-            self.font_tiny.render(
+        engine_detail = (
+            f"{controlled.rocket_status} {controlled.main_burn_remaining_s:.1f}s "
+            f"RCS {controlled.rcs_remaining_s:.1f}s"
+            if flight_model == "rocket"
+            else (
                 f"ENGINE REQ/ACT {sim.manual_command.requested_engine*100:3.0f}"
                 f"/{controlled.engine_output*100:3.0f}% "
-                f"{'ON' if controlled.engine_enabled else 'CUT'}  BRAKE {brake_text}",
+                f"{'ON' if controlled.engine_enabled else 'CUT'}  BRAKE {brake_text}"
+            )
+        )
+        panel.blit(
+            self.font_tiny.render(
+                engine_detail,
                 True,
                 RED
                 if not controlled.engine_enabled
@@ -811,10 +941,375 @@ class WorldRenderer:
                 else "GUIDANCE ADVISORY: SENSOR SEARCH"
             )
         else:
-            advisory = "OUR DRONE REMAINS UNDER AUTO GUIDANCE"
+            advisory = "OUR VEHICLE REMAINS UNDER AUTO GUIDANCE"
         if sim.manual_command.floor_protection:
             advisory = "ALTITUDE FLOOR ACTIVE // DOWN LIMITED"
         panel.blit(self.font_tiny.render(advisory, True, AMBER), (12, 141))
+        surface.blit(panel, rect)
+
+    def _toolbar_button(
+        self,
+        surface: pygame.Surface,
+        key: str,
+        rect: pygame.Rect,
+        label: str,
+        active: bool = False,
+    ) -> None:
+        self.click_regions[key] = rect
+        pygame.draw.rect(
+            surface,
+            (14, 45, 54) if active else (6, 24, 34),
+            rect,
+        )
+        pygame.draw.rect(surface, CYAN if active else (58, 104, 115), rect, 1)
+        rendered = self.font_tiny.render(label, True, CYAN if active else WHITE)
+        surface.blit(
+            rendered,
+            (
+                rect.centerx - rendered.get_width() // 2,
+                rect.centery - rendered.get_height() // 2,
+            ),
+        )
+
+    def _draw_toolbar(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        width = surface.get_width()
+        labels = (
+            ("minimap", "MAP [M]", self.minimap_visible),
+            ("settings", "SETTINGS", self.settings_visible),
+            ("verification", "VERIFY", self.verification_visible),
+            ("capture_check", "CHECK 2s [G]", sim.prediction_check is not None),
+            ("info", "INFO [F1]", False),
+            ("analysis", "ANALYSIS [F2]", False),
+            ("help", "KEYS [H]", False),
+        )
+        button_width = 88
+        gap = 5
+        total_width = len(labels) * button_width + (len(labels) - 1) * gap
+        start_x = max(340, width - total_width - 14)
+        y = 82
+        for index, (key, label, active) in enumerate(labels):
+            self._toolbar_button(
+                surface,
+                key,
+                pygame.Rect(
+                    start_x + index * (button_width + gap),
+                    y,
+                    button_width,
+                    28,
+                ),
+                label,
+                active,
+            )
+
+    def _draw_minimap(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        if not self.minimap_visible:
+            return
+        width = surface.get_width()
+        rect = pygame.Rect(width - 300, 120, 284, 220)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill((4, 16, 23, 242))
+        pygame.draw.rect(panel, CYAN, panel.get_rect(), 1)
+        panel.blit(self.font_bold.render("TOP-DOWN MAP // WORLD X/Z", True, CYAN), (10, 8))
+
+        map_rect = pygame.Rect(10, 34, rect.width - 20, rect.height - 46)
+        pygame.draw.rect(panel, (5, 24, 29), map_rect)
+        pygame.draw.rect(panel, (49, 91, 99), map_rect, 1)
+
+        own = sim.interceptor.position
+        estimated = (
+            sim.track.position
+            if sim.track.position is not None
+            else sim.last_estimated_position
+        )
+        points = [own]
+        points.extend(self.interceptor_trail[-80:])
+        points.extend(self.estimated_target_trail[-80:])
+        if estimated is not None:
+            points.append(estimated)
+        min_x = min(point.x for point in points)
+        max_x = max(point.x for point in points)
+        min_z = min(point.z for point in points)
+        max_z = max(point.z for point in points)
+        span = max(100.0, max_x - min_x + 40.0, max_z - min_z + 40.0)
+        center_x = (min_x + max_x) * 0.5
+        center_z = (min_z + max_z) * 0.5
+        scale = min(map_rect.width, map_rect.height) / span
+
+        def map_point(point: Vec3) -> tuple[int, int]:
+            return (
+                int(map_rect.centerx + (point.x - center_x) * scale),
+                int(map_rect.centery - (point.z - center_z) * scale),
+            )
+
+        grid_step = 50.0
+        half_lines = int(span / grid_step) + 2
+        for index in range(-half_lines, half_lines + 1):
+            world_x = math.floor(center_x / grid_step) * grid_step + index * grid_step
+            x = map_point(Vec3(world_x, 0, center_z))[0]
+            pygame.draw.line(panel, (21, 51, 56), (x, map_rect.top), (x, map_rect.bottom))
+            world_z = math.floor(center_z / grid_step) * grid_step + index * grid_step
+            y = map_point(Vec3(center_x, 0, world_z))[1]
+            pygame.draw.line(panel, (21, 51, 56), (map_rect.left, y), (map_rect.right, y))
+
+        own_px = map_point(own)
+        fov_forward = Vec3(
+            sim.camera_forward.x,
+            0.0,
+            sim.camera_forward.z,
+        ).normalized(Vec3(0, 0, 1))
+        fov_angle = math.radians(sim.config.camera.horizontal_fov_deg * 0.5)
+        fov_length = span * 0.58
+        base_yaw = math.atan2(fov_forward.x, fov_forward.z)
+        for sign in (-1.0, 1.0):
+            yaw = base_yaw + sign * fov_angle
+            end = own + Vec3(math.sin(yaw), 0, math.cos(yaw)) * fov_length
+            pygame.draw.line(panel, (58, 143, 153), own_px, map_point(end), 1)
+
+        if len(self.interceptor_trail) > 1:
+            pygame.draw.lines(
+                panel,
+                (34, 123, 133),
+                False,
+                [map_point(point) for point in self.interceptor_trail[-80:]],
+                1,
+            )
+        if len(self.estimated_target_trail) > 1:
+            pygame.draw.lines(
+                panel,
+                (122, 84, 76),
+                False,
+                [map_point(point) for point in self.estimated_target_trail[-80:]],
+                1,
+            )
+
+        pygame.draw.circle(panel, CYAN, own_px, 5)
+        own_heading = own + sim.interceptor.forward_direction() * 12.0
+        pygame.draw.line(panel, CYAN, own_px, map_point(own_heading), 2)
+        panel.blit(self.font_tiny.render("OUR", True, CYAN), (own_px[0] + 7, own_px[1] - 7))
+
+        if estimated is not None:
+            altitude_delta = estimated.y - own.y
+            brightness = clamp(0.55 + altitude_delta / 100.0, 0.28, 1.0)
+            base_color = sim.target.spec.color
+            target_color = tuple(int(channel * brightness) for channel in base_color)
+            target_px = map_point(estimated)
+            pygame.draw.circle(panel, target_color, target_px, 6)
+            symbol = "^" if altitude_delta > 1.0 else "v" if altitude_delta < -1.0 else "="
+            panel.blit(
+                self.font_tiny.render(
+                    f"TGT {symbol} {altitude_delta:+.0f}m",
+                    True,
+                    target_color,
+                ),
+                (target_px[0] + 8, target_px[1] - 7),
+            )
+
+        panel.blit(
+            self.font_tiny.render(
+                "BRIGHTER = ABOVE  //  DARKER = BELOW  //  WEDGE = SENSOR FOV",
+                True,
+                MUTED,
+            ),
+            (10, rect.height - 15),
+        )
+        surface.blit(panel, rect)
+
+    def _draw_settings(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+        time_scale: float,
+    ) -> None:
+        if not self.settings_visible:
+            return
+        rect = pygame.Rect(340, 120, 330, 210)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill((4, 16, 25, 244))
+        pygame.draw.rect(panel, CYAN, panel.get_rect(), 1)
+        panel.blit(self.font_bold.render("PRESENTATION SETTINGS", True, CYAN), (12, 10))
+        rows = (
+            ("TIME SCALE", f"{time_scale:g}x"),
+            ("MINIMAP", "ON" if self.minimap_visible else "OFF"),
+            ("AIM AIDS", "ON" if self.aim_aids_visible else "OFF"),
+            (
+                "TERMINAL",
+                "ENTER 1s OVAL"
+                if sim.terminal_mode == "ONE_SECOND_ENVELOPE"
+                else "TTC <= 1.0s",
+            ),
+        )
+        y = 48
+        for label, value in rows:
+            panel.blit(self.font_tiny.render(label, True, MUTED), (12, y + 6))
+            panel.blit(self.font_small.render(value, True, WHITE), (126, y + 4))
+            y += 33
+        button_specs = (
+            ("time_down", pygame.Rect(238, 43, 34, 25), "-"),
+            ("time_up", pygame.Rect(282, 43, 34, 25), "+"),
+            ("minimap", pygame.Rect(238, 76, 78, 25), "TOGGLE"),
+            ("aim_aids", pygame.Rect(238, 109, 78, 25), "TOGGLE"),
+            ("terminal_mode", pygame.Rect(238, 142, 78, 25), "CHANGE"),
+            ("panels_reset", pygame.Rect(12, 178, 130, 23), "RESET PANELS"),
+        )
+        for key, local_rect, label in button_specs:
+            pygame.draw.rect(panel, (10, 36, 46), local_rect)
+            pygame.draw.rect(panel, (59, 117, 127), local_rect, 1)
+            rendered = self.font_tiny.render(label, True, WHITE)
+            panel.blit(
+                rendered,
+                (
+                    local_rect.centerx - rendered.get_width() // 2,
+                    local_rect.centery - rendered.get_height() // 2,
+                ),
+            )
+            self.click_regions[key] = local_rect.move(rect.x, rect.y)
+        surface.blit(panel, rect)
+
+    def _draw_verification(
+        self,
+        surface: pygame.Surface,
+        sim: InterceptionSimulation,
+    ) -> None:
+        if not self.verification_visible:
+            return
+        width, height = surface.get_size()
+        rect = pygame.Rect(width // 2 - 215, max(345, height - 410), 430, 190)
+        panel = pygame.Surface(rect.size, pygame.SRCALPHA)
+        panel.fill((4, 16, 25, 245))
+        pygame.draw.rect(panel, AMBER, panel.get_rect(), 1)
+        panel.blit(
+            self.font_bold.render(
+                "SIMULATION-TRUTH VERIFICATION ONLY",
+                True,
+                AMBER,
+            ),
+            (12, 9),
+        )
+        truth = sim.target.position
+        estimate = sim.track.position
+        error = truth.distance_to(estimate) if estimate is not None else math.nan
+        panel.blit(
+            self.font_tiny.render(
+                f"TRUTH XYZ {truth.x:+.1f}/{truth.y:+.1f}/{truth.z:+.1f} m",
+                True,
+                MUTED,
+            ),
+            (12, 34),
+        )
+        panel.blit(
+            self.font_tiny.render(
+                (
+                    f"EST. XYZ  {estimate.x:+.1f}/{estimate.y:+.1f}/{estimate.z:+.1f} m"
+                    f"  ERROR {error:.2f} m"
+                    if estimate is not None
+                    else "EST. XYZ  NO CURRENT VISUAL TRACK"
+                ),
+                True,
+                WHITE,
+            ),
+            (12, 51),
+        )
+
+        inset_rect = pygame.Rect(12, 74, 242, 101)
+        pygame.draw.rect(panel, (2, 10, 16), inset_rect)
+        pygame.draw.rect(panel, (57, 93, 101), inset_rect, 1)
+        check = sim.prediction_check
+        if check is None:
+            panel.blit(
+                self.font_tiny.render(
+                    "Press G or CAPTURE to record the current +2s sensor frame.",
+                    True,
+                    MUTED,
+                ),
+                (20, 114),
+            )
+            status = "NO RECORDED CHECK"
+            status_color = MUTED
+        else:
+            inset = panel.subsurface(inset_rect)
+            recorded_camera = ViewCamera(
+                check.camera_position,
+                check.camera_forward,
+                "RECORDED SENSOR FRAME",
+            )
+            self._draw_polyline_3d(
+                inset,
+                self._oval_points(check.oval),
+                recorded_camera,
+                GREEN if check.result_inside else AMBER,
+                2,
+            )
+            marker_position = (
+                check.projected_truth
+                if check.evaluated and check.projected_truth is not None
+                else sim.target.position
+            )
+            projected = self._project(
+                marker_position,
+                recorded_camera,
+                inset_rect.width,
+                inset_rect.height,
+            )
+            if projected:
+                pygame.draw.circle(
+                    inset,
+                    GREEN if check.result_inside else RED,
+                    projected[:2],
+                    5,
+                    2,
+                )
+            if check.evaluated:
+                status = "INSIDE" if check.result_inside else "OUTSIDE"
+                status_color = GREEN if check.result_inside else RED
+            else:
+                remaining = max(
+                    0.0,
+                    check.capture_time_s + check.oval.horizon_s - sim.time_s,
+                )
+                status = f"RECORDED FRAME // CHECK IN {remaining:.2f}s"
+                status_color = AMBER
+        panel.blit(
+            self.font_small.render(
+                f"RESULT: {status}" if check is not None and check.evaluated else status,
+                True,
+                status_color,
+            ),
+            (266, 82),
+        )
+        explanatory = (
+            "RECORDED CAMERA FIXED.",
+            "LIVE VIEW MAY MOVE.",
+            "TRUTH CHECK AT T+2.",
+        )
+        for index, line in enumerate(explanatory):
+            panel.blit(
+                self.font_tiny.render(line, True, MUTED),
+                (266, 110 + index * 17),
+            )
+
+        capture_local = pygame.Rect(rect.width - 144, rect.height - 27, 92, 22)
+        clear_local = pygame.Rect(rect.width - 47, rect.height - 27, 42, 22)
+        self.click_regions["capture_check"] = capture_local.move(rect.x, rect.y)
+        self.click_regions["clear_check"] = clear_local.move(rect.x, rect.y)
+        for button_rect, label in ((capture_local, "CAPTURE"), (clear_local, "CLEAR")):
+            pygame.draw.rect(panel, (10, 36, 46), button_rect)
+            pygame.draw.rect(panel, AMBER, button_rect, 1)
+            rendered = self.font_tiny.render(label, True, WHITE)
+            panel.blit(
+                rendered,
+                (
+                    button_rect.centerx - rendered.get_width() // 2,
+                    button_rect.centery - rendered.get_height() // 2,
+                ),
+            )
         surface.blit(panel, rect)
 
     def draw_hud(
@@ -824,6 +1319,7 @@ class WorldRenderer:
         time_scale: float,
         fps: float,
     ) -> None:
+        self.click_regions = {}
         width, height = surface.get_size()
         top = pygame.Surface((width, 54), pygame.SRCALPHA)
         top.fill((3, 12, 20, 235))
@@ -852,6 +1348,7 @@ class WorldRenderer:
             (16, 62),
         )
         self._draw_control_hud(surface, sim)
+        self._draw_toolbar(surface, sim)
         if sim.paused:
             pause = self.font_large.render("SIMULATION PAUSED", True, AMBER)
             surface.blit(pause, (width // 2 - pause.get_width() // 2, 82))
@@ -864,10 +1361,9 @@ class WorldRenderer:
             box.blit(success, (18, 10))
             surface.blit(box, (width // 2 - box.get_width() // 2, 105))
 
-        panel_y = height - 178
         margin, gap = 10, 8
         panel_width = (width - margin * 2 - gap * 3) // 4
-        panel_height = 168
+        panel_height_expanded = 190
 
         target_name = sim.target.spec.name if sim.identity_confirmed else "???"
         target_axial_accel = (
@@ -882,6 +1378,16 @@ class WorldRenderer:
             ("ACCEL / BRAKE", f"{sim.target.spec.max_accel:.1f} / {sim.target.spec.brake_accel:.1f} m/s²" if sim.identity_confirmed else "QUERYING"),
             ("SIZE W/H/L", sim.target.spec.size_label if sim.identity_confirmed else "QUERYING"),
             ("SPEED / AXIAL A", f"{sim.track.velocity.length():.2f} / {target_axial_accel:+.2f}" if sim.visual_locked and sim.track.sample_count > 2 else ("NO VISUAL LOCK" if sim.identity_confirmed and not sim.visual_locked else "ANGULAR ONLY")),
+            (
+                "EST. POSITION XYZ",
+                (
+                    f"{sim.track.position.x:+.0f}/{sim.track.position.y:+.0f}/"
+                    f"{sim.track.position.z:+.0f} m"
+                    if sim.track.position is not None
+                    else "---"
+                ),
+                WHITE if sim.visual_locked else AMBER,
+            ),
             ("SCENARIO", dict(SCENARIOS)[sim.config.scenario]),
         ]
 
@@ -912,12 +1418,20 @@ class WorldRenderer:
             ("ACCELERATION", f"{own.acceleration.length():.2f} m/s²"),
             (
                 "ENGINE / LIFT",
-                f"{'ON' if own.engine_enabled else 'CUT'} "
+                f"{own.rocket_status if own.spec.flight_model == 'rocket' else ('ON' if own.engine_enabled else 'CUT')} "
                 f"{own.engine_output*100:.0f}% / "
-                f"{own.lift_acceleration.length():.1f} m/sÂ²",
+                f"{own.lift_acceleration.length():.1f} m/s2",
                 RED if not own.engine_enabled else WHITE,
             ),
         ]
+        if own.spec.flight_model == "rocket":
+            own_rows.append(
+                (
+                    "BOOSTER / RCS",
+                    f"{own.main_burn_remaining_s:.1f}s / {own.rcs_remaining_s:.1f}s",
+                    AMBER if own.engine_enabled else MUTED,
+                )
+            )
 
         if sim.hit:
             relative_velocity = sim.target.velocity - own.velocity
@@ -938,9 +1452,6 @@ class WorldRenderer:
         else:
             relative_v = Vec3()
         guidance = sim.guidance
-        error = (
-            estimate.distance_m - sim.true_range_m if estimate is not None else None
-        )
         if sim.hit:
             relative_rows = [
                 ("REL. Vx / Vy", f"{relative_v.x:+.2f} / {relative_v.y:+.2f} m/s"),
@@ -964,24 +1475,59 @@ class WorldRenderer:
                 ("CLOSING SPEED", f"{guidance.closing_speed:+.2f} m/s" if guidance else "---"),
                 ("TIME TO CONTACT", f"{guidance.time_to_contact_s:.2f} s" if guidance and math.isfinite(guidance.time_to_contact_s) else "---"),
                 ("GUIDANCE", guidance.mode if guidance else ("BEARING PURSUIT" if sim.visual_locked else "NO VISUAL LOCK")),
-                ("OVAL / EDGES", f"{guidance.selected_horizon_s:.1f}s / {guidance.reachable_count}/4" if guidance and guidance.selected_horizon_s else ("SEARCHING" if not sim.visual_locked else "---")),
-                ("TRUE / ERROR", f"{sim.true_range_m:.2f} / {error:+.2f} m" if error is not None else f"{sim.true_range_m:.2f} / ---", MUTED),
+                (
+                    "OVAL / EDGE",
+                    (
+                        f"{guidance.selected_horizon_s:.1f}s / "
+                        f"{guidance.reachable_count}/{guidance.reachable_total}"
+                        if guidance and guidance.selected_horizon_s
+                        else "SEARCHING" if not sim.visual_locked else "---"
+                    ),
+                ),
+                (
+                    "TRACK SIGMA",
+                    (
+                        f"{sim.track.position_sigma_m:.2f}m / "
+                        f"{sim.track.velocity_sigma_mps:.2f}m/s"
+                        if sim.visual_locked
+                        else "---"
+                    ),
+                    MUTED,
+                ),
             ]
 
         panels = (
-            ("TARGET VEHICLE", target_rows),
-            ("CALCULATIONS", calc_rows),
-            ("OUR DRONE", own_rows),
-            ("RELATIVE", relative_rows),
+            ("target", "TARGET VEHICLE", target_rows),
+            ("calculations", "CALCULATIONS", calc_rows),
+            ("own", "OUR VEHICLE", own_rows),
+            ("relative", "RELATIVE", relative_rows),
         )
-        for index, (title, rows) in enumerate(panels):
+        for index, (key, title, rows) in enumerate(panels):
+            expanded = self.panel_expanded[key]
+            panel_height = panel_height_expanded if expanded else 32
+            panel_y = height - panel_height - 10
             rect = pygame.Rect(
                 margin + index * (panel_width + gap),
                 panel_y,
                 panel_width,
                 panel_height,
             )
-            self._panel(surface, rect, title, rows)
+            self._panel(
+                surface,
+                rect,
+                f"{'v' if expanded else '>'} {title}",
+                rows if expanded else [],
+            )
+            self.click_regions[f"panel:{key}"] = pygame.Rect(
+                rect.x,
+                rect.y,
+                rect.width,
+                32,
+            )
+
+        self._draw_minimap(surface, sim)
+        self._draw_settings(surface, sim, time_scale)
+        self._draw_verification(surface, sim)
 
     def draw_analysis(self, surface: pygame.Surface, sim: InterceptionSimulation) -> None:
         width, height = surface.get_size()
@@ -1147,7 +1693,7 @@ class WorldRenderer:
         if sim.guidance is not None:
             for oval in sim.guidance.ovals:
                 selected = (
-                    sim.guidance.mode == "OVAL CENTER"
+                    sim.guidance.mode == "WEIGHTED OVAL"
                     and sim.guidance.selected_horizon_s is not None
                     and abs(
                         sim.guidance.selected_horizon_s - oval.horizon_s
@@ -1157,7 +1703,8 @@ class WorldRenderer:
                 oval_rows.append(
                     f"{oval.horizon_s:.0f}s: radii "
                     f"{oval.radius_x:.1f}/{oval.radius_y:.1f} m, "
-                    f"{sum(oval.reachable)}/4 reachable"
+                    f"edge {oval.edge_reachable_count}/{oval.edge_total}, "
+                    f"cardinal {oval.cardinal_reachable_count}/4"
                     f"{' [SELECTED]' if selected else ''}"
                 )
         else:
@@ -1189,8 +1736,8 @@ class WorldRenderer:
                     [
                         "TARGET VEHICLE: signal-resolved dimensions and maneuver limits.",
                         "CALCULATIONS: measured pixels, confidence, range uncertainty, and Dx/Dy/Dz.",
-                        "OUR DRONE: integrated position, velocity, acceleration, engine state, and lift.",
-                        "RELATIVE: image-track relative velocity, closing time, chosen guidance, reachability, and verification-only truth error.",
+                        "OUR VEHICLE: integrated position, velocity, acceleration, engine/lift, and rocket fuel where applicable.",
+                        "RELATIVE: image-track relative velocity, closing time, guidance, full-edge reachability, and track uncertainty.",
                     ],
                 ),
                 (
@@ -1208,18 +1755,18 @@ class WorldRenderer:
                 (
                     "WHAT EACH OVAL MEANS",
                     [
-                        "The 1, 2, 3, and 5 second ellipses bound the target's allowed projected acceleration at those future times.",
-                        "Every ellipse is in the single plane through the target and perpendicular to the current sensor optical axis.",
-                        "Therefore the target, every oval center, every extreme, and every unchanged-trajectory dot have the same measured Z depth.",
-                        "The center is the average of the four asymmetric extreme points, not an arbitrary screen position.",
+                        "At 60 Hz the current camera pose is frozen and the 1, 2, 3, and 5 second ellipses bound the pixels the target could occupy.",
+                        "Maneuver authority, perspective, and bounded track uncertainty inflate an outer containment border.",
+                        "Each pixel ellipse is back-projected onto the plane through the estimated target, perpendicular to the current sensor axis.",
+                        "A possible camera-plane crossing is labeled UNBOUNDED instead of drawing a false finite ellipse.",
                     ],
                 ),
                 (
-                    "COLOR AND FOUR-POINT RULE",
+                    "COLOR AND COMPLETE-EDGE RULE",
                     [
-                        "GREEN border: all 4 extreme points are reachable; this oval may be selected.",
-                        "RED border: at least 1 required extreme is unreachable; the label states the exact reachable count.",
-                        "Individual extreme markers are green/red so the failing direction remains visible.",
+                        "GREEN border: every one of the 96 displayed edge directions is reachable; this oval may be selected.",
+                        "RED border: at least one edge direction is unavailable; the label reports the complete count.",
+                        "Four large cardinal markers remain as a simple 4/4 explanation, but they do not decide the border color.",
                         "AMBER dots are the unchanged-velocity trajectory, not a partially valid oval.",
                     ],
                 ),
@@ -1230,9 +1777,10 @@ class WorldRenderer:
                 (
                     "HOW THE AIM IS CHOSEN",
                     [
-                        "The solver checks 5s, 3s, 2s, then 1s and aims at the largest center whose four extremes all pass.",
-                        "If none pass, it aims at the smallest oval's unchanged-trajectory point.",
-                        "Near contact it switches to a camera-track terminal intercept instead of chasing a large oval.",
+                        "The solver checks 5s, 3s, 2s, then 1s and selects the largest completely green edge.",
+                        "The aim is biased from its center toward measured likely motion, but remains inside 65% of the ellipse.",
+                        "If none pass, it reports NO GUARANTEED OVAL and follows the transparent unchanged-motion point.",
+                        "When our one-second reach enters the smallest oval, it switches to camera-derived terminal collision lead.",
                         f"Current guidance: {current_guidance}",
                     ],
                 ),
@@ -1245,7 +1793,7 @@ class WorldRenderer:
                         "Gravity is always 9.81 m/s2 downward for every airborne vehicle.",
                         "Rotorcraft hover only because their powered thrust explicitly counters gravity; cutting the engine removes that support.",
                         "Drag grows with speed. Airbrakes add continuous opposing acceleration instead of deleting speed instantly.",
-                        "X cuts or restarts the currently controlled vehicle's engine.",
+                        "X cuts or restarts controllable drone engines; a solid rocket booster cannot be cut or restarted.",
                     ],
                 ),
                 (
@@ -1253,7 +1801,8 @@ class WorldRenderer:
                     [
                         "Fixed wings generate lift perpendicular to their flight path. Lift grows with airflow, weakens below stall speed, and vanishes in a vertical fall.",
                         "An engine-off wing therefore glides and loses altitude more slowly while moving forward, then sinks faster as drag removes airspeed.",
-                        "Rockets receive gravity and drag but no wing lift, reverse thrust, or airbrake.",
+                        "Rockets use one automatic finite main burn plus a separate limited RCS budget; burnout is permanent.",
+                        "They receive gravity and drag but no wing lift, reverse thrust, throttle, restart, or airbrake.",
                         "The model is deliberately simplified and exposes its stall speed and lift efficiency rather than claiming CFD fidelity.",
                     ],
                 ),
@@ -1269,7 +1818,7 @@ class WorldRenderer:
                 (
                     "PLAYER AUTHORITY",
                     [
-                        "Tab cycles AUTO -> OUR DRONE -> TARGET -> AUTO.",
+                        "Tab cycles AUTO -> OUR VEHICLE -> TARGET -> AUTO.",
                         "W/S request forward/reverse or deceleration; A/D turn; Q/E change and then hold altitude; Shift requests full authority; Ctrl uses an available airbrake.",
                         "Commands still pass through thrust direction, stall/lift, turn rate, speed, drag, gravity, and the two-metre floor.",
                         "When our drone is manual, the oval solution remains visible only as an advisory.",
@@ -1291,7 +1840,7 @@ class WorldRenderer:
                 (
                     "CAMERA AND SPECTATOR MODES",
                     [
-                        "V cycles onboard sensor, chase, and spectator/tactical views.",
+                        "V cycles onboard sensor, chase, and spectator/tactical views. The fixed boresight appears only onboard.",
                         "F3 jumps directly to the spectator view, which watches both vehicles and is not attached to either pilot.",
                         "Right mouse captures unlimited presentation free-look; Shift+right mouse rolls; C centers.",
                         "Presentation free-look never changes the sensor, oval plane, detection, or guidance calculation.",
@@ -1300,18 +1849,18 @@ class WorldRenderer:
                 (
                     "PROOF BOUNDARY",
                     [
-                        "Target truth is used only to render the synthetic image, resolve physical contact, and compute explicitly labeled verification error.",
+                        "Target truth is used only to render the synthetic image, resolve contact, and feed the expanded verification window.",
                         "The generic detector and signal lookup are deterministic simulation adapters, not deployed YOLO/DINO or radio hardware.",
                         "The meshes and aerodynamics are presentation-grade prototypes; production work needs calibrated cameras, wind, latency, uncertainty, and hardware tests.",
-                        "The automated suite verifies plane geometry, actual ellipses, center selection, colors, gravity/glide, engine cut, sensors, propulsion, and all scenarios.",
+                        "CHECK 2s records an old virtual camera frame; it can verify the target at T+2 even after the live camera moves.",
                     ],
                 ),
                 (
                     "FAST DEMO KEYS",
                     [
-                        "F1 info | H controls | F2 analysis | F3 spectator | F5 CSV",
-                        "O camera occlusion | Space pause | +/- time | R restart | N setup",
-                        "Tab authority | X engine | W/S A/D Q/E flight | Shift full | Ctrl brake",
+                        "F1 info | H controls | F2 analysis | F3 spectator | F4 settings | F5 CSV",
+                        "M minimap | G check 2s | O camera occlusion | Space pause | +/- time",
+                        "Tab authority | X drone engine | W/S A/D Q/E flight | Shift full | Ctrl brake",
                         f"Current status: {sim.status}",
                     ],
                 ),
@@ -1373,7 +1922,9 @@ class WorldRenderer:
             ("F1", "open the full four-page system reference"),
             ("F2", "open range-error and resolution analysis"),
             ("F3", "jump directly to spectator / tactical view"),
+            ("F4", "toggle presentation settings"),
             ("F5", "export verification telemetry to CSV"),
+            ("M / G", "toggle minimap / record a +2 s prediction check"),
             ("R", "restart the current simulation"),
             ("N", "return to setup and place new drones"),
             ("O", "force camera occlusion (lock-loss proof)"),
@@ -1381,13 +1932,13 @@ class WorldRenderer:
             ("ESC", "close an overlay, then exit"),
         ]
         flight_items = [
-            ("TAB", "AUTO -> OUR DRONE -> TARGET -> AUTO"),
+            ("TAB", "AUTO -> OUR VEHICLE -> TARGET -> AUTO"),
             ("W / S", "forward thrust / reverse or decelerate"),
             ("A / D", "turn left / right within vehicle limits"),
             ("Q / E", "descend / climb; release to hold altitude"),
             ("SHIFT", "request full available maneuver authority"),
             ("CTRL", "airbrake (unavailable on rockets)"),
-            ("X", "cut / restart the controlled vehicle engine"),
+            ("X", "cut / restart a drone engine; solid rockets are fixed-burn"),
             ("RMB", "mouse look suppresses flight-key input"),
             ("GREEN", "direct authority"),
             ("AMBER", "turn / braking limited"),
@@ -1413,7 +1964,7 @@ class WorldRenderer:
             overlay.blit(self.font_tiny.render(description, True, WHITE), (card.x + 586, y + 2))
             y += 30
 
-        separator_y = card.bottom - 112
+        separator_y = card.bottom - 88
         pygame.draw.line(
             overlay,
             (42, 92, 103),
@@ -1423,8 +1974,8 @@ class WorldRenderer:
         )
         notes = [
             "Every oval shares the target plane perpendicular to the sensor.",
-            "Its border conservatively contains all allowed projected maneuvers.",
-            "Green oval = 4/4 reachable; red = at least one required edge failed.",
+            "Its border contains the modeled projected maneuvers plus bounded track uncertainty.",
+            "Green = all 96 edge directions reachable; four large dots remain the cardinal summary.",
             "True range is simulation verification only, never guidance input.",
         ]
         y = separator_y + 12

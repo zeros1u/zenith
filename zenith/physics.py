@@ -32,6 +32,44 @@ class DroneState:
     engine_enabled: bool = True
     lift_acceleration: Vec3 = field(default_factory=Vec3)
     drag_acceleration: Vec3 = field(default_factory=Vec3)
+    main_burn_remaining_s: float = -1.0
+    rcs_remaining_s: float = -1.0
+    burned_out: bool = False
+
+    def __post_init__(self) -> None:
+        if self.spec.flight_model != "rocket":
+            return
+        if self.main_burn_remaining_s < 0.0:
+            self.main_burn_remaining_s = self.spec.main_burn_duration_s
+        if self.rcs_remaining_s < 0.0:
+            self.rcs_remaining_s = self.spec.rcs_duration_s
+        self.engine_enabled = self.main_burn_remaining_s > 0.0
+
+    @property
+    def main_burn_fraction(self) -> float:
+        if self.spec.main_burn_duration_s <= 0.0:
+            return 0.0
+        return clamp(
+            self.main_burn_remaining_s / self.spec.main_burn_duration_s,
+            0.0,
+            1.0,
+        )
+
+    @property
+    def rcs_fraction(self) -> float:
+        if self.spec.rcs_duration_s <= 0.0:
+            return 0.0
+        return clamp(
+            self.rcs_remaining_s / self.spec.rcs_duration_s,
+            0.0,
+            1.0,
+        )
+
+    @property
+    def rocket_status(self) -> str:
+        if self.spec.flight_model != "rocket":
+            return "N/A"
+        return "BURNING" if self.engine_enabled and not self.burned_out else "BURNOUT"
 
     def integrate(
         self,
@@ -238,10 +276,29 @@ class DroneState:
         axial_request = command.dot(forward)
         minimum_axial = 0.0 if self.spec.flight_model == "rocket" else -self.spec.brake_accel
         maximum_axial = self.spec.max_accel if self.engine_enabled else 0.0
-        axial = clamp(axial_request, minimum_axial, maximum_axial)
+        if self.spec.flight_model == "rocket":
+            # A literal single-stage booster ignites at launch and burns at
+            # full thrust until its propellant is exhausted. Guidance controls
+            # only the separate RCS steering authority.
+            axial = maximum_axial
+        else:
+            axial = clamp(axial_request, minimum_axial, maximum_axial)
         lateral = (command - forward * axial_request).clamp_length(
             self.spec.lateral_accel
         )
+        if self.spec.flight_model == "rocket":
+            if self.rcs_remaining_s <= 0.0:
+                lateral = Vec3()
+            elif lateral.length() > 1e-6:
+                usage = clamp(
+                    lateral.length() / max(self.spec.lateral_accel, 0.001),
+                    0.0,
+                    1.0,
+                )
+                self.rcs_remaining_s = max(
+                    0.0,
+                    self.rcs_remaining_s - dt * usage,
+                )
 
         commanded_turn_rate = lateral.length() / max(speed, 5.0)
         allowed_turn_rate = min(
@@ -288,6 +345,15 @@ class DroneState:
             if self.engine_enabled
             else 0.0
         )
+        if self.spec.flight_model == "rocket" and self.engine_enabled:
+            self.main_burn_remaining_s = max(
+                0.0,
+                self.main_burn_remaining_s - dt,
+            )
+            if self.main_burn_remaining_s <= 1e-9:
+                self.main_burn_remaining_s = 0.0
+                self.engine_enabled = False
+                self.burned_out = True
 
         target_yaw = math.atan2(new_forward.x, new_forward.z)
         target_pitch = -math.asin(clamp(new_forward.y, -1.0, 1.0))
@@ -307,7 +373,12 @@ def lerp_angle(start: float, end: float, amount: float) -> float:
     return start + delta * clamp(amount, 0.0, 1.0)
 
 
-def maximum_travel_distance(initial_along_speed: float, spec: DroneSpec, time_s: float) -> float:
+def maximum_travel_distance(
+    initial_along_speed: float,
+    spec: DroneSpec,
+    time_s: float,
+    powered_time_s: float | None = None,
+) -> float:
     """Maximum one-dimensional distance under acceleration and speed constraints."""
     if time_s <= 0.0:
         return 0.0
@@ -315,9 +386,19 @@ def maximum_travel_distance(initial_along_speed: float, spec: DroneSpec, time_s:
     accel = max(0.001, spec.max_accel)
     if speed >= spec.max_speed:
         return spec.max_speed * time_s
-    accelerate_time = min(time_s, (spec.max_speed - speed) / accel)
+    available_burn = (
+        time_s
+        if powered_time_s is None
+        else clamp(powered_time_s, 0.0, time_s)
+    )
+    accelerate_time = min(
+        time_s,
+        available_burn,
+        (spec.max_speed - speed) / accel,
+    )
     accelerated = speed * accelerate_time + 0.5 * accel * accelerate_time**2
-    cruise = spec.max_speed * (time_s - accelerate_time)
+    achieved_speed = min(spec.max_speed, speed + accel * accelerate_time)
+    cruise = achieved_speed * (time_s - accelerate_time)
     return accelerated + cruise
 
 

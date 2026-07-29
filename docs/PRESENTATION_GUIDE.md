@@ -20,15 +20,15 @@ Explain that the image center gives bearing, while known size gives scale. `Dx`,
 
 Point to the 1, 2, 3, and 5 second ovals:
 
-- each oval represents positions allowed by the target's known acceleration and speed;
-- every oval, its four extremes, its center, the projected unchanged path, and the target lie in one plane perpendicular to our sensor camera view;
-- the border is inflated from propulsion-specific acceleration support, so the target's projected position cannot escape it under the stated limits;
-- the four extreme points are calculated separately and tested for our reachability;
-- a green border means all 4 extremes are reachable; if even one required point fails, the border is red and reports the exact `n/4` count;
+- each oval is the future pixel area seen from the current camera pose if that pose were frozen now;
+- the pixel ellipse is back-projected onto one plane through the estimated target, perpendicular to the sensor;
+- propulsion support, perspective, and track uncertainty make the border an outer bound under the stated model;
+- four large points remain the cardinal explanation, while all 96 rendered edge directions are tested;
+- green means `96/96`; red reports the complete count, and grey reports an unbounded camera crossing;
 - an unreachable oval remains visible and red instead of disappearing;
-- if all four extremes are reachable, the center is a safe guidance objective;
+- the largest green oval uses a confidence-weighted likely-motion point limited to 65% of its radius;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
-- near contact, large ovals are ignored and terminal pursuit matches the target's motion.
+- reaching the one-second region activates camera-derived terminal collision lead.
 
 ### 4. Prove it is camera-driven — 60 seconds
 
@@ -36,7 +36,7 @@ Point out:
 
 - identity begins as `UNKNOWN / QUERYING`;
 - pixel size, focal length, estimated range, and uncertainty are visible;
-- `TRUE / ERROR` is labeled verification-only;
+- estimated target XYZ is visible while truth/error stays in the expanded verification window;
 - the exact target coordinate never enters the guidance function;
 - pressing `F5` exports the camera estimate and truth comparison for every sampled frame.
 
@@ -45,6 +45,8 @@ Press `O` once. Point out that the detection brackets, metric readout, ovals, an
 Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered sensor presentation.
 
 Press `F3` for the independent spectator/tactical camera. This is the clearest view for proving that the target and all four ovals occupy the same plane. Press `F1` at any time for the four-page explanation of every coordinate, color, force, guidance state, camera, and verification boundary.
+
+Press `M` for the estimated-track X/Z minimap. Its wedge is the actual sensor FOV; the target marker is brighter above the camera and darker below, with a numeric altitude difference. Press `G` to record the current two-second prediction. The verification inset retains the old virtual camera, so the live vehicle and camera may continue moving before the `INSIDE/OUTSIDE` check.
 
 ### 5. Demonstrate robustness — 60 seconds
 
@@ -86,7 +88,7 @@ The target's bounded acceleration spreads its future projected position in the p
 
 ### “Does checking four points prove the whole oval is reachable?”
 
-The four checks prove whether our drone can reach the four marked extremes used by this software's decision rule. Separately, the oval's conservative support construction proves containment of the target's projected acceleration-bounded set. A production system would add full 3D range uncertainty and formal actuator/wind uncertainty.
+No. Connecting four cardinal extremes makes a diamond that excludes diagonal parts of an ellipse. ZENITH keeps the four large dots for explanation but tests all 96 rendered edge directions. A deliberately tested diagonal failure remains red even with `CARDINAL 4/4`.
 
 ### “Can an aircraft accelerate in any direction in this simulation?”
 
@@ -94,7 +96,7 @@ No. Multirotors must slew and tilt their thrust vector. Fixed-wing engines push 
 
 ### “Where is gravity, and why does a wing fall differently?”
 
-Gravity is continuously applied at `9.81 m/s²` to every airborne vehicle. A powered multirotor spends upward thrust to cancel it. A wing creates lift perpendicular to its flight path; that lift depends on airspeed, weakens below the model's visible stall speed, and vanishes during a vertical fall. With its engine cut, a fast wing therefore glides and sinks slowly at first, then falls faster as drag removes speed. Rockets have gravity and drag but no wing lift. Take over a vehicle with `Tab` and press `X` to cut or restart its engine.
+Gravity is continuously applied at `9.81 m/s²` to every airborne vehicle. A powered multirotor spends upward thrust to cancel it. A wing creates lift perpendicular to its flight path; that lift weakens below stall and vanishes in a vertical fall. Rockets have gravity and drag but no wing lift. Their solid booster ignites automatically, expires permanently, and uses a separately timed RCS supply; `X` correctly cannot cut or restart it.
 
 ### “What happens when the target rotates?”
 
@@ -108,9 +110,9 @@ The current milestone uses a deterministic synthetic detector with the same boun
 
 No. The renderer now uses original low-poly meshes with rotors, arms, fuselages, wings, fins, nose cones, and exhaust sections. They remain lightweight enough for the custom renderer, and `mesh_id` provides the future boundary for imported Blender or glTF assets.
 
-### “Why no instant boosters?”
+### “How do the rocket boosters work?”
 
-The prototype uses continuous acceleration, drag, and airbrake forces because they are easier to verify physically. A booster would use the same acceleration command interface but with a time-limited higher bound.
+`SKYFALL-R1` and `LANCE-M2` can be selected as our interceptor or as the target. They ignite at launch, use full thrust for four or six seconds, cannot throttle/reverse/cut/restart, and then coast. A separate RCS timer powers bounded direction changes. The HUD exposes both remaining timers.
 
 ### “Can you control both vehicles?”
 
@@ -122,10 +124,10 @@ Yes. `Tab` cycles from autonomy to our interceptor, then to the target, then bac
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
 3. Start and wait for signal confirmation.
 4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it and press `C` to center.
-5. Press `F3` for spectator view. Point out that the target, every oval center/border, and every amber unchanged-path dot occupy the same oblique plane. Red now means the oval fails the required four-point rule even if only one point is unreachable.
-6. Press `Tab` for our-drone control. Show the guidance advisory beside your own command, then use `W/A/Q` with `Shift`. Press `X` to cut the engine and show gravity/lift, then restart it. Press `Tab` again and control the target; point out the chase camera and authority HUD. Press `Tab` a third time to restore autonomy.
-7. Press `F1`; show the oval and aerodynamics information pages. Close it and press `F2` to discuss range degradation and resolution.
-8. Close analysis with `F2`, return onboard with `V`, then press `O` to prove guidance loss. Point out that search follows the last image motion while holding altitude and staying near the horizon. Press `O` again to demonstrate genuine reacquisition.
-9. Press `-` for slow motion and let the collision complete.
-10. Start a new run with `SKYFALL-R1` and `ROCKET ATTACK`. Take over the rocket to show that reverse, airbrake, and wing lift are unavailable.
+5. Press `F3` for spectator view and show the common target plane. Red means at least one of 96 edge directions failed even if all four cardinal dots are green.
+6. Press `M` for the estimated-track map, then `G` for the saved-camera two-second check.
+7. Press `Tab` for our-vehicle control. Demonstrate drone gravity/lift with `X`, then restore autonomy.
+8. Press `F1` for the oval/aerodynamics reference, then `F2` for range degradation.
+9. Return onboard, press `O` to prove guidance loss, then restore the image and reacquire.
+10. Start a new run with `SKYFALL-R1` or `LANCE-M2` as **our interceptor**. Show automatic burn, RCS steering, and burnout; rockets remain available as incoming threats.
 11. Press `F5` to export the proof data.

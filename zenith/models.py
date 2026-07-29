@@ -1,4 +1,4 @@
-"""Expandable drone and incoming-threat specification catalogue."""
+"""Expandable drone and two-sided one-shot rocket specification catalogue."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ class DroneSpec:
     max_turn_rate_deg: float = 90.0
     stall_speed: float = 0.0
     lift_efficiency: float = 0.0
+    main_burn_duration_s: float = 0.0
+    rcs_duration_s: float = 0.0
 
     @property
     def size_label(self) -> str:
@@ -99,7 +101,7 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         75.0,
         19.0,
         24.0,
-        16.0,
+        25.0,
         0.0015,
         "High-agility interceptor",
         "talon_delta",
@@ -137,13 +139,15 @@ ROCKET_SPECS: tuple[DroneSpec, ...] = (
         96.0,
         26.0,
         0.0,
-        7.0,
+        12.0,
         0.0007,
-        "High-speed unguided rocket",
+        "High-speed single-stage interceptor",
         "rocket_skyfall",
-        "rocket",
-        "rocket",
-        18.0,
+        vehicle_type="rocket",
+        flight_model="rocket",
+        max_turn_rate_deg=35.0,
+        main_burn_duration_s=4.0,
+        rcs_duration_s=8.0,
     ),
     DroneSpec(
         "LM2",
@@ -153,16 +157,19 @@ ROCKET_SPECS: tuple[DroneSpec, ...] = (
         84.0,
         21.0,
         0.0,
-        10.0,
+        16.0,
         0.0009,
-        "Maneuver-capable defense threat",
+        "Agile single-stage RCS interceptor",
         "rocket_lance",
-        "rocket",
-        "rocket",
-        31.0,
+        vehicle_type="rocket",
+        flight_model="rocket",
+        max_turn_rate_deg=70.0,
+        main_burn_duration_s=6.0,
+        rcs_duration_s=12.0,
     ),
 )
 
+INTERCEPTOR_SPECS: tuple[DroneSpec, ...] = DRONE_SPECS + ROCKET_SPECS
 TARGET_SPECS: tuple[DroneSpec, ...] = DRONE_SPECS + ROCKET_SPECS
 ALL_SPECS: tuple[DroneSpec, ...] = TARGET_SPECS
 

@@ -15,7 +15,7 @@ import pygame
 from zenith.camera import CameraModel
 from zenith.controls import ControlMode, ManualControlInput
 from zenith.math3d import Vec3
-from zenith.models import DRONE_SPECS, TARGET_SPECS
+from zenith.models import INTERCEPTOR_SPECS, TARGET_SPECS
 from zenith.physics import DroneState
 from zenith.rendering import (
     AMBER,
@@ -40,6 +40,8 @@ DISPLAY_OPTIONS = (
 WINDOW_SIZE = DISPLAY_OPTIONS[0]
 MINIMUM_WINDOW_SIZE = (1000, 680)
 FIXED_STEP = 1.0 / 60.0
+TIME_SCALES = (0.25, 0.5, 1.0, 2.0, 4.0)
+DEFAULT_TIME_SCALE_INDEX = 1
 SENSOR_OPTIONS = (
     (1280, 720),
     (1920, 1080),
@@ -159,7 +161,7 @@ class SetupScreen:
         spec_index: int,
         prefix: str,
     ) -> None:
-        catalogue = DRONE_SPECS if prefix == "own" else TARGET_SPECS
+        catalogue = INTERCEPTOR_SPECS if prefix == "own" else TARGET_SPECS
         spec = catalogue[spec_index]
         pygame.draw.rect(surface, (7, 24, 35), rect)
         pygame.draw.rect(surface, spec.color, rect, 1)
@@ -170,7 +172,12 @@ class SetupScreen:
             f"SIZE       {spec.size_label}",
             f"MAX SPEED  {spec.max_speed:.0f} m/s",
             f"ACCEL      {spec.max_accel:.0f} m/s²",
-            f"AIRBRAKE   {spec.brake_accel:.0f} m/s²",
+            (
+                f"BOOST/RCS  {spec.main_burn_duration_s:.0f}s / "
+                f"{spec.rcs_duration_s:.0f}s"
+                if spec.flight_model == "rocket"
+                else f"AIRBRAKE   {spec.brake_accel:.0f} m/s²"
+            ),
         ]
         y = rect.y + 94
         for line in values:
@@ -272,7 +279,7 @@ class SetupScreen:
         self._draw_model_card(
             surface,
             pygame.Rect(left, card_y, card_width, card_height),
-            "OUR DRONE / INTERCEPTOR",
+            "OUR VEHICLE / INTERCEPTOR",
             self.interceptor_index,
             "own",
         )
@@ -329,7 +336,7 @@ class SetupScreen:
         footer_y = height - 38
         pygame.draw.line(surface, (39, 76, 89), (left, footer_y - 10), (left + content_width, footer_y - 10))
         footer = (
-            "Five playable drones + two rocket threats • place both vehicles • no radar/lidar/rangefinder • "
+            "Five drones + two rockets selectable on both sides • place both vehicles • no radar/lidar/rangefinder • "
             "ground truth is verification-only"
         )
         surface.blit(self.small.render(footer, True, MUTED), (left, footer_y))
@@ -349,9 +356,13 @@ class SetupScreen:
             if not rect.collidepoint(event.pos):
                 continue
             if key == "own_prev":
-                self.interceptor_index = (self.interceptor_index - 1) % len(DRONE_SPECS)
+                self.interceptor_index = (
+                    self.interceptor_index - 1
+                ) % len(INTERCEPTOR_SPECS)
             elif key == "own_next":
-                self.interceptor_index = (self.interceptor_index + 1) % len(DRONE_SPECS)
+                self.interceptor_index = (
+                    self.interceptor_index + 1
+                ) % len(INTERCEPTOR_SPECS)
             elif key == "target_prev":
                 self.target_index = (self.target_index - 1) % len(TARGET_SPECS)
                 self._sync_target_scenario()
@@ -400,7 +411,7 @@ class SetupScreen:
         resolution = SENSOR_OPTIONS[self.sensor_index]
         self.error = ""
         return SimulationConfig(
-            interceptor_code=DRONE_SPECS[self.interceptor_index].code,
+            interceptor_code=INTERCEPTOR_SPECS[self.interceptor_index].code,
             target_code=TARGET_SPECS[self.target_index].code,
             interceptor_position=own,
             target_position=target,
@@ -465,6 +476,17 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                 "apparent_target_span_px",
                 "range_error_m",
                 "closing_speed_m_s",
+                "estimated_target_x_m",
+                "estimated_target_y_m",
+                "estimated_target_z_m",
+                "guidance_mode",
+                "selected_horizon_s",
+                "edge_reachable",
+                "edge_total",
+                "interceptor_booster_remaining_s",
+                "interceptor_rcs_remaining_s",
+                "target_booster_remaining_s",
+                "target_rcs_remaining_s",
                 "target_type",
                 "target_model",
                 "interceptor_model",
@@ -480,6 +502,33 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                     f"{sample.apparent_px:.6f}",
                     "" if sample.range_error_m is None else f"{sample.range_error_m:.6f}",
                     f"{sample.closing_speed:.6f}",
+                    (
+                        ""
+                        if sample.estimated_target_position is None
+                        else f"{sample.estimated_target_position.x:.6f}"
+                    ),
+                    (
+                        ""
+                        if sample.estimated_target_position is None
+                        else f"{sample.estimated_target_position.y:.6f}"
+                    ),
+                    (
+                        ""
+                        if sample.estimated_target_position is None
+                        else f"{sample.estimated_target_position.z:.6f}"
+                    ),
+                    sample.guidance_mode,
+                    (
+                        ""
+                        if sample.selected_horizon_s is None
+                        else f"{sample.selected_horizon_s:.6f}"
+                    ),
+                    sample.edge_reachable,
+                    sample.edge_total,
+                    f"{sample.interceptor_burn_remaining_s:.6f}",
+                    f"{sample.interceptor_rcs_remaining_s:.6f}",
+                    f"{sample.target_burn_remaining_s:.6f}",
+                    f"{sample.target_rcs_remaining_s:.6f}",
                     simulation.target.spec.vehicle_type,
                     simulation.target.spec.name,
                     simulation.interceptor.spec.name,
@@ -501,8 +550,8 @@ def run_interactive() -> int:
     current_config: SimulationConfig | None = None
     app_state = "setup"
     accumulator = 0.0
-    time_scales = (0.25, 0.5, 1.0, 2.0, 4.0)
-    time_scale_index = 2
+    time_scales = TIME_SCALES
+    time_scale_index = DEFAULT_TIME_SCALE_INDEX
     analysis_open = False
     help_open = False
     info_open = False
@@ -584,10 +633,41 @@ def run_interactive() -> int:
                 continue
             if (
                 event.type == pygame.MOUSEBUTTONDOWN
+                and event.button == 1
+                and not analysis_open
+                and not help_open
+                and not info_open
+            ):
+                action = renderer.handle_left_click(event.pos, simulation)
+                if action is not None:
+                    set_mouse_capture(False)
+                    if action == "time_down":
+                        time_scale_index = max(0, time_scale_index - 1)
+                    elif action == "time_up":
+                        time_scale_index = min(
+                            len(time_scales) - 1,
+                            time_scale_index + 1,
+                        )
+                    elif action == "info":
+                        info_open = True
+                        analysis_open = False
+                        help_open = False
+                    elif action == "analysis":
+                        analysis_open = True
+                        info_open = False
+                        help_open = False
+                    elif action == "help":
+                        help_open = True
+                        info_open = False
+                        analysis_open = False
+                    continue
+            if (
+                event.type == pygame.MOUSEBUTTONDOWN
                 and event.button == 3
                 and not analysis_open
                 and not help_open
                 and not info_open
+                and not renderer.settings_visible
             ):
                 set_mouse_capture(True)
                 continue
@@ -625,6 +705,13 @@ def run_interactive() -> int:
                 elif event.key == pygame.K_F3:
                     renderer.view_mode = 2
                     renderer.reset_view_offset()
+                elif event.key == pygame.K_F4:
+                    renderer.settings_visible = not renderer.settings_visible
+                elif event.key == pygame.K_m:
+                    renderer.minimap_visible = not renderer.minimap_visible
+                elif event.key == pygame.K_g:
+                    renderer.verification_visible = True
+                    simulation.capture_prediction_check()
                 elif event.key == pygame.K_c:
                     renderer.reset_view_offset()
                 elif event.key == pygame.K_TAB:
@@ -712,6 +799,7 @@ def run_interactive() -> int:
                 or analysis_open
                 or help_open
                 or info_open
+                or renderer.settings_visible
                 or right_mouse_dragging
                 or not window_focused
                 or simulation.finished

@@ -19,7 +19,12 @@ from .controls import (
     ManualControlInput,
     ManualFlightController,
 )
-from .guidance import GuidanceSolution, TargetTrack, solve_guidance
+from .guidance import (
+    GuidanceSolution,
+    PredictionOval,
+    TargetTrack,
+    solve_guidance,
+)
 from .math3d import (
     Vec3,
     clamp,
@@ -58,6 +63,28 @@ class TelemetrySample:
     apparent_px: float
     range_error_m: float | None
     closing_speed: float
+    estimated_target_position: Vec3 | None
+    guidance_mode: str
+    selected_horizon_s: float | None
+    edge_reachable: int
+    edge_total: int
+    interceptor_burn_remaining_s: float
+    interceptor_rcs_remaining_s: float
+    target_burn_remaining_s: float
+    target_rcs_remaining_s: float
+
+
+@dataclass(slots=True)
+class PredictionCheck:
+    """A recorded sensor-frame audit; never an input to guidance."""
+
+    capture_time_s: float
+    camera_position: Vec3
+    camera_forward: Vec3
+    oval: PredictionOval
+    evaluated: bool = False
+    result_inside: bool | None = None
+    projected_truth: Vec3 | None = None
 
 
 class InterceptionSimulation:
@@ -66,7 +93,7 @@ class InterceptionSimulation:
     # Includes protruding rotors/fins that are not captured perfectly by the
     # lightweight collision sphere, while the segment test still proves an
     # actual close pass rather than a multi-metre "hit."
-    CONTACT_TOLERANCE_M = 0.35
+    CONTACT_TOLERANCE_M = 0.42
     GIMBAL_SLEW_RATE_DEG_S = 120.0
     SEARCH_SLEW_RATE_DEG_S = 120.0
 
@@ -89,6 +116,8 @@ class InterceptionSimulation:
         self.manual_controller = ManualFlightController()
         self.manual_command = ManualCommand()
         self.guidance_advisory_command = Vec3()
+        self.terminal_mode = "ONE_SECOND_ENVELOPE"
+        self.prediction_check: PredictionCheck | None = None
         self.last_event = "Simulation initialized"
         self.events: list[tuple[float, str]] = [(0.0, self.last_event)]
         self.telemetry: list[TelemetrySample] = []
@@ -99,10 +128,25 @@ class InterceptionSimulation:
         initial_line = (self.config.target_position - self.config.interceptor_position).normalized(
             Vec3(0, 0, 1)
         )
+        if interceptor_spec.flight_model == "rocket":
+            # The one-shot interceptors use a pre-launch ballistic loft so the
+            # finite booster and small RCS budget do not pretend to hover.
+            launch_loft = 0.62 if interceptor_spec.code == "SR1" else 1.20
+            launch_direction = (
+                initial_line + Vec3(0.0, launch_loft, 0.0)
+            ).normalized(initial_line)
+        else:
+            launch_direction = initial_line
+        interceptor_orientation = Vec3(
+            -math.asin(clamp(launch_direction.y, -1.0, 1.0)),
+            math.atan2(launch_direction.x, launch_direction.z),
+            0.0,
+        )
         self.interceptor = DroneState(
             interceptor_spec,
             self.config.interceptor_position,
-            initial_line * min(24.0, interceptor_spec.max_speed * 0.38),
+            launch_direction * min(24.0, interceptor_spec.max_speed * 0.38),
+            orientation=interceptor_orientation,
         )
         incoming_rocket = (
             target_spec.vehicle_type == "rocket"
@@ -171,10 +215,80 @@ class InterceptionSimulation:
         if controlled.crashed:
             self._event(f"{controlled.spec.code} engine unavailable after impact")
             return False
+        if controlled.spec.flight_model == "rocket":
+            self._event(
+                f"{controlled.spec.code} uses a fixed nonrestartable booster"
+            )
+            return controlled.engine_enabled
         controlled.engine_enabled = not controlled.engine_enabled
         state = "started" if controlled.engine_enabled else "cut"
         self._event(f"{controlled.spec.code} engine {state} by player")
         return controlled.engine_enabled
+
+    def capture_prediction_check(self) -> bool:
+        """Record the current +2 s sensor prediction for a truth-only audit."""
+        if self.guidance is None or not self.visual_locked:
+            self._event("2 s prediction check needs a valid visual oval")
+            return False
+        oval = next(
+            (
+                candidate
+                for candidate in self.guidance.ovals
+                if abs(candidate.horizon_s - 2.0) < 1e-6
+                and candidate.invalid_reason is None
+            ),
+            None,
+        )
+        if oval is None:
+            self._event("2 s prediction is unbounded or unavailable")
+            return False
+        self.prediction_check = PredictionCheck(
+            self.time_s,
+            Vec3(
+                self.interceptor.position.x,
+                self.interceptor.position.y,
+                self.interceptor.position.z,
+            ),
+            Vec3(
+                self.camera_forward.x,
+                self.camera_forward.y,
+                self.camera_forward.z,
+            ),
+            oval,
+        )
+        self._event("Recorded +2 s sensor-frame prediction")
+        return True
+
+    def clear_prediction_check(self) -> None:
+        self.prediction_check = None
+        self._event("Cleared recorded prediction check")
+
+    def _update_prediction_check(self) -> None:
+        check = self.prediction_check
+        if (
+            check is None
+            or check.evaluated
+            or self.time_s < check.capture_time_s + check.oval.horizon_s
+        ):
+            return
+        relative = self.target.position - check.camera_position
+        depth = relative.dot(check.oval.plane_normal)
+        plane_depth = (
+            check.oval.center - check.camera_position
+        ).dot(check.oval.plane_normal)
+        if depth <= 1e-6:
+            projected = None
+        else:
+            projected = check.camera_position + relative * (plane_depth / depth)
+        check.projected_truth = projected
+        check.result_inside = (
+            projected is not None and check.oval.contains_projected(projected)
+        )
+        check.evaluated = True
+        self._event(
+            "2 s prediction check: "
+            + ("INSIDE" if check.result_inside else "OUTSIDE")
+        )
 
     def cycle_control_mode(self) -> ControlMode:
         """Cycle AUTO -> own vehicle -> target vehicle -> AUTO."""
@@ -368,7 +482,7 @@ class InterceptionSimulation:
                 )
             ).clamp_length(spec.max_accel)
         if scenario == "rocket_attack":
-            maneuver_scale = 0.0 if spec.code == "SR1" else 0.22
+            maneuver_scale = 0.0 if spec.code == "SR1" else 0.04
             terminal_weave = Vec3(
                 math.sin(self.time_s * 1.2) * spec.lateral_accel * maneuver_scale,
                 math.sin(self.time_s * 0.7) * spec.lateral_accel * maneuver_scale * 0.45,
@@ -509,6 +623,11 @@ class InterceptionSimulation:
                 )
                 self.last_estimated_position = estimated_position
                 self.track.update(estimated_position, self.time_s)
+                self.track.confidence = self.detection.confidence
+                self.track.position_sigma_m = max(
+                    self.track.position_sigma_m,
+                    min(12.0, self.range_estimate.sigma_m),
+                )
 
                 camera_ray = Vec3(
                     math.tan(math.radians(self.detection.bearing_x_deg)),
@@ -541,6 +660,15 @@ class InterceptionSimulation:
                 max(self.detection.width_px, self.detection.height_px),
                 estimate - self.true_range_m if estimate is not None else None,
                 closing,
+                self.track.position,
+                self.guidance.mode if self.guidance else "NONE",
+                self.guidance.selected_horizon_s if self.guidance else None,
+                self.guidance.reachable_count if self.guidance else 0,
+                self.guidance.reachable_total if self.guidance else 0,
+                max(0.0, self.interceptor.main_burn_remaining_s),
+                max(0.0, self.interceptor.rcs_remaining_s),
+                max(0.0, self.target.main_burn_remaining_s),
+                max(0.0, self.target.rcs_remaining_s),
             )
         )
         self.telemetry = self.telemetry[-600:]
@@ -556,6 +684,7 @@ class InterceptionSimulation:
             # crashed body receives exactly one gravity integration per tick.
             self.interceptor.integrate(Vec3(), dt)
             self.target.integrate(Vec3(), dt)
+            self._update_prediction_check()
             self.status = self.success_message
             if self.explosion_age_s > 5.0:
                 self.finished = True
@@ -574,6 +703,8 @@ class InterceptionSimulation:
                 self.track,
                 self.target.spec,
                 self.camera_forward,
+                self.config.camera.focal_px,
+                self.terminal_mode,
             )
             advisory_command = (
                 self.guidance.commanded_acceleration if self.guidance else Vec3()
@@ -632,6 +763,7 @@ class InterceptionSimulation:
         )
         self.interceptor.integrate(interceptor_command, dt, interceptor_yaw)
         self.target.integrate(target_command, dt, target_yaw)
+        self._update_prediction_check()
         if (
             self.config.scenario == "rotating"
             and self.control_mode is not ControlMode.TARGET

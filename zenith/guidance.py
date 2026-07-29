@@ -28,6 +28,9 @@ class TargetTrack:
     acceleration: Vec3 = field(default_factory=Vec3)
     last_time: float | None = None
     sample_count: int = 0
+    position_sigma_m: float = 0.25
+    velocity_sigma_mps: float = 0.50
+    confidence: float = 0.0
 
     def update(self, measured_position: Vec3, timestamp: float) -> None:
         self.last_measurement = measured_position
@@ -44,6 +47,7 @@ class TargetTrack:
         # following intentional target maneuvers.
         predicted = self.position + self.velocity * dt
         residual = measured_position - predicted
+        residual_length = residual.length()
         previous_velocity = self.velocity
         alpha = clamp(0.13 + dt * 0.8, 0.13, 0.24)
         beta = clamp(0.006 + dt * 0.05, 0.006, 0.018)
@@ -53,6 +57,18 @@ class TargetTrack:
         self.acceleration = lerp_vec(
             self.acceleration, raw_acceleration, clamp(dt * 1.8, 0.02, 0.12)
         )
+        uncertainty_alpha = 1.0 - math.exp(-2.0 * dt)
+        self.position_sigma_m += (
+            max(0.08, residual_length) - self.position_sigma_m
+        ) * uncertainty_alpha
+        raw_velocity_sigma = clamp(
+            residual_length / max(dt, 0.10),
+            0.15,
+            8.0,
+        )
+        self.velocity_sigma_mps += (
+            max(0.15, raw_velocity_sigma) - self.velocity_sigma_mps
+        ) * min(0.08, uncertainty_alpha)
         self.last_time = timestamp
         self.sample_count += 1
 
@@ -68,13 +84,46 @@ class PredictionOval:
     plane_normal: Vec3
     radius_x: float
     radius_y: float
+    edge_points: tuple[Vec3, ...] = ()
+    edge_reachable: tuple[bool, ...] = ()
+    likely_point: Vec3 | None = None
+    uncertainty_margin_m: float = 0.0
+    invalid_reason: str | None = None
+    approximate_radius_px: float = 0.0
+    observer_position: Vec3 | None = None
 
     @property
     def fully_reachable(self) -> bool:
-        return all(self.reachable)
+        return (
+            not self.invalid_reason
+            and bool(self.edge_reachable)
+            and all(self.edge_reachable)
+        )
+
+    @property
+    def cardinal_reachable_count(self) -> int:
+        return sum(self.reachable)
+
+    @property
+    def edge_reachable_count(self) -> int:
+        return sum(self.edge_reachable)
+
+    @property
+    def edge_total(self) -> int:
+        return len(self.edge_reachable)
 
     def contains_projected(self, point: Vec3, tolerance: float = 1e-8) -> bool:
         """Whether a future position's camera-plane projection is contained."""
+        if self.observer_position is not None:
+            relative = point - self.observer_position
+            depth = relative.dot(self.plane_normal)
+            plane_depth = (
+                self.center - self.observer_position
+            ).dot(self.plane_normal)
+            if depth > 1e-6:
+                point = self.observer_position + relative * (
+                    plane_depth / depth
+                )
         offset = point - self.center
         x = offset.dot(self.plane_x) / max(self.radius_x, 1e-9)
         y = offset.dot(self.plane_y) / max(self.radius_y, 1e-9)
@@ -91,6 +140,8 @@ class GuidanceSolution:
     closing_speed: float
     time_to_contact_s: float
     reachable_count: int
+    reachable_total: int
+    terminal_trigger: str | None = None
 
 
 def _acceleration_support(spec: DroneSpec, forward: Vec3, direction: Vec3) -> float:
@@ -131,11 +182,31 @@ def point_is_reachable(interceptor: DroneState, point: Vec3, horizon_s: float) -
         turn_time = angle_between(heading, direction) / max(turn_rate, 1e-6)
         effective_horizon = max(0.0, horizon_s - turn_time * 0.55)
     available = maximum_travel_distance(
-        along_speed, interceptor.spec, effective_horizon
+        along_speed,
+        interceptor.spec,
+        effective_horizon,
+        (
+            interceptor.main_burn_remaining_s
+            if interceptor.spec.flight_model == "rocket"
+            else None
+        ),
     )
     # Reserve covers drag and the difference between ideal path length and the
     # rate-limited vehicle trajectory.
     return distance <= available * 0.96 + interceptor.spec.collision_radius
+
+
+def _project_to_target_plane(
+    point: Vec3,
+    observer: Vec3,
+    plane_normal: Vec3,
+    plane_depth: float,
+) -> Vec3 | None:
+    relative = point - observer
+    depth = relative.dot(plane_normal)
+    if depth <= 1e-6:
+        return None
+    return observer + relative * (plane_depth / depth)
 
 
 def build_prediction_ovals(
@@ -144,6 +215,9 @@ def build_prediction_ovals(
     target_spec: DroneSpec,
     interceptor: DroneState,
     observation_axis: Vec3 | None = None,
+    camera_focal_px: float | None = None,
+    position_sigma_m: float = 0.0,
+    velocity_sigma_mps: float = 0.0,
 ) -> tuple[PredictionOval, ...]:
     line_of_sight = (
         observation_axis
@@ -152,30 +226,58 @@ def build_prediction_ovals(
     ).normalized(Vec3(0, 0, 1))
     plane_x, plane_y, plane_normal = basis_from_forward(line_of_sight)
     target_forward = target_velocity.normalized(line_of_sight)
+    plane_depth = max(
+        0.01,
+        (target_position - interceptor.position).dot(plane_normal),
+    )
     result: list[PredictionOval] = []
     for horizon in PREDICTION_HORIZONS:
-        # The project treats interception as a 2D problem at the measured
-        # target range. Remove line-of-sight motion so every oval, every
-        # unchanged-trajectory point, and the target share one physical plane.
-        future_displacement = target_velocity * horizon
-        ballistic = (
-            target_position
-            + future_displacement
-            - plane_normal * future_displacement.dot(plane_normal)
+        # Each 60 Hz calculation freezes the camera pose "now", projects the
+        # future target set into that recorded image, then back-projects it onto
+        # the current target-depth plane for the 3D presentation.
+        future_position = target_position + target_velocity * horizon
+        future_depth = (future_position - interceptor.position).dot(plane_normal)
+        depth_acceleration = _acceleration_support(
+            target_spec,
+            target_forward,
+            -plane_normal,
         )
+        uncertainty = max(
+            0.0,
+            position_sigma_m + velocity_sigma_mps * horizon,
+        )
+        minimum_depth = (
+            future_depth
+            - 0.5 * depth_acceleration * horizon**2
+            - uncertainty
+        )
+        invalid_reason = (
+            "CAMERA CROSSING"
+            if minimum_depth <= 2.0 or future_depth <= 2.0
+            else None
+        )
+        projected_ballistic = _project_to_target_plane(
+            future_position,
+            interceptor.position,
+            plane_normal,
+            plane_depth,
+        )
+        ballistic = projected_ballistic or target_position
+        perspective_scale = plane_depth / max(2.0, minimum_depth)
         scale = 0.5 * horizon**2
         positive_x = _acceleration_support(
             target_spec, target_forward, plane_x
-        ) * scale
+        ) * scale * perspective_scale
         negative_x = _acceleration_support(
             target_spec, target_forward, -plane_x
-        ) * scale
+        ) * scale * perspective_scale
         positive_y = _acceleration_support(
             target_spec, target_forward, plane_y
-        ) * scale
+        ) * scale * perspective_scale
         negative_y = _acceleration_support(
             target_spec, target_forward, -plane_y
-        ) * scale
+        ) * scale * perspective_scale
+        projected_uncertainty = uncertainty * perspective_scale
 
         # Component support gives a guaranteed rectangle in the camera plane.
         # A directional vehicle uses sqrt(2) to circumscribe that rectangle.
@@ -194,11 +296,13 @@ def build_prediction_ovals(
         )
         radius_x = max(
             0.05,
-            (positive_x + negative_x) * 0.5 * containment_scale,
+            (positive_x + negative_x) * 0.5 * containment_scale
+            + projected_uncertainty,
         )
         radius_y = max(
             0.05,
-            (positive_y + negative_y) * 0.5 * containment_scale,
+            (positive_y + negative_y) * 0.5 * containment_scale
+            + projected_uncertainty,
         )
         extremes = (
             center + plane_x * radius_x,
@@ -206,7 +310,32 @@ def build_prediction_ovals(
             center + plane_y * radius_y,
             center - plane_y * radius_y,
         )
-        reachable = tuple(point_is_reachable(interceptor, point, horizon) for point in extremes)
+        reachable = tuple(
+            point_is_reachable(interceptor, point, horizon)
+            and invalid_reason is None
+            for point in extremes
+        )
+        radius_px = (
+            camera_focal_px * max(radius_x, radius_y) / max(plane_depth, 1e-6)
+            if camera_focal_px is not None
+            else 36.0
+        )
+        # Half-pixel angular spacing checks the complete rendered border rather
+        # than assuming the four cardinal points cover diagonal escape routes.
+        # The renderer uses the same 96-segment border. Reachability evaluates
+        # every displayed segment direction rather than only four cardinals.
+        edge_count = 96
+        edge_points = tuple(
+            center
+            + plane_x * (math.cos(math.tau * index / edge_count) * radius_x)
+            + plane_y * (math.sin(math.tau * index / edge_count) * radius_y)
+            for index in range(edge_count)
+        )
+        edge_reachable = tuple(
+            invalid_reason is None
+            and point_is_reachable(interceptor, point, horizon)
+            for point in edge_points
+        )
         result.append(
             PredictionOval(
                 horizon,
@@ -219,6 +348,13 @@ def build_prediction_ovals(
                 plane_normal,
                 radius_x,
                 radius_y,
+                edge_points,
+                edge_reachable,
+                ballistic,
+                projected_uncertainty,
+                invalid_reason,
+                radius_px,
+                interceptor.position,
             )
         )
     return tuple(result)
@@ -229,6 +365,8 @@ def solve_guidance(
     track: TargetTrack,
     target_spec: DroneSpec,
     observation_axis: Vec3 | None = None,
+    camera_focal_px: float | None = None,
+    terminal_mode: str = "ONE_SECOND_ENVELOPE",
 ) -> GuidanceSolution | None:
     if track.position is None:
         return None
@@ -245,15 +383,74 @@ def solve_guidance(
         target_spec,
         interceptor,
         observation_axis,
+        camera_focal_px,
+        track.position_sigma_m,
+        track.velocity_sigma_mps,
     )
+
+    tracked_acceleration = track.acceleration.clamp_length(
+        target_spec.max_accel
+    )
+    track_confidence = clamp(
+        track.confidence * min(1.0, track.sample_count / 30.0),
+        0.0,
+        1.0,
+    )
+    for oval in ovals:
+        predicted = (
+            track.position
+            + track.velocity * oval.horizon_s
+            + tracked_acceleration * (0.5 * oval.horizon_s**2)
+        )
+        projected = _project_to_target_plane(
+            predicted,
+            interceptor.position,
+            oval.plane_normal,
+            (track.position - interceptor.position).dot(oval.plane_normal),
+        )
+        candidate = projected or oval.center
+        offset = candidate - oval.center
+        normalized_x = offset.dot(oval.plane_x) / max(oval.radius_x, 1e-9)
+        normalized_y = offset.dot(oval.plane_y) / max(oval.radius_y, 1e-9)
+        normalized_length = math.hypot(normalized_x, normalized_y)
+        if normalized_length > 0.65:
+            offset = offset * (0.65 / normalized_length)
+        oval.likely_point = oval.center + offset * track_confidence
 
     selected: PredictionOval | None = None
     for oval in reversed(ovals):
-        if oval.fully_reachable:
+        if (
+            oval.fully_reachable
+            and oval.likely_point is not None
+            and point_is_reachable(interceptor, oval.likely_point, oval.horizon_s)
+        ):
             selected = oval
             break
 
-    if distance < 120.0 or time_to_contact < 2.2:
+    smallest = ovals[0]
+    smallest_aim = smallest.likely_point or smallest.ballistic_center
+    enters_smallest = point_is_reachable(
+        interceptor,
+        smallest_aim,
+        smallest.horizon_s,
+    )
+    terminal_trigger: str | None = None
+    if terminal_mode == "TTC_1S":
+        terminal = time_to_contact <= 1.0
+        if terminal:
+            terminal_trigger = "TTC <= 1.0s"
+    else:
+        terminal = enters_smallest
+        if terminal:
+            terminal_trigger = "ENTER 1s OVAL"
+    if time_to_contact <= 0.75:
+        terminal = True
+        terminal_trigger = "TTC SAFETY <= 0.75s"
+    if interceptor.spec.flight_model == "rocket":
+        terminal = True
+        terminal_trigger = "ROCKET PROPORTIONAL NAVIGATION"
+
+    if terminal:
         # Closed-form constant-velocity lead. It remains a camera-only solution:
         # relative position and target velocity both come from the image track.
         speed = max(5.0, interceptor.spec.max_speed)
@@ -279,14 +476,15 @@ def solve_guidance(
                 ]
                 if roots:
                     lead_time = min(roots)
-        lead_time = clamp(lead_time, 0.04, 1.5)
+        lead_time = clamp(
+            lead_time,
+            0.04,
+            5.0 if interceptor.spec.flight_model == "rocket" else 1.5,
+        )
         terminal_position = (
             lerp_vec(track.position, track.last_measurement, 0.72)
             if track.last_measurement is not None
             else track.position
-        )
-        tracked_acceleration = track.acceleration.clamp_length(
-            target_spec.max_accel
         )
         aim = (
             terminal_position
@@ -296,13 +494,15 @@ def solve_guidance(
         mode = "TERMINAL PURSUIT"
         horizon = lead_time
     elif selected is not None:
-        aim = selected.center
-        mode = "OVAL CENTER"
+        aim = selected.likely_point or selected.center
+        mode = "WEIGHTED OVAL"
         horizon = selected.horizon_s
     else:
-        # The unchanged-trajectory point sits inside the smallest oval.
-        aim = ovals[0].ballistic_center
-        mode = "BALLISTIC FALLBACK"
+        # Without a complete green containment result, measured acceleration
+        # is too uncertain to justify biasing toward an edge. Keep pursuing the
+        # transparent unchanged-motion prediction while reporting the failure.
+        aim = smallest.ballistic_center
+        mode = "NO GUARANTEED OVAL"
         horizon = PREDICTION_HORIZONS[0]
 
     aim = Vec3(aim.x, max(2.0, aim.y), aim.z)
@@ -330,7 +530,29 @@ def solve_guidance(
 
     # A small proportional-navigation term damps sideways line-of-sight motion.
     lateral_relative = relative_velocity - line * relative_velocity.dot(line)
-    command = command + lateral_relative * 1.25
+    command = command + lateral_relative * 4.0
+    if interceptor.spec.flight_model == "rocket":
+        # The main motor is fixed at full thrust. Guidance therefore requests
+        # only a bounded RCS turn toward the collision ray instead of asking a
+        # solid booster to slow down or velocity-match.
+        rocket_forward = interceptor.velocity.normalized(
+            interceptor.forward_direction()
+        )
+        collision_ray = (aim - interceptor.position).normalized(line)
+        steering_error = (
+            collision_ray
+            - rocket_forward * collision_ray.dot(rocket_forward)
+        )
+        steering = (
+            steering_error.normalized()
+            * interceptor.spec.lateral_accel
+            if steering_error.length() > 1e-6
+            else Vec3()
+        )
+        command = (
+            rocket_forward * interceptor.spec.max_accel
+            + steering
+        )
     if interceptor.spec.flight_model in ("fixed_wing", "rocket"):
         # Directional craft must generate aerodynamic/steering force to cancel
         # the part of gravity that their current wing lift does not support.
@@ -348,7 +570,7 @@ def solve_guidance(
         )
     command = command.clamp_length(command_limit)
 
-    selected_reachable = sum(selected.reachable) if selected else sum(ovals[0].reachable)
+    reported = selected or smallest
     return GuidanceSolution(
         mode,
         aim,
@@ -357,5 +579,7 @@ def solve_guidance(
         ovals,
         closing_speed,
         time_to_contact,
-        selected_reachable,
+        reported.edge_reachable_count,
+        reported.edge_total,
+        terminal_trigger,
     )

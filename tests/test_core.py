@@ -5,7 +5,13 @@ import unittest
 
 import pygame
 
-from app import DISPLAY_OPTIONS, SENSOR_OPTIONS, WINDOW_SIZE
+from app import (
+    DEFAULT_TIME_SCALE_INDEX,
+    DISPLAY_OPTIONS,
+    SENSOR_OPTIONS,
+    TIME_SCALES,
+    WINDOW_SIZE,
+)
 from zenith.camera import (
     CameraModel,
     detect_box,
@@ -21,7 +27,12 @@ from zenith.guidance import (
 )
 from zenith.math3d import Vec3, angle_between, basis_from_forward, clamp
 from zenith.meshes import get_mesh
-from zenith.models import DRONE_SPECS, ROCKET_SPECS, TARGET_SPECS
+from zenith.models import (
+    DRONE_SPECS,
+    INTERCEPTOR_SPECS,
+    ROCKET_SPECS,
+    TARGET_SPECS,
+)
 from zenith.physics import DroneState, maximum_travel_distance
 from zenith.rendering import (
     GREEN,
@@ -49,6 +60,7 @@ class InterfaceConfigTests(unittest.TestCase):
         self.assertEqual(DISPLAY_OPTIONS[0], WINDOW_SIZE)
         self.assertNotIn(WINDOW_SIZE, SENSOR_OPTIONS)
         self.assertEqual(SENSOR_OPTIONS[1], (1920, 1080))
+        self.assertEqual(TIME_SCALES[DEFAULT_TIME_SCALE_INDEX], 0.5)
 
     def test_mouse_free_look_does_not_change_sensor_direction(self) -> None:
         sim = InterceptionSimulation(SimulationConfig())
@@ -115,6 +127,44 @@ class InterfaceConfigTests(unittest.TestCase):
         for page in range(INFO_PAGE_COUNT):
             renderer.draw_info(surface, sim, page)
 
+    def test_collapsible_panels_and_widgets_render_at_minimum_size(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        surface = pygame.Surface(WINDOW_SIZE)
+        renderer.draw_hud(surface, sim, 0.5, 60.0)
+        self.assertTrue(renderer.panel_expanded["target"])
+        self.assertFalse(renderer.panel_expanded["calculations"])
+        calculations_header = renderer.click_regions["panel:calculations"]
+        renderer.handle_left_click(calculations_header.center, sim)
+        self.assertTrue(renderer.panel_expanded["calculations"])
+        renderer.minimap_visible = True
+        renderer.settings_visible = True
+        renderer.verification_visible = True
+        renderer.draw_hud(surface, sim, 0.5, 60.0)
+        self.assertIn("minimap", renderer.click_regions)
+        self.assertIn("terminal_mode", renderer.click_regions)
+        self.assertIn("capture_check", renderer.click_regions)
+
+    def test_sensor_boresight_only_draws_in_onboard_auto_view(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        onboard = pygame.Surface((400, 300))
+        onboard.fill((0, 0, 0))
+        renderer.view_mode = 0
+        renderer._draw_reticle(onboard, sim)
+        self.assertNotEqual(
+            pygame.image.tostring(onboard, "RGB"),
+            bytes(len(pygame.image.tostring(onboard, "RGB"))),
+        )
+        spectator = pygame.Surface((400, 300))
+        spectator.fill((0, 0, 0))
+        renderer.view_mode = 2
+        renderer._draw_reticle(spectator, sim)
+        self.assertEqual(
+            pygame.image.tostring(spectator, "RGB"),
+            bytes(len(pygame.image.tostring(spectator, "RGB"))),
+        )
+
 
 class CameraTests(unittest.TestCase):
     def test_direct_pinhole_formula(self) -> None:
@@ -155,8 +205,10 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual([oval.horizon_s for oval in ovals], [1, 2, 3, 5])
         self.assertTrue(all(len(oval.extremes) == 4 for oval in ovals))
         self.assertTrue(all(len(oval.reachable) == 4 for oval in ovals))
+        self.assertTrue(all(len(oval.edge_points) == 96 for oval in ovals))
+        self.assertTrue(all(len(oval.edge_reachable) == 96 for oval in ovals))
 
-    def test_entire_oval_color_reports_four_point_reachability(self) -> None:
+    def test_entire_oval_color_reports_complete_edge_reachability(self) -> None:
         interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
         oval = build_prediction_ovals(
             Vec3(0, 35, 150),
@@ -165,8 +217,12 @@ class GuidanceTests(unittest.TestCase):
             interceptor,
         )[0]
         oval.reachable = (True, True, True, True)
+        oval.edge_reachable = tuple(True for _ in oval.edge_points)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), GREEN)
-        oval.reachable = (True, False, False, False)
+        # Four green cardinals do not hide a diagonal escape direction.
+        edge = list(oval.edge_reachable)
+        edge[len(edge) // 8] = False
+        oval.edge_reachable = tuple(edge)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
         oval.reachable = (False, False, False, False)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
@@ -231,7 +287,7 @@ class GuidanceTests(unittest.TestCase):
             y = offset.dot(oval.plane_y) / oval.radius_y
             self.assertAlmostEqual(x * x + y * y, 1.0, places=7)
 
-    def test_guidance_aims_at_largest_fully_reachable_oval_center(self) -> None:
+    def test_guidance_aims_inside_largest_fully_reachable_weighted_oval(self) -> None:
         interceptor = DroneState(
             DRONE_SPECS[2],
             Vec3(0, 30, 0),
@@ -241,7 +297,9 @@ class GuidanceTests(unittest.TestCase):
             position=Vec3(0, 35, 125),
             last_measurement=Vec3(0, 35, 125),
             velocity=Vec3(0, 0, 2),
-            sample_count=5,
+            acceleration=Vec3(5, 1, 0),
+            sample_count=30,
+            confidence=1.0,
         )
         solution = solve_guidance(
             interceptor,
@@ -251,14 +309,20 @@ class GuidanceTests(unittest.TestCase):
         )
         self.assertIsNotNone(solution)
         assert solution is not None
-        self.assertEqual(solution.mode, "OVAL CENTER")
+        self.assertEqual(solution.mode, "WEIGHTED OVAL")
         selected = next(
             oval
             for oval in solution.ovals
             if oval.horizon_s == solution.selected_horizon_s
         )
         self.assertTrue(selected.fully_reachable)
-        self.assertLess(solution.aim_point.distance_to(selected.center), 1e-8)
+        offset = solution.aim_point - selected.center
+        normalized = math.hypot(
+            offset.dot(selected.plane_x) / selected.radius_x,
+            offset.dot(selected.plane_y) / selected.radius_y,
+        )
+        self.assertLessEqual(normalized, 0.65 + 1e-8)
+        self.assertGreater(solution.aim_point.distance_to(selected.center), 0.01)
 
     def test_conservative_envelope_contains_allowed_acceleration_samples(self) -> None:
         interceptor = DroneState(DRONE_SPECS[3], Vec3(0, 30, 0), Vec3(0, 0, 25))
@@ -306,6 +370,31 @@ class GuidanceTests(unittest.TestCase):
                     multirotor_oval.contains_projected(endpoint, 1e-7)
                 )
 
+    def test_approaching_camera_crossing_is_reported_unbounded(self) -> None:
+        interceptor = DroneState(
+            DRONE_SPECS[3],
+            Vec3(0, 30, 0),
+            Vec3(0, 0, 25),
+        )
+        ovals = build_prediction_ovals(
+            Vec3(0, 35, 120),
+            Vec3(0, 0, -70),
+            ROCKET_SPECS[0],
+            interceptor,
+            Vec3(0, 0, 1),
+        )
+        self.assertIsNone(ovals[0].invalid_reason)
+        self.assertTrue(
+            any(oval.invalid_reason == "CAMERA CROSSING" for oval in ovals[1:])
+        )
+        self.assertTrue(
+            all(
+                not oval.fully_reachable
+                for oval in ovals
+                if oval.invalid_reason is not None
+            )
+        )
+
 
 class PropulsionTests(unittest.TestCase):
     def test_fixed_wing_turn_is_rate_limited_and_thrust_is_axial(self) -> None:
@@ -326,12 +415,16 @@ class PropulsionTests(unittest.TestCase):
         self.assertAlmostEqual(state.thrust_vector.x, 0.0, places=7)
         self.assertGreater(state.thrust_vector.z, 0.0)
 
-    def test_rocket_cannot_apply_reverse_engine_thrust(self) -> None:
+    def test_rocket_ignores_reverse_request_and_keeps_full_booster(self) -> None:
         spec = ROCKET_SPECS[0]
         state = DroneState(spec, Vec3(0, 30, 0), Vec3(0, 0, 60))
         state.integrate(Vec3(0, 0, -100), 1.0 / 60.0)
-        self.assertAlmostEqual(state.thrust_vector.length(), 0.0, places=7)
-        self.assertEqual(state.engine_output, 0.0)
+        self.assertAlmostEqual(
+            state.thrust_vector.length(),
+            spec.max_accel,
+            places=7,
+        )
+        self.assertEqual(state.engine_output, 1.0)
 
     def test_every_unpowered_vehicle_class_receives_gravity(self) -> None:
         for spec in (
@@ -398,6 +491,40 @@ class PropulsionTests(unittest.TestCase):
             fast.lift_acceleration.length() * 0.2,
         )
 
+    def test_rocket_booster_burns_out_permanently(self) -> None:
+        spec = ROCKET_SPECS[0]
+        state = DroneState(
+            spec,
+            Vec3(0, 1000, 0),
+            Vec3(0, 0, 20),
+        )
+        for _ in range(int(spec.main_burn_duration_s * 60) + 2):
+            state.integrate(Vec3(0, 0, spec.max_accel), 1.0 / 60.0)
+        self.assertTrue(state.burned_out)
+        self.assertFalse(state.engine_enabled)
+        self.assertEqual(state.main_burn_remaining_s, 0.0)
+        state.integrate(Vec3(0, 0, spec.max_accel), 1.0 / 60.0)
+        self.assertEqual(state.engine_output, 0.0)
+        self.assertEqual(state.thrust_vector.length(), 0.0)
+
+    def test_rocket_rcs_has_separate_limited_supply(self) -> None:
+        spec = ROCKET_SPECS[0]
+        state = DroneState(
+            spec,
+            Vec3(0, 1000, 0),
+            Vec3(0, 0, 30),
+        )
+        initial_rcs = state.rcs_remaining_s
+        state.integrate(Vec3(spec.lateral_accel, 0, 0), 0.25)
+        self.assertLess(state.rcs_remaining_s, initial_rcs)
+        burn_after_turn = state.main_burn_remaining_s
+        state.integrate(
+            state.velocity.normalized(state.forward_direction()) * spec.max_accel,
+            0.25,
+        )
+        self.assertAlmostEqual(state.rcs_remaining_s, initial_rcs - 0.25)
+        self.assertLess(state.main_burn_remaining_s, burn_after_turn)
+
 
 class ManualControlTests(unittest.TestCase):
     def test_tab_cycles_auto_own_target_auto(self) -> None:
@@ -418,6 +545,17 @@ class ManualControlTests(unittest.TestCase):
         self.assertFalse(sim.interceptor.engine_enabled)
         self.assertTrue(sim.toggle_controlled_engine())
         self.assertTrue(sim.interceptor.engine_enabled)
+
+    def test_player_cannot_cut_or_restart_fixed_rocket_booster(self) -> None:
+        sim = InterceptionSimulation(
+            SimulationConfig(interceptor_code="SR1", scenario="steady")
+        )
+        sim.cycle_control_mode()
+        remaining = sim.interceptor.main_burn_remaining_s
+        self.assertTrue(sim.toggle_controlled_engine())
+        self.assertTrue(sim.interceptor.engine_enabled)
+        self.assertEqual(sim.interceptor.main_burn_remaining_s, remaining)
+        self.assertIn("fixed nonrestartable", sim.last_event)
 
     def test_player_own_command_overrides_but_preserves_guidance_advisory(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
@@ -521,6 +659,7 @@ class ProjectTests(unittest.TestCase):
         self.assertEqual(len({spec.code for spec in DRONE_SPECS}), 5)
         self.assertEqual(len(ROCKET_SPECS), 2)
         self.assertTrue(all(spec.vehicle_type == "rocket" for spec in ROCKET_SPECS))
+        self.assertEqual(INTERCEPTOR_SPECS, TARGET_SPECS)
 
     def test_every_vehicle_has_a_polygon_mesh(self) -> None:
         for spec in TARGET_SPECS:
@@ -646,6 +785,66 @@ class ProjectTests(unittest.TestCase):
                         break
                 self.assertTrue(sim.hit)
                 self.assertEqual(sim.status, "ROCKET INTERCEPTED SUCCESSFULLY")
+
+    def test_both_rockets_can_be_our_one_way_interceptor(self) -> None:
+        for rocket in ROCKET_SPECS:
+            with self.subTest(rocket=rocket.name):
+                sim = InterceptionSimulation(
+                    SimulationConfig(
+                        interceptor_code=rocket.code,
+                        target_code="FX1",
+                        scenario="steady",
+                    )
+                )
+                for _ in range(60 * 12):
+                    sim.step()
+                    if sim.hit:
+                        break
+                self.assertTrue(sim.hit)
+                self.assertEqual(sim.interceptor.spec.code, rocket.code)
+
+    def test_two_second_prediction_check_uses_recorded_camera(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
+        for _ in range(120):
+            sim.step()
+            if sim.guidance is not None:
+                break
+        self.assertTrue(sim.capture_prediction_check())
+        assert sim.prediction_check is not None
+        recorded_position = sim.prediction_check.camera_position
+        recorded_forward = sim.prediction_check.camera_forward
+        for _ in range(125):
+            sim.step()
+        check = sim.prediction_check
+        assert check is not None
+        self.assertTrue(check.evaluated)
+        self.assertTrue(check.result_inside)
+        self.assertEqual(check.camera_position, recorded_position)
+        self.assertEqual(check.camera_forward, recorded_forward)
+        self.assertGreater(
+            sim.interceptor.position.distance_to(recorded_position),
+            1.0,
+        )
+
+    def test_two_second_outer_oval_contains_all_drone_scenarios(self) -> None:
+        for scenario, _ in SCENARIOS:
+            if scenario == "rocket_attack":
+                continue
+            with self.subTest(scenario=scenario):
+                sim = InterceptionSimulation(
+                    SimulationConfig(scenario=scenario, target_code="FX1")
+                )
+                for _ in range(120):
+                    sim.step()
+                    if sim.guidance is not None and sim.time_s > 0.8:
+                        break
+                self.assertTrue(sim.capture_prediction_check())
+                for _ in range(125):
+                    sim.step()
+                check = sim.prediction_check
+                assert check is not None
+                self.assertTrue(check.evaluated)
+                self.assertTrue(check.result_inside)
 
 
 if __name__ == "__main__":

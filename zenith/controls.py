@@ -14,7 +14,7 @@ class ControlMode(Enum):
     """Who owns the two vehicles in the current demonstration."""
 
     AUTO = "AUTO"
-    INTERCEPTOR = "PLAYER / OUR DRONE"
+    INTERCEPTOR = "PLAYER / OUR VEHICLE"
     TARGET = "PLAYER / TARGET"
 
 
