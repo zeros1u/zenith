@@ -136,33 +136,57 @@ class InterceptionSimulation:
             launch_direction = (
                 initial_line + Vec3(0.0, launch_loft, 0.0)
             ).normalized(initial_line)
+        elif interceptor_spec.flight_model in ("multirotor", "vectored_vtol"):
+            # Drones enter in level flight. The target may be above or below
+            # the interceptor, but that image elevation must become a later
+            # guidance maneuver rather than an unexplained vertical spawn
+            # velocity.
+            launch_direction = Vec3(
+                initial_line.x,
+                0.0,
+                initial_line.z,
+            ).normalized(Vec3(0.0, 0.0, 1.0))
         else:
+            # A fixed wing's velocity and nose cannot be decoupled. A shallow
+            # initial flight path toward the visible setup coordinate avoids
+            # inventing a later vertical side-force during an incoming attack.
             launch_direction = initial_line
         interceptor_orientation = Vec3(
             -math.asin(clamp(launch_direction.y, -1.0, 1.0)),
             math.atan2(launch_direction.x, launch_direction.z),
             0.0,
         )
-        self.interceptor = DroneState(
-            interceptor_spec,
-            self.config.interceptor_position,
-            launch_direction * min(24.0, interceptor_spec.max_speed * 0.38),
-            orientation=interceptor_orientation,
-        )
-        incoming_rocket = (
+        incoming_target = (
             target_spec.vehicle_type == "rocket"
             or self.config.scenario == "rocket_attack"
         )
+        initial_interceptor_speed = (
+            min(24.0, interceptor_spec.max_speed * 0.38)
+            if (
+                interceptor_spec.flight_model == "rocket"
+                or (
+                    incoming_target
+                    and interceptor_spec.flight_model == "fixed_wing"
+                )
+            )
+            else interceptor_spec.max_speed * 0.5
+        )
+        self.interceptor = DroneState(
+            interceptor_spec,
+            self.config.interceptor_position,
+            launch_direction * initial_interceptor_speed,
+            orientation=interceptor_orientation,
+        )
         target_velocity = (
             Vec3(0.0, 0.0, -min(65.0, target_spec.max_speed * 0.72))
-            if incoming_rocket
+            if incoming_target
             else Vec3(8.0, 0.0, min(23.0, target_spec.max_speed * 0.42))
         )
         self.target = DroneState(
             target_spec,
             self.config.target_position,
             target_velocity,
-            orientation=Vec3(0.0, math.pi if incoming_rocket else 0.25, 0.0),
+            orientation=Vec3(0.0, math.pi if incoming_target else 0.25, 0.0),
         )
         self.camera_forward = self.interceptor.forward_direction()
         self.search_anchor_forward = self.camera_forward
@@ -806,7 +830,13 @@ class InterceptionSimulation:
                 )
                 self.last_estimated_position = estimated_position
                 self.track.confidence = self.detection.confidence
-                self.track.update(estimated_position, self.time_s)
+                self.track.update(
+                    estimated_position,
+                    self.time_s,
+                    rapid_velocity_tracking=(
+                        self.target.spec.vehicle_type == "rocket"
+                    ),
+                )
                 self.track.position_sigma_m = max(
                     self.track.position_sigma_m,
                     min(12.0, self.range_estimate.sigma_m),

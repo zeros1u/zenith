@@ -39,7 +39,12 @@ class TargetTrack:
     velocity_sigma_mps: float = 0.50
     confidence: float = 0.0
 
-    def update(self, measured_position: Vec3, timestamp: float) -> None:
+    def update(
+        self,
+        measured_position: Vec3,
+        timestamp: float,
+        rapid_velocity_tracking: bool = False,
+    ) -> None:
         self.last_measurement = measured_position
         if self.position is None or self.last_time is None:
             self.position = measured_position
@@ -65,10 +70,12 @@ class TargetTrack:
             0.13,
             0.62,
         )
+        beta_span = 0.070 if rapid_velocity_tracking else 0.018
+        beta_ceiling = 0.085 if rapid_velocity_tracking else 0.026
         beta = clamp(
-            0.006 + image_quality * 0.070 + dt * 0.05,
+            0.006 + image_quality * beta_span + dt * 0.05,
             0.006,
-            0.085,
+            beta_ceiling,
         )
         self.position = predicted + residual * alpha
         self.velocity = self.velocity + residual * (beta / dt)

@@ -106,7 +106,11 @@ A naive fixed-width calculation is biased. ZENITH projects all eight corners of 
 
 ### “Where are YOLO or DINO?”
 
-No trained recognition model is bundled yet. The current milestone uses a deterministic synthetic detector/pose adapter with the same box, bearing, confidence, and pose outputs that real models would provide. Identity comes from signal lookup, as required by the project idea. A future YOLO plus pose-estimation adapter can replace this boundary without changing the camera, tracking, guidance, UI, or verification layers.
+No trained recognition model is bundled yet. The current milestone uses a deterministic synthetic detector/pose adapter with the same floating-point box, vehicle-center keypoint, bearing, confidence, and pose outputs that real models would provide. Subpixel box motion is preserved instead of rounded into unstable whole-pixel range steps. Identity comes from signal lookup, as required by the project idea. A future YOLO plus keypoint/pose-estimation adapter can replace this boundary without changing the camera, tracking, guidance, UI, or verification layers.
+
+### “Why were Aegis-Q4 and Smart Evader tilting upward?”
+
+That was a real sign and initialization bug, now covered by regression tests. Both spawn level at half maximum speed with zero vertical velocity. Forward vectored thrust tilts the nose downward; any later climb is a gradual maneuver toward a higher target, not a spawn impulse.
 
 ### “Why can Wraith-S miss even though it is fastest?”
 

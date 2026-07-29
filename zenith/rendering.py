@@ -2119,7 +2119,7 @@ class WorldRenderer:
                 (
                     "SENSOR PIPELINE",
                     [
-                        "No trained neural detector is bundled: a deterministic synthetic adapter returns a 2D box, bearing, pixel size, confidence, and visual pose estimate.",
+                        "No trained neural detector is bundled: a deterministic synthetic adapter returns a 2D box, center keypoint, bearing, subpixel size, confidence, and visual pose estimate.",
                         "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
                         "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
                         f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
@@ -2196,10 +2196,10 @@ class WorldRenderer:
                     "GRAVITY AND FORCE MODEL",
                     [
                         "Gravity is always 9.81 m/s2 downward for every airborne vehicle.",
+                        "Aegis-Q4 and Smart Evader spawn level at half maximum speed; forward thrust tilts their noses down, not up.",
                         "Rotorcraft hover only because their powered thrust explicitly counters gravity; cutting the engine removes that support.",
                         "Drag grows with speed. Airbrakes add continuous opposing acceleration instead of deleting speed instantly.",
                         "Autonomous fixed wings schedule throttle and closing speed early; they never use reverse thrust or an automatic speed-triggered brake.",
-                        "X cuts or restarts controllable drone engines; a solid rocket booster cannot be cut or restarted.",
                     ],
                 ),
                 (

@@ -110,9 +110,16 @@ def detect_box(
     bottom = max(point[1] for point in projected)
     width = max(0.0, right - left)
     height = max(0.0, bottom - top)
-    center = ((left + right) * 0.5, (top + bottom) * 0.5)
-    # Bearing is derived strictly from the detected image box, not the
-    # simulation's 3D target-center coordinate.
+    # The synthetic pose adapter reports the vehicle-center image keypoint in
+    # addition to its box. A real pose/keypoint model supplies the same kind of
+    # image-space observation; using the raw box midpoint creates a large
+    # perspective bias when a long rocket passes close to the camera.
+    center = (
+        camera.width_px * 0.5 + focal * center_cam.x / center_cam.z,
+        camera.height_px * 0.5 - focal * center_cam.y / center_cam.z,
+    )
+    # Bearing is still an image measurement. No world coordinate is exposed
+    # beyond this synthetic detector/pose boundary.
     bearing_x = math.degrees(
         math.atan2(center[0] - camera.width_px * 0.5, focal)
     )
@@ -191,9 +198,13 @@ def estimate_range(
         return None
 
     span_x, span_y = projected_physical_spans(spec, pose_estimate, camera_forward)
-    # The detector reports integer-pixel box edges, like a real image detector.
-    pixel_width = max(1.0, round(detection.width_px))
-    pixel_height = max(1.0, round(detection.height_px))
+    # Modern detector boxes are floating-point even though the source image is
+    # rasterised. Preserve those sub-pixel coordinates here; rounding the whole
+    # span made a 3.49 -> 3.50 px transition become a discontinuous 3 -> 4 px
+    # range jump. The explicit half-pixel uncertainty below still models the
+    # finite sensor resolution without injecting that artificial flicker.
+    pixel_width = max(1.0, detection.width_px)
+    pixel_height = max(1.0, detection.height_px)
     depth_x = camera.focal_px * span_x / pixel_width
     depth_y = camera.focal_px * span_y / pixel_height
     optical_depth = (depth_x + depth_y) * 0.5

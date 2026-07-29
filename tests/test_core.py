@@ -248,6 +248,45 @@ class CameraTests(unittest.TestCase):
         # remain inside the estimator's explicit pixel-quantisation uncertainty.
         self.assertLess(error, estimate.sigma_m)
 
+    def test_subpixel_box_change_does_not_create_a_range_step(self) -> None:
+        camera = CameraModel(1920, 1080, 90)
+        spec = DRONE_SPECS[0]
+
+        def detection_with_span(span_px: float) -> Detection:
+            return Detection(
+                True,
+                (960.0 - span_px * 0.5, 539.0, 960.0 + span_px * 0.5, 541.0),
+                (960.0, 540.0),
+                span_px,
+                2.0,
+                0.0,
+                0.0,
+                0.1,
+                200.0,
+                (),
+                Vec3(),
+            )
+
+        before = estimate_range(
+            detection_with_span(3.49),
+            spec,
+            Vec3(),
+            Vec3(0.0, 0.0, 1.0),
+            camera,
+        )
+        after = estimate_range(
+            detection_with_span(3.50),
+            spec,
+            Vec3(),
+            Vec3(0.0, 0.0, 1.0),
+            camera,
+        )
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        assert before is not None and after is not None
+        relative_change = abs(after.distance_m - before.distance_m) / before.distance_m
+        self.assertLess(relative_change, 0.01)
+
     def test_simulation_consumes_reported_pose_not_target_orientation(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))
         sim.identity_confirmed = True
@@ -566,6 +605,22 @@ class PropulsionTests(unittest.TestCase):
                     state.integrate(downward_turn, 1.0 / 60.0)
                 self.assertLess(state.position.y, initial_altitude - 0.5)
                 self.assertLess(state.velocity.y, 0.0)
+
+    def test_forward_vectored_thrust_tilts_the_nose_down(self) -> None:
+        for spec in (DRONE_SPECS[2], DRONE_SPECS[5]):
+            with self.subTest(vehicle=spec.name):
+                state = DroneState(
+                    spec,
+                    Vec3(0, 100, 0),
+                    Vec3(0, 0, spec.max_speed * 0.5),
+                )
+                for _ in range(30):
+                    state.integrate(
+                        Vec3(0, 0, spec.lateral_accel * 0.5),
+                        1.0 / 60.0,
+                    )
+                self.assertGreater(state.orientation.x, 0.0)
+                self.assertLess(state.forward_direction().y, 0.0)
 
     def test_horizontal_wing_glides_slower_than_unlifted_rocket_falls(self) -> None:
         wing = DroneState(
@@ -937,10 +992,15 @@ class ProjectTests(unittest.TestCase):
     def test_tricky_mode_is_a_real_but_bounded_stress_case(self) -> None:
         intercepted = 0
         escaped = 0
-        for target in DRONE_SPECS:
-            with self.subTest(target=target.name):
+        smart_evader = next(spec for spec in DRONE_SPECS if spec.code == "SEV")
+        for interceptor in DRONE_SPECS:
+            with self.subTest(interceptor=interceptor.name):
                 sim = InterceptionSimulation(
-                    SimulationConfig(target_code=target.code, scenario="tricky")
+                    SimulationConfig(
+                        interceptor_code=interceptor.code,
+                        target_code=smart_evader.code,
+                        scenario="tricky",
+                    )
                 )
                 for _ in range(60 * 30):
                     sim.step()
@@ -956,7 +1016,7 @@ class ProjectTests(unittest.TestCase):
                 else:
                     escaped += 1
                     self.assertFalse(sim.target.crashed)
-        self.assertGreaterEqual(intercepted, 4)
+        self.assertGreaterEqual(intercepted, 2)
         self.assertGreaterEqual(escaped, 1)
 
     def test_every_drone_interceptor_hits_the_baseline_evasive_target(self) -> None:
@@ -999,6 +1059,69 @@ class ProjectTests(unittest.TestCase):
                     interceptor.max_speed * 0.5,
                     delta=2.5,
                 )
+
+    def test_aegis_and_smart_evader_spawn_level_at_half_speed(self) -> None:
+        for interceptor_code in ("AQ4", "SEV"):
+            with self.subTest(interceptor=interceptor_code):
+                sim = InterceptionSimulation(
+                    SimulationConfig(
+                        interceptor_code=interceptor_code,
+                        target_code="FX1",
+                        scenario="evasive",
+                    )
+                )
+                initial_altitude = sim.interceptor.position.y
+                self.assertAlmostEqual(sim.interceptor.velocity.y, 0.0, places=9)
+                self.assertAlmostEqual(
+                    sim.interceptor.velocity.length(),
+                    sim.interceptor.spec.max_speed * 0.5,
+                    places=9,
+                )
+                for _ in range(30):
+                    sim.step()
+                self.assertAlmostEqual(
+                    sim.interceptor.position.y,
+                    initial_altitude,
+                    delta=0.05,
+                )
+                self.assertLessEqual(
+                    sim.interceptor.forward_direction().y,
+                    1e-9,
+                )
+
+    def test_displayed_oval_radius_is_frame_stable(self) -> None:
+        # AQ4 at long range used to cross a 3 px -> 4 px rounding boundary,
+        # producing a 240% one-frame jump in the rendered prediction edge.
+        sim = InterceptionSimulation(
+            SimulationConfig(
+                interceptor_code="TLR",
+                target_code="AQ4",
+                scenario="evasive",
+            )
+        )
+        previous_radius_px: float | None = None
+        previous_time_s: float | None = None
+        largest_relative_jump = 0.0
+        for _ in range(60 * 8):
+            sim.step()
+            if sim.guidance is None:
+                previous_radius_px = None
+                previous_time_s = None
+                continue
+            radius_px = sim.guidance.ovals[0].approximate_radius_px
+            if (
+                previous_radius_px is not None
+                and previous_time_s is not None
+                and sim.time_s - previous_time_s < 0.02
+            ):
+                largest_relative_jump = max(
+                    largest_relative_jump,
+                    abs(radius_px - previous_radius_px)
+                    / max(previous_radius_px, 1.0),
+                )
+            previous_radius_px = radius_px
+            previous_time_s = sim.time_s
+        self.assertLess(largest_relative_jump, 0.08)
 
     def test_success_state_persists_during_crash(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))

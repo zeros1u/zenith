@@ -255,7 +255,7 @@ class DroneState:
         forward_flat = Vec3(math.sin(target_yaw), 0.0, math.cos(target_yaw))
         right_flat = Vec3(forward_flat.z, 0.0, -forward_flat.x)
         target_pitch = clamp(
-            -propulsion_acceleration.dot(forward_flat) / 9.81,
+            propulsion_acceleration.dot(forward_flat) / 9.81,
             -max_tilt,
             max_tilt,
         )

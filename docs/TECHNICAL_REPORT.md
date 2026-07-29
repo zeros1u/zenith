@@ -12,7 +12,7 @@ The defense guidance algorithm does not read simulated target coordinates. Simul
 
 Our interceptor's position and velocity are propagated from its own commanded acceleration, which represents normal onboard inertial/state estimation. No external target range sensor is modeled.
 
-No trained neural detector is claimed in this milestone. A deterministic synthetic camera adapter uses truth only to generate a detector-style 2D box, bearing, confidence, and imperfect visual pose output. All defense-side estimation after that boundary consumes those outputs rather than target state.
+No trained neural detector is claimed in this milestone. A deterministic synthetic camera adapter uses truth only to generate a detector-style floating-point 2D box, vehicle-center image keypoint, bearing, confidence, and imperfect visual pose output. All defense-side estimation after that boundary consumes those outputs rather than target state.
 
 The optional `TRICKY AI` adversary is an explicit test-harness exception to this truth boundary. That scenario assumes the enemy knows about the interceptor, so only the target's own autopilot reads true relative range and closing speed to choose a maneuver. It cannot write to the detector, target track, oval solver, or interceptor command.
 
@@ -51,7 +51,7 @@ For horizontal image width `N` and horizontal field of view `θ`:
 f = N / (2 tan(θ/2))
 ```
 
-The bounding-box center also gives horizontal and vertical bearing:
+The reported vehicle-center image keypoint gives horizontal and vertical bearing:
 
 ```text
 bearing_x = atan((pixel_x - center_x) / f)
@@ -129,7 +129,7 @@ These are not arbitrary labels: the application recalculates the table for which
 
 ## 6. Detection and signal sequence
 
-The current `detect_box` backend is not YOLO, DINO, or another trained recognizer. It is a deterministic simulation adapter with the same output boundary expected from a generic detector plus pose estimator. This makes the camera-to-guidance software testable now without presenting synthetic detections as a trained AI model.
+The current `detect_box` backend is not YOLO, DINO, or another trained recognizer. It is a deterministic simulation adapter with the same floating-point box, center-keypoint, and pose output boundary expected from a generic detector plus keypoint/pose estimator. Preserving subpixel box coordinates avoids an artificial 3 px to 4 px range step; the uncertainty calculation still includes a half-pixel edge envelope. This makes the camera-to-guidance software testable now without presenting synthetic detections as a trained AI model.
 
 The implemented state machine is:
 
@@ -153,7 +153,7 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. Filter gains rise with detector confidence so a large terminal image can follow a real maneuver faster than a distant few-pixel image. Target velocity and acceleration come from successive camera-derived position measurements, never from the target body's velocity fields. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`, while altitude and approximately half of the selected vehicle's maximum speed are regulated. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
+This reduces range-quantization jitter without secretly substituting ground truth. Position gains rise with detector confidence, while drone velocity uses a deliberately lower gain so a tiny image change cannot inflate an oval in one frame. The separately identified fast-rocket profile enables a more responsive velocity update because its closing speed is much higher. Target velocity and acceleration still come from successive camera-derived position measurements, never from the target body's velocity fields. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`, while altitude and approximately half of the selected vehicle's maximum speed are regulated. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
@@ -229,6 +229,8 @@ position(t+Δt) = position + velocity Δt
 
 Actual propulsion acceleration, gravity, passive quadratic drag, explicitly commanded/scenario-specific airbrakes, maximum speed, and ground contact are continuous. A vectored craft decomposes vertical and horizontal thrust before applying the tilt limit, so a requested descent cannot be reflected into an artificial upward-thrust spike. Wing lift uses an explicit model stall speed and lift-efficiency factor:
 
+Aegis-Q4 and Smart Evader initialize in level half-speed flight with zero vertical velocity. Their visual attitude follows the same thrust request: forward acceleration tilts the nose downward. A later climb can occur only as a gradual guidance or player command, not as a spawn impulse or reversed pitch sign.
+
 ```text
 airflow factor = clamp((speed / stall_speed)², 0, 1)
 lift            = 9.81 × lift_efficiency × airflow factor
@@ -274,7 +276,7 @@ Rotation is handled by known-model pose-compensated physical spans. Maneuvers ar
 ## 13. Known prototype boundaries
 
 - Six original low-poly drone meshes and two original rocket meshes are bundled. The SMART EVADER uses a saucer body, pointed +Z nose, stabilizers, keel, and twin rear drives so its direction remains unambiguous. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
-- The generic detector backend deterministically emits a synthetic camera box, bearing, confidence, and imperfect pose estimate. It represents a future detector/pose output contract, not a trained neural network.
+- The generic detector backend deterministically emits a synthetic floating-point camera box, center keypoint, bearing, confidence, and imperfect pose estimate. It represents a future detector/keypoint/pose output contract, not a trained neural network.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
 - The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
 - The lift model is not CFD. Production aerodynamics require measured lift/drag curves, mass, wing area, angle of attack, wind, control-surface dynamics, and flight-test validation.
