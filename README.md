@@ -2,9 +2,15 @@
 
 ZENITH is a windowed interactive desktop proof-of-concept for vision-only interception. It estimates an intruder's range from a monocular camera, builds conservative maneuver-containment ovals, and outputs the maneuver for a propulsion-constrained interceptor. No radar, lidar, rangefinder, or target ground-truth coordinates are used by the guidance calculation.
 
-The project includes five controllable drones with distinct low-poly quadcopter, swept-wing, delta-wing, and blended-wing meshes. Two literal single-stage rockets are selectable on either side. Each ignites automatically, expends a finite nonrestartable booster, uses a separate limited RCS steering budget, and then coasts under drag and gravity.
+The project includes six controllable drones with distinct low-poly quadcopter, swept-wing, delta-wing, blended-wing, and directional UFO-style meshes. The new `SMART EVADER` has the catalogue's strongest drone performance and can demonstrate a separate threat-aware `TRICKY AI` behavior. Two literal single-stage rockets are selectable on either side. Each ignites automatically, expends a finite nonrestartable booster, uses a separate limited RCS steering budget, and then coasts under drag and gravity.
 
 ![DPI-aware windowed setup](artifacts/setup_windowed.png)
+
+![Smart Evader and separate Tricky AI setup](artifacts/smart_evader_setup.png)
+
+![Tricky AI spectator engagement with blocked red ovals](artifacts/smart_evader_tricky.png)
+
+![Tricky AI close engagement with a fully reachable green oval](artifacts/smart_evader_tricky_close.png)
 
 ![Mid-flight prototype](artifacts/prototype_midflight.png)
 
@@ -49,14 +55,15 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 1. Keep `TALON-R` as our interceptor and `FALCON-X1` as the target.
 2. Select `EVASIVE MANEUVERS`, `1920 × 1080`, and start the simulation.
 3. Observe the target label change from `UNKNOWN / QUERYING` to `FALCON-X1`.
-4. Point out the 1, 2, 3, and 5 second prediction ovals. The four large dots are the cardinal summary, but the border color tests all 96 displayed edge directions. Green means every direction passes; red reports the exact complete-edge count.
+4. Point out the 1, 2, 3, and 5 second prediction ovals. The four large dots are the cardinal summary, but the border color tests all 96 displayed edge directions. Green segments are reachable and red segments are blocked; only a completely green `96/96` edge can be selected.
 5. Press `F2` to show the camera-resolution and range-error analysis.
-6. Press `V` to cycle views or `F3` to jump directly to the independent spectator/tactical view. Hold the right mouse button to capture the pointer for unlimited free look; hold `Shift` while moving it to roll the presentation camera. Release the button to restore the pointer, or press `C` to center the view.
+6. Press `V` to cycle views or `F3` to jump directly to the independent spectator/tactical view. Hold the right mouse button to capture the pointer for unlimited free look; hold `Shift` while moving it to roll the presentation camera. Use the mouse wheel to zoom without changing the sensor. Release the button to restore the pointer, or press `C` to center the view and reset zoom.
 7. Press `O` to obscure the camera: lock, guidance, range, and ovals disappear immediately. Press `O` again and watch the search pattern genuinely reacquire the target.
 8. Click the bottom headers to expand/collapse individual panels. Press `M` for the estimated-track minimap and `G` to record a two-second prediction check in the old virtual camera frame.
 9. Press `Tab` to take over our vehicle, then press it again to take over the target. Use `W/S`, `A/D`, `Q/E`, `Shift`, and `Ctrl`; the authority HUD proves which requests each propulsion model can execute. `X` cuts/restarts a drone engine, while a solid rocket correctly rejects that request.
-10. Start a new simulation, select `SKYFALL-R1` or `LANCE-M2` as **our interceptor**, and show the automatic booster/RCS timers. Rockets remain selectable as incoming targets too.
-11. Press `F5` to export the run's verification telemetry.
+10. Start a new simulation with `SMART EVADER` as the target and select `TRICKY AI`. Its Target panel and event log expose deterministic decisions such as jinks, climbs, speed shifts, brake traps, and escape boosts.
+11. Select `SKYFALL-R1` or `LANCE-M2` as **our interceptor**, and show the automatic booster/RCS timers. Rockets remain selectable as incoming targets too.
+12. Press `F5` to export the run's verification telemetry, including the current target-AI decision.
 
 ## Controls
 
@@ -69,7 +76,8 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 | `F4` | Toggle presentation settings |
 | Hold right mouse | Capture the pointer for unlimited free look |
 | `Shift` + right mouse | Roll the presentation camera |
-| `C` | Center the free-look camera |
+| Mouse wheel | Zoom the presentation camera; the simulated sensor remains 90° |
+| `C` | Center free look and reset presentation zoom |
 | `Tab` | Cycle `AUTO -> PLAYER / OUR VEHICLE -> PLAYER / TARGET -> AUTO` |
 | `W` / `S` | Forward thrust / reverse or decelerate |
 | `A` / `D` | Turn left / right within propulsion limits |
@@ -121,13 +129,13 @@ flowchart LR
     J --> K[Acceleration command]
 ```
 
-The simulation's exact target position is used only to render the synthetic camera, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads the camera detection, signal-resolved model data, and our drone's own integrated state. The 90° sensor is rigidly fixed to the interceptor nose: it cannot turn independently to preserve lock or see behind the airframe. A lost visual detection invalidates guidance immediately; the last metric track is not coasted as if it were a current lock. The search system filters the final image-plane bearing rate, extrapolates it for at most 1.5 seconds, then asks the autonomous interceptor airframe to perform a widening horizon-limited scan. If the player controls our vehicle, only the player can turn the body and therefore the camera.
+The defense guidance never reads the simulation's exact target position: truth is used to render the synthetic camera, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads the camera detection, signal-resolved model data, and our drone's own integrated state. The optional `TRICKY AI` target controller is a separately declared adversary test harness: because that scenario assumes the enemy knows about us, it reads our true relative approach to choose its own bounded maneuver, but cannot feed truth back into detection or guidance. The 90° sensor is rigidly fixed to the interceptor nose: it cannot turn independently to preserve lock or see behind the airframe. A lost visual detection invalidates guidance immediately; the last metric track is not coasted as if it were a current lock. The search system filters the final image-plane bearing rate, extrapolates it for at most 1.5 seconds, then asks the autonomous interceptor airframe to perform a widening horizon-limited scan. If the player controls our vehicle, only the player can turn the body and therefore the camera.
 
 At every 60 Hz update the current sensor pose is frozen and each mathematical ellipse bounds the pixels the identified target could occupy after 1, 2, 3, or 5 seconds. The bound includes propulsion support, perspective at the closest permitted future depth, and the track's position/velocity uncertainty. It is then back-projected onto the plane through the estimated target, perpendicular to the current optical axis. If the future set could cross the camera plane, the horizon is labeled `UNBOUNDED / CAMERA CROSSING` instead of drawing a dishonest finite oval.
 
-The four large marked points remain the easy cardinal explanation. They do not prove the diagonal edge: the actual decision checks all 96 directions used to render the border. Green requires the complete edge; red reports `n/96` and retains the individual cardinal colors. Guidance chooses the largest green oval and biases its aim from the center toward measured likely motion while remaining within 65% of the ellipse. With no green oval it explicitly reports `NO GUARANTEED OVAL` and follows the unchanged-motion prediction. Reaching the one-second region activates terminal collision lead.
+The four large marked points remain the easy cardinal explanation. They do not prove the diagonal edge: the actual decision checks all 96 directions used to render the border. Each reachable edge segment is green and each blocked segment is red, so partial reachability is visibly mixed; the label still reports `n/96`. Guidance chooses only the largest completely green oval and biases its aim from the center toward measured likely motion while remaining within 65% of the ellipse. With no green oval it explicitly reports `NO GUARANTEED OVAL` and follows the unchanged-motion prediction. Reaching the one-second region activates terminal collision lead.
 
-Mouse free-look changes only the presentation renderer, not the sensor axis, detection, or guidance. While the right button is held, the pointer is captured and hidden so window edges cannot stop rotation; release, focus loss, overlays, or simulation exit restore it. Vehicle key input is suppressed during mouse capture so `Shift` can roll without also commanding thrust.
+Mouse free-look and wheel zoom change only the presentation renderer, not the sensor axis, detection, or guidance. The zoom is a bounded 24°–100° presentation field of view; the sensor remains fixed at its configured 90°. While the right button is held, the pointer is captured and hidden so window edges cannot stop rotation; release, focus loss, overlays, or simulation exit restore it. Vehicle key input is suppressed during mouse capture so `Shift` can roll without also commanding thrust.
 
 Manual takeover is an advisory proof mode rather than a physics bypass. Inputs pass through the same thrust direction, airbrake, turn rate, speed, drag, gravity, wing lift/stall, fuel, and altitude constraints used by autonomy. A powered rotorcraft must spend thrust to hover; an engine-off wing glides before sinking. A rocket automatically burns at full thrust, cannot reverse/throttle/restart, steers only while RCS remains, and falls after burnout. During our-vehicle takeover, the normal oval solution remains visible as an advisory.
 
@@ -135,7 +143,7 @@ Manual takeover is an advisory proof mode rather than a physics bypass. Inputs p
 
 ## Verification
 
-Run all six deterministic behavior tests:
+Run all seven deterministic behavior tests:
 
 ```powershell
 python verify_prototype.py --duration 30 --csv artifacts\verification.csv
@@ -151,14 +159,14 @@ The benchmark runs the same evasive simulation and complete 1050 × 700 software
 
 ```text
 app.py                    Desktop UI, setup screen, controls, CSV export
-verify_prototype.py       Deterministic six-scenario verification
+verify_prototype.py       Deterministic seven-scenario verification
 benchmark_performance.py  Repeatable physics/guidance/render benchmark
 zenith/
   camera.py               Pinhole camera, detector output, range estimator
   controls.py             Manual authority modes and assisted flight requests
   guidance.py             Tracking, prediction ovals, reachability, commands
   math3d.py               Vector, camera-basis, and transform mathematics
-  models.py               Five drones and two controllable rocket profiles
+  models.py               Six drones and two controllable rocket profiles
   meshes.py               Bundled procedural drone and rocket polygon meshes
   physics.py              60 Hz gravity, lift/stall, thrust, drag, and impacts
   rendering.py            3D scene, HUD, spectator, analysis, full info display

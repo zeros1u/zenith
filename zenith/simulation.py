@@ -39,6 +39,7 @@ SCENARIOS = (
     ("evasive", "EVASIVE MANEUVERS"),
     ("braking", "AIRBRAKE TEST"),
     ("rotating", "ROTATING TARGET"),
+    ("tricky", "TRICKY AI"),
     ("rocket_attack", "ROCKET ATTACK"),
 )
 
@@ -70,6 +71,9 @@ class TelemetrySample:
     interceptor_rcs_remaining_s: float
     target_burn_remaining_s: float
     target_rcs_remaining_s: float
+    target_ai_state: str
+    target_ai_threat_range_m: float | None
+    target_ai_closing_speed_mps: float | None
 
 
 @dataclass(slots=True)
@@ -174,6 +178,15 @@ class InterceptionSimulation:
         self.guidance: GuidanceSolution | None = None
         self.last_estimated_position: Vec3 | None = None
         self.explosion_age_s = math.inf
+        # The tricky target autopilot is deterministic so demonstrations and
+        # verification runs are reproducible. It may use simulation truth
+        # because the scenario explicitly assumes that the target knows about
+        # the interceptor; truth is never exposed to our sensor or guidance.
+        self.evader_decision = "INACTIVE"
+        self.evader_decision_until_s = 0.0
+        self.evader_decision_index = 0
+        self.evader_threat_range_m = math.inf
+        self.evader_closing_speed_mps = 0.0
 
     @property
     def true_range_m(self) -> float:
@@ -472,6 +485,8 @@ class InterceptionSimulation:
             )
         self.target.airbrake = False
 
+        if scenario == "tricky":
+            return self._smart_evader_command(stabilise)
         if scenario == "weave":
             return (
                 stabilise
@@ -510,6 +525,126 @@ class InterceptionSimulation:
                 )
             return stabilise.clamp_length(spec.max_accel)
         return stabilise.clamp_length(spec.max_accel)
+
+    def _choose_evader_decision(
+        self,
+        distance_m: float,
+        closing_speed_mps: float,
+    ) -> None:
+        """Choose a deterministic, threat-aware maneuver for the tricky mode."""
+        index = self.evader_decision_index
+        if distance_m > 165.0 or closing_speed_mps < 2.0:
+            choices = ("DECEPTIVE CRUISE", "OFFSET JINK", "SPEED SHIFT")
+            duration = 1.15
+        elif distance_m > 95.0:
+            choices = ("OFFSET JINK", "HARD BREAK", "CLIMB", "SPRINT")
+            duration = 0.88
+        elif distance_m > 48.0:
+            choices = (
+                "BRAKE TRAP",
+                "SNAP LEFT",
+                "VERTICAL BREAK",
+                "SNAP RIGHT",
+                "BOOST ESCAPE",
+            )
+            duration = 0.68
+        else:
+            choices = (
+                "BRAKE TRAP",
+                "SNAP RIGHT",
+                "BOOST ESCAPE",
+                "SNAP LEFT",
+                "VERTICAL BREAK",
+            )
+            duration = 0.52
+        # The range bucket perturbs the sequence without introducing random
+        # state, so identical inputs always produce identical demonstrations.
+        range_phase = int(distance_m / 17.0)
+        self.evader_decision = choices[(index + range_phase) % len(choices)]
+        self.evader_decision_index += 1
+        self.evader_decision_until_s = self.time_s + duration
+        self._event(f"Target AI: {self.evader_decision}")
+
+    def _smart_evader_command(self, stabilise: Vec3) -> Vec3:
+        """Reactive target autopilot constrained by the selected craft limits."""
+        spec = self.target.spec
+        relative = self.interceptor.position - self.target.position
+        distance = relative.length()
+        threat_direction = relative.normalized(Vec3(0.0, 0.0, -1.0))
+        relative_velocity = self.interceptor.velocity - self.target.velocity
+        closing = max(0.0, -relative_velocity.dot(threat_direction))
+        self.evader_threat_range_m = distance
+        self.evader_closing_speed_mps = closing
+
+        if self.time_s >= self.evader_decision_until_s:
+            self._choose_evader_decision(distance, closing)
+
+        # A horizontal perpendicular is a predictable way to maximize angular
+        # displacement from the interceptor's current line of approach.
+        horizontal_threat = Vec3(threat_direction.x, 0.0, threat_direction.z)
+        horizontal_threat = horizontal_threat.normalized(Vec3(0.0, 0.0, -1.0))
+        side = Vec3(horizontal_threat.z, 0.0, -horizontal_threat.x)
+        side_sign = -1.0 if self.evader_decision_index % 2 else 1.0
+        lateral = side * side_sign
+        away = -horizontal_threat
+        authority = spec.lateral_accel
+        decision = self.evader_decision
+
+        if decision == "DECEPTIVE CRUISE":
+            maneuver = lateral * authority * 0.30
+        elif decision == "OFFSET JINK":
+            maneuver = lateral * authority * 0.72 + away * authority * 0.18
+        elif decision == "SPEED SHIFT":
+            # Alternating axial changes complicate a constant-velocity track.
+            speed_sign = -1.0 if self.evader_decision_index % 2 else 1.0
+            maneuver = (
+                self.target.velocity.normalized(away)
+                * spec.max_accel
+                * 0.55
+                * speed_sign
+                + lateral * authority * 0.25
+            )
+        elif decision == "HARD BREAK":
+            maneuver = lateral * authority * 0.92 + away * authority * 0.30
+        elif decision == "CLIMB":
+            maneuver = lateral * authority * 0.36 + Vec3(0.0, spec.max_accel, 0.0)
+        elif decision == "SPRINT":
+            maneuver = away * spec.max_accel + lateral * authority * 0.18
+        elif decision == "BRAKE TRAP":
+            self.target.airbrake = True
+            maneuver = lateral * authority * 0.20
+        elif decision == "VERTICAL BREAK":
+            vertical_sign = -1.0 if self.evader_decision_index % 2 else 1.0
+            if self.target.position.y < 12.0:
+                vertical_sign = 1.0
+            maneuver = (
+                Vec3(0.0, vertical_sign * spec.max_accel, 0.0)
+                + lateral * authority * 0.35
+            )
+        elif decision == "BOOST ESCAPE":
+            maneuver = away * spec.max_accel + Vec3(0.0, spec.max_accel * 0.22, 0.0)
+        else:  # SNAP LEFT / SNAP RIGHT
+            snap_sign = -1.0 if decision == "SNAP LEFT" else 1.0
+            maneuver = side * snap_sign * authority + away * authority * 0.20
+
+        # SMART EVADER is the full-authority demonstrator. Other catalogue
+        # craft can use the same intelligence mode, but retain a small control
+        # reserve instead of unrealistically riding every actuator limit.
+        if spec.code != "SEV":
+            maneuver = maneuver * min(
+                0.66,
+                18.0 / max(spec.lateral_accel, 0.001),
+            )
+
+        # Close to the ground, vertical recovery overrides any downward break.
+        ground_recovery = (
+            Vec3(0.0, (10.0 - self.target.position.y) * 3.0, 0.0)
+            if self.target.position.y < 10.0
+            else Vec3()
+        )
+        return (stabilise * 0.55 + maneuver + ground_recovery).clamp_length(
+            spec.max_accel
+        )
 
     def _update_sensor(self, dt: float) -> None:
         # The camera is not a target-following gimbal. Its FOV can move only
@@ -644,6 +779,17 @@ class InterceptionSimulation:
                 max(0.0, self.interceptor.rcs_remaining_s),
                 max(0.0, self.target.main_burn_remaining_s),
                 max(0.0, self.target.rcs_remaining_s),
+                self.evader_decision,
+                (
+                    self.evader_threat_range_m
+                    if self.config.scenario == "tricky"
+                    else None
+                ),
+                (
+                    self.evader_closing_speed_mps
+                    if self.config.scenario == "tricky"
+                    else None
+                ),
             )
         )
         self.telemetry = self.telemetry[-600:]

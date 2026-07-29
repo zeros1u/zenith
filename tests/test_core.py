@@ -89,6 +89,39 @@ class InterfaceConfigTests(unittest.TestCase):
             places=7,
         )
 
+    def test_mouse_wheel_zoom_is_presentation_only_and_bounded(self) -> None:
+        sim = InterceptionSimulation(SimulationConfig())
+        renderer = WorldRenderer()
+        camera = renderer.get_view_camera(sim)
+        sensor_fov = sim.config.camera.horizontal_fov_deg
+        sensor_forward = sim.camera_forward
+        point = camera.position + camera.forward * 100.0 + Vec3(10.0, 0.0, 0.0)
+        before = renderer._project_cached(point, camera, 1050, 700)
+        renderer.adjust_zoom(4)
+        after = renderer._project_cached(point, camera, 1050, 700)
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        assert before is not None and after is not None
+        self.assertGreater(abs(after[0] - 525), abs(before[0] - 525))
+        self.assertGreater(renderer.zoom_multiplier, 1.0)
+        self.assertEqual(sim.config.camera.horizontal_fov_deg, sensor_fov)
+        self.assertEqual(sim.camera_forward, sensor_forward)
+        renderer.adjust_zoom(100)
+        self.assertEqual(
+            renderer.presentation_fov_deg,
+            renderer.MIN_PRESENTATION_FOV_DEG,
+        )
+        renderer.adjust_zoom(-200)
+        self.assertEqual(
+            renderer.presentation_fov_deg,
+            renderer.MAX_PRESENTATION_FOV_DEG,
+        )
+        renderer.reset_view_offset()
+        self.assertEqual(
+            renderer.presentation_fov_deg,
+            renderer.DEFAULT_PRESENTATION_FOV_DEG,
+        )
+
     def test_camera_roll_rotates_screen_axes(self) -> None:
         rolled = ViewCamera(Vec3(), Vec3(0, 0, 1), "TEST", math.pi * 0.5)
         projected = WorldRenderer._project(Vec3(1, 0, 10), rolled, 1000, 600)
@@ -245,6 +278,9 @@ class GuidanceTests(unittest.TestCase):
         edge[len(edge) // 8] = False
         oval.edge_reachable = tuple(edge)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
+        edge_colors = WorldRenderer._oval_edge_colors(oval)
+        self.assertEqual(edge_colors.count(GREEN), len(edge) - 1)
+        self.assertEqual(edge_colors.count(RED), 1)
         oval.reachable = (False, False, False, False)
         self.assertEqual(WorldRenderer._oval_reachability_color(oval), RED)
 
@@ -675,12 +711,16 @@ class ManualControlTests(unittest.TestCase):
 
 
 class ProjectTests(unittest.TestCase):
-    def test_five_expandable_models_exist(self) -> None:
-        self.assertEqual(len(DRONE_SPECS), 5)
-        self.assertEqual(len({spec.code for spec in DRONE_SPECS}), 5)
+    def test_six_expandable_models_exist(self) -> None:
+        self.assertEqual(len(DRONE_SPECS), 6)
+        self.assertEqual(len({spec.code for spec in DRONE_SPECS}), 6)
         self.assertEqual(len(ROCKET_SPECS), 2)
         self.assertTrue(all(spec.vehicle_type == "rocket" for spec in ROCKET_SPECS))
         self.assertEqual(INTERCEPTOR_SPECS, TARGET_SPECS)
+        smart_evader = next(spec for spec in DRONE_SPECS if spec.code == "SEV")
+        self.assertEqual(smart_evader.name, "SMART EVADER")
+        self.assertEqual(smart_evader.mesh_id, "smart_evader_ufo")
+        self.assertGreater(smart_evader.max_speed, DRONE_SPECS[3].max_speed)
 
     def test_every_vehicle_has_a_polygon_mesh(self) -> None:
         for spec in TARGET_SPECS:
@@ -788,6 +828,37 @@ class ProjectTests(unittest.TestCase):
                         break
                 self.assertTrue(sim.hit)
 
+    def test_tricky_ai_is_reactive_deterministic_and_physically_limited(self) -> None:
+        self.assertIn(("tricky", "TRICKY AI"), SCENARIOS)
+        first = InterceptionSimulation(
+            SimulationConfig(target_code="SEV", scenario="tricky")
+        )
+        second = InterceptionSimulation(
+            SimulationConfig(target_code="SEV", scenario="tricky")
+        )
+        decisions: set[str] = set()
+        airbrake_seen = False
+        for _ in range(60 * 8):
+            first.step()
+            second.step()
+            decisions.add(first.evader_decision)
+            airbrake_seen = airbrake_seen or first.target.airbrake
+            self.assertEqual(first.evader_decision, second.evader_decision)
+            self.assertLess(
+                first.target.position.distance_to(second.target.position),
+                1e-9,
+            )
+            self.assertLessEqual(
+                first.target.velocity.length(),
+                first.target.spec.max_speed + 1e-7,
+            )
+            if first.hit:
+                break
+        self.assertTrue(first.hit)
+        self.assertGreaterEqual(len(decisions), 4)
+        self.assertTrue(airbrake_seen)
+        self.assertGreater(first.evader_decision_index, 3)
+
     def test_every_catalogue_target_can_be_intercepted(self) -> None:
         for target in DRONE_SPECS:
             with self.subTest(target=target.name):
@@ -799,6 +870,19 @@ class ProjectTests(unittest.TestCase):
                     if sim.hit:
                         break
                 self.assertTrue(sim.hit)
+
+    def test_tricky_mode_remains_interceptable_for_every_drone(self) -> None:
+        for target in DRONE_SPECS:
+            with self.subTest(target=target.name):
+                sim = InterceptionSimulation(
+                    SimulationConfig(target_code=target.code, scenario="tricky")
+                )
+                for _ in range(60 * 30):
+                    sim.step()
+                    if sim.hit:
+                        break
+                self.assertTrue(sim.hit)
+                self.assertGreater(sim.evader_decision_index, 1)
 
     def test_success_state_persists_during_crash(self) -> None:
         sim = InterceptionSimulation(SimulationConfig(scenario="steady"))

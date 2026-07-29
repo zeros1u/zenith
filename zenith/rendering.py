@@ -57,6 +57,10 @@ class _ProjectionState:
 
 
 class WorldRenderer:
+    DEFAULT_PRESENTATION_FOV_DEG = 72.0
+    MIN_PRESENTATION_FOV_DEG = 24.0
+    MAX_PRESENTATION_FOV_DEG = 100.0
+
     def __init__(self) -> None:
         pygame.font.init()
         self.font_tiny = pygame.font.SysFont("consolas", 12)
@@ -67,6 +71,8 @@ class WorldRenderer:
         self.font_large = pygame.font.SysFont("arial", 32, bold=True)
         self._background: pygame.Surface | None = None
         self._background_size = (0, 0)
+        self._prediction_fill: pygame.Surface | None = None
+        self._prediction_fill_size = (0, 0)
         self.view_mode = 0
         self.interceptor_trail: list[Vec3] = []
         self.target_trail: list[Vec3] = []
@@ -75,6 +81,7 @@ class WorldRenderer:
         self.look_yaw_rad = 0.0
         self.look_pitch_rad = 0.0
         self.look_roll_rad = 0.0
+        self.presentation_fov_deg = self.DEFAULT_PRESENTATION_FOV_DEG
         self.panel_expanded = {
             "target": True,
             "calculations": False,
@@ -104,6 +111,29 @@ class WorldRenderer:
         self.look_yaw_rad = 0.0
         self.look_pitch_rad = 0.0
         self.look_roll_rad = 0.0
+        self.presentation_fov_deg = self.DEFAULT_PRESENTATION_FOV_DEG
+        self._projection_state = None
+
+    def adjust_zoom(self, wheel_steps: int) -> None:
+        """Zoom only the presentation camera; the simulated sensor stays fixed."""
+        if not wheel_steps:
+            return
+        self.presentation_fov_deg = clamp(
+            self.presentation_fov_deg * (0.90 ** wheel_steps),
+            self.MIN_PRESENTATION_FOV_DEG,
+            self.MAX_PRESENTATION_FOV_DEG,
+        )
+        self._projection_state = None
+
+    @property
+    def zoom_multiplier(self) -> float:
+        default_tangent = math.tan(
+            math.radians(self.DEFAULT_PRESENTATION_FOV_DEG) * 0.5
+        )
+        current_tangent = math.tan(
+            math.radians(self.presentation_fov_deg) * 0.5
+        )
+        return default_tangent / current_tangent
 
     def rotate_view(
         self,
@@ -335,8 +365,10 @@ class WorldRenderer:
         camera: ViewCamera,
         width: int,
         height: int,
-        fov_deg: float = 72.0,
+        fov_deg: float | None = None,
     ) -> _ProjectionState:
+        if fov_deg is None:
+            fov_deg = self.presentation_fov_deg
         state = self._projection_state
         if (
             state is not None
@@ -403,7 +435,7 @@ class WorldRenderer:
         camera: ViewCamera,
         width: int,
         height: int,
-        fov_deg: float = 72.0,
+        fov_deg: float | None = None,
     ) -> tuple[int, int, float] | None:
         state = self._prepare_projection(camera, width, height, fov_deg)
         camera_point = self._camera_space(point, state)
@@ -508,11 +540,18 @@ class WorldRenderer:
         camera: ViewCamera,
         color: tuple[int, int, int],
         width_px: int = 1,
+        fov_deg: float | None = None,
     ) -> None:
         width, height = surface.get_size()
         segment: list[tuple[int, int]] = []
         for point in points:
-            projected = self._project_cached(point, camera, width, height)
+            projected = self._project_cached(
+                point,
+                camera,
+                width,
+                height,
+                fov_deg,
+            )
             if projected is None:
                 if len(segment) > 1:
                     pygame.draw.lines(surface, color, False, segment, width_px)
@@ -609,6 +648,18 @@ class WorldRenderer:
         # All rendered edge directions must pass, not only four cardinals.
         return RED
 
+    @staticmethod
+    def _oval_edge_colors(
+        oval: PredictionOval,
+    ) -> tuple[tuple[int, int, int], ...]:
+        """One displayed color per evaluated edge direction."""
+        if oval.invalid_reason:
+            return tuple(GREY for _ in oval.edge_points)
+        return tuple(
+            GREEN if reachable else RED
+            for reachable in oval.edge_reachable
+        )
+
     def _draw_predictions(
         self,
         surface: pygame.Surface,
@@ -618,29 +669,131 @@ class WorldRenderer:
         if not sim.guidance or sim.hit:
             return
         selected_horizon = sim.guidance.selected_horizon_s
-        for oval in sim.guidance.ovals:
+        surface_size = surface.get_size()
+        if (
+            self._prediction_fill is None
+            or self._prediction_fill_size != surface_size
+        ):
+            self._prediction_fill = pygame.Surface(surface_size, pygame.SRCALPHA)
+            self._prediction_fill_size = surface_size
+        fill_layer = self._prediction_fill
+        fill_layer.fill((0, 0, 0, 0))
+        projected_ovals = [
+            (
+                oval,
+                [
+                    self._project_cached(point, camera, *surface_size)
+                    for point in oval.edge_points
+                ],
+            )
+            for oval in sim.guidance.ovals
+        ]
+
+        # A faint fill makes the nested prediction regions readable against
+        # both sky and ground while leaving the synthetic target unobscured.
+        for oval, projected_edge in projected_ovals:
+            if (
+                len(projected_edge) >= 3
+                and all(point is not None for point in projected_edge)
+            ):
+                color = self._oval_reachability_color(oval)
+                polygon = [
+                    point[:2]
+                    for point in projected_edge
+                    if point is not None
+                ]
+                xs = [point[0] for point in polygon]
+                ys = [point[1] for point in polygon]
+                # SDL's software polygon rasterizer becomes needlessly costly
+                # for a huge off-screen 5 s envelope. Its thick border remains
+                # exact; skip only the cosmetic fill when it spans >2 screens.
+                if (
+                    max(xs) - min(xs) <= surface_size[0] * 2
+                    and max(ys) - min(ys) <= surface_size[1] * 2
+                ):
+                    pygame.draw.polygon(fill_layer, (*color, 12), polygon)
+        surface.blit(fill_layer, (0, 0))
+
+        for oval, projected_edge in projected_ovals:
             selected = (
                 selected_horizon is not None
                 and abs(oval.horizon_s - selected_horizon) < 0.02
                 and sim.guidance.mode == "WEIGHTED OVAL"
             )
             draw_color = self._oval_reachability_color(oval)
-            self._draw_polyline_3d(
-                surface,
-                self._oval_points(oval),
-                camera,
-                draw_color,
-                3 if selected else 2,
-            )
+            border_width = 5 if selected else 3
+            if projected_edge:
+                edge_count = len(projected_edge)
+                segment_colors = list(self._oval_edge_colors(oval))
+                if not segment_colors:
+                    segment_colors = [draw_color] * edge_count
+
+                # Batch contiguous same-color arcs instead of issuing 96 draw
+                # calls per oval. Mixed borders stay exact and render quickly.
+                if len(set(segment_colors)) == 1 and all(
+                    point is not None for point in projected_edge
+                ):
+                    pygame.draw.lines(
+                        surface,
+                        segment_colors[0],
+                        True,
+                        [point[:2] for point in projected_edge if point],
+                        border_width,
+                    )
+                else:
+                    start = next(
+                        (
+                            index
+                            for index in range(edge_count)
+                            if segment_colors[index]
+                            != segment_colors[index - 1]
+                        ),
+                        0,
+                    )
+                    active_color = segment_colors[start]
+                    active_points: list[tuple[int, int]] = []
+                    for offset in range(edge_count):
+                        index = (start + offset) % edge_count
+                        following = (index + 1) % edge_count
+                        first = projected_edge[index]
+                        second = projected_edge[following]
+                        color = segment_colors[index]
+                        if (
+                            color != active_color
+                            or first is None
+                            or second is None
+                        ):
+                            if len(active_points) > 1:
+                                pygame.draw.lines(
+                                    surface,
+                                    active_color,
+                                    False,
+                                    active_points,
+                                    border_width,
+                                )
+                            active_points = []
+                            active_color = color
+                        if first is not None and second is not None:
+                            if not active_points:
+                                active_points.append(first[:2])
+                            active_points.append(second[:2])
+                    if len(active_points) > 1:
+                        pygame.draw.lines(
+                            surface,
+                            active_color,
+                            False,
+                            active_points,
+                            border_width,
+                        )
             for point, reachable in zip(oval.extremes, oval.reachable):
                 projected = self._project_cached(
                     point,
                     camera,
-                    *surface.get_size(),
+                    *surface_size,
                 )
                 if projected:
                     pygame.draw.circle(
-                        surface, GREEN if reachable else RED, projected[:2], 3, 1
+                        surface, GREEN if reachable else RED, projected[:2], 4
                     )
             label_anchor = (
                 oval.center
@@ -650,7 +803,7 @@ class WorldRenderer:
             label_projected = self._project_cached(
                 label_anchor,
                 camera,
-                *surface.get_size(),
+                *surface_size,
             )
             if label_projected:
                 if oval.invalid_reason:
@@ -675,8 +828,15 @@ class WorldRenderer:
                         f"| CARDINAL {oval.cardinal_reachable_count}/4"
                     )
                 text = self.font_tiny.render(label, True, draw_color)
+                chip = pygame.Surface(
+                    (text.get_width() + 8, text.get_height() + 4),
+                    pygame.SRCALPHA,
+                )
+                chip.fill((3, 13, 20, 210))
+                pygame.draw.rect(chip, (*draw_color, 190), chip.get_rect(), 1)
+                chip.blit(text, (4, 2))
                 surface.blit(
-                    text,
+                    chip,
                     (label_projected[0] + 5, label_projected[1] - 8),
                 )
 
@@ -694,7 +854,7 @@ class WorldRenderer:
             projected = self._project_cached(
                 point,
                 camera,
-                *surface.get_size(),
+                *surface_size,
             )
             if projected:
                 pygame.draw.circle(surface, AMBER, projected[:2], 2)
@@ -703,7 +863,7 @@ class WorldRenderer:
             self._project_cached(
                 sim.guidance.aim_point,
                 camera,
-                *surface.get_size(),
+                *surface_size,
             )
             if self.aim_aids_visible
             else None
@@ -716,6 +876,34 @@ class WorldRenderer:
                 self.font_tiny.render("AIM", True, WHITE),
                 (x + 12, y - 7),
             )
+
+        legend = self.font_tiny.render(
+            "OVAL EDGE  GREEN=REACHABLE  RED=BLOCKED  MIXED=PARTIAL",
+            True,
+            WHITE,
+        )
+        legend_chip = pygame.Surface(
+            (legend.get_width() + 12, legend.get_height() + 7),
+            pygame.SRCALPHA,
+        )
+        legend_chip.fill((3, 13, 20, 218))
+        pygame.draw.line(
+            legend_chip,
+            GREEN,
+            (5, legend_chip.get_height() - 2),
+            (legend_chip.get_width() // 2, legend_chip.get_height() - 2),
+            2,
+        )
+        pygame.draw.line(
+            legend_chip,
+            RED,
+            (legend_chip.get_width() // 2, legend_chip.get_height() - 2),
+            (legend_chip.get_width() - 5, legend_chip.get_height() - 2),
+            2,
+        )
+        legend_chip.blit(legend, (6, 2))
+        legend_x = 342 if sim.control_mode is not ControlMode.AUTO else 12
+        surface.blit(legend_chip, (legend_x, 126))
 
     def _draw_detection_brackets(
         self,
@@ -1429,6 +1617,7 @@ class WorldRenderer:
                 recorded_camera,
                 GREEN if check.result_inside else AMBER,
                 2,
+                self.DEFAULT_PRESENTATION_FOV_DEG,
             )
             marker_position = (
                 check.projected_truth
@@ -1440,6 +1629,7 @@ class WorldRenderer:
                 recorded_camera,
                 inset_rect.width,
                 inset_rect.height,
+                self.DEFAULT_PRESENTATION_FOV_DEG,
             )
             if projected:
                 pygame.draw.circle(
@@ -1524,7 +1714,7 @@ class WorldRenderer:
 
         surface.blit(
             self.font_tiny.render(
-                f"VIEW: {self.get_view_camera(sim).name}   [V] SWITCH   [F3] SPECTATOR   [RMB] LOOK   [F1] INFO   [H] KEYS",
+                f"VIEW: {self.get_view_camera(sim).name}   ZOOM x{self.zoom_multiplier:.2f} [WHEEL]   [V] SWITCH   [F3] SPECTATOR   [RMB] LOOK   [F1] INFO   [H] KEYS",
                 True,
                 MUTED,
             ),
@@ -1571,7 +1761,15 @@ class WorldRenderer:
                 ),
                 WHITE if sim.visual_locked else AMBER,
             ),
-            ("SCENARIO", dict(SCENARIOS)[sim.config.scenario]),
+            (
+                "SCENARIO",
+                (
+                    f"TRICKY: {sim.evader_decision}"
+                    if sim.config.scenario == "tricky"
+                    else dict(SCENARIOS)[sim.config.scenario]
+                ),
+                AMBER if sim.config.scenario == "tricky" else WHITE,
+            ),
         ]
 
         estimate = sim.range_estimate
@@ -1955,7 +2153,7 @@ class WorldRenderer:
                     "COLOR AND COMPLETE-EDGE RULE",
                     [
                         "GREEN border: every one of the 96 displayed edge directions is reachable; this oval may be selected.",
-                        "RED border: at least one edge direction is unavailable; the label reports the complete count.",
+                        "RED border: no edge directions are reachable. A mixed red/green border shows exactly which edge portions pass.",
                         "Four large cardinal markers remain as a simple 4/4 explanation, but they do not decide the border color.",
                         "AMBER dots are the unchanged-velocity trajectory, not a partially valid oval.",
                     ],
@@ -2012,6 +2210,7 @@ class WorldRenderer:
                         "W/S request forward/reverse or deceleration; A/D turn; Q/E change and then hold altitude; Shift requests full authority; Ctrl uses an available airbrake.",
                         "Commands still pass through thrust direction, stall/lift, turn rate, speed, drag, gravity, and the two-metre floor.",
                         "When our drone is manual, the oval solution remains visible only as an advisory.",
+                        "TRICKY AI assumes the target knows our true approach, then chooses deterministic jinks, traps, climbs, and sprints within that target's physical limits.",
                     ],
                 ),
             )
@@ -2032,17 +2231,17 @@ class WorldRenderer:
                     [
                         "V cycles onboard sensor, chase, and spectator/tactical views. The fixed boresight appears only onboard.",
                         "F3 jumps directly to the spectator view, which watches both vehicles and is not attached to either pilot.",
-                        "Right mouse captures unlimited presentation free-look; Shift+right mouse rolls; C centers.",
-                        "Presentation free-look never changes the sensor, oval plane, detection, or guidance calculation.",
+                        "Right mouse captures unlimited presentation free-look; Shift+right mouse rolls; the wheel zooms; C centers and resets zoom.",
+                        "Presentation free-look and zoom never change the 90-degree sensor, oval plane, detection, or guidance calculation.",
                     ],
                 ),
                 (
                     "PROOF BOUNDARY",
                     [
-                        "Target truth is used only to render the synthetic image, resolve contact, and feed the expanded verification window.",
-                        "The generic detector and signal lookup are deterministic simulation adapters, not deployed YOLO/DINO or radio hardware.",
-                        "The meshes and aerodynamics are presentation-grade prototypes; production work needs calibrated cameras, wind, latency, uncertainty, and hardware tests.",
-                        "CHECK 2s records an old virtual camera frame; it can verify the target at T+2 even after the live camera moves.",
+                        "Defense guidance never reads target truth; truth only renders the synthetic image, resolves contact, and supports verification.",
+                        "TRICKY AI is the declared exception: only its target autopilot knows our approach; it cannot feed our sensor or guidance.",
+                        "Detector, signal lookup, meshes, and aerodynamics are deterministic presentation adapters, not deployed hardware.",
+                        "CHECK 2s records an old camera frame and evaluates truth at T+2.",
                     ],
                 ),
                 (
@@ -2108,7 +2307,8 @@ class WorldRenderer:
             ("V", "cycle onboard, chase, and spectator cameras"),
             ("RMB HOLD", "capture mouse for unlimited free look"),
             ("SHIFT+RMB", "roll the presentation camera"),
-            ("C", "center the free-look camera"),
+            ("WHEEL", "zoom presentation view without changing the sensor"),
+            ("C", "center free look and reset presentation zoom"),
             ("F1", "open the full four-page system reference"),
             ("F2", "open range-error and resolution analysis"),
             ("F3", "jump directly to spectator / tactical view"),
@@ -2146,7 +2346,7 @@ class WorldRenderer:
         for key, description in presentation_items:
             overlay.blit(self.font_bold.render(key, True, CYAN), (card.x + 36, y))
             overlay.blit(self.font_tiny.render(description, True, WHITE), (card.x + 138, y + 2))
-            y += 24
+            y += 22
         y = card.y + 108
         for key, description in flight_items:
             color = GREEN if key == "GREEN" else AMBER if key == "AMBER" else RED if key == "RED" else CYAN
@@ -2165,7 +2365,7 @@ class WorldRenderer:
         notes = [
             "Every oval shares the target plane perpendicular to the sensor.",
             "Its border contains the modeled projected maneuvers plus bounded track uncertainty.",
-            "Green = all 96 edge directions reachable; four large dots remain the cardinal summary.",
+            "Green/red segments show each edge result; only a fully green 96/96 oval is selectable.",
             "True range is simulation verification only, never guidance input.",
         ]
         y = separator_y + 12

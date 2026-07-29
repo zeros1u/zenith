@@ -278,6 +278,61 @@ def _manta_heavy() -> VehicleMesh:
     return mesh.build()
 
 
+def _smart_evader_ufo() -> VehicleMesh:
+    """Directional saucer: pointed nose and twin tail drives show +Z clearly."""
+    mesh = MeshBuilder()
+    # Main saucer and raised canopy.
+    mesh.add_cylinder(
+        Vec3(0, 0, -0.02),
+        0.47,
+        0.13,
+        20,
+        "body",
+        Vec3(math.pi / 2, 0, 0),
+    )
+    mesh.add_cylinder(
+        Vec3(0, 0.09, 0.05),
+        0.23,
+        0.12,
+        16,
+        "accent",
+        Vec3(math.pi / 2, 0, 0),
+    )
+    # A long arrowhead breaks the circular symmetry and marks the flight nose.
+    mesh.add_prism_xz(
+        [(0, 0.58), (0.25, 0.13), (0, 0.22), (-0.25, 0.13)],
+        0.10,
+        "accent",
+        Vec3(0, 0.01, 0),
+    )
+    mesh.add_prism_xz(
+        [(0, 0.43), (0.08, -0.31), (0, -0.42), (-0.08, -0.31)],
+        0.045,
+        "dark",
+        Vec3(0, -0.08, 0),
+    )
+    # Swept stabilisers and two unmistakable rear engine apertures.
+    mesh.add_prism_xz(
+        [(0.18, -0.12), (0.48, -0.34), (0.29, -0.42), (0.10, -0.24)],
+        0.055,
+        "metal",
+    )
+    mesh.add_prism_xz(
+        [(-0.18, -0.12), (-0.48, -0.34), (-0.29, -0.42), (-0.10, -0.24)],
+        0.055,
+        "metal",
+    )
+    for x in (-0.19, 0.19):
+        mesh.add_cylinder(
+            Vec3(x, 0, -0.39),
+            0.075,
+            0.10,
+            12,
+            "glow",
+        )
+    return mesh.build()
+
+
 def _rocket(long_body: bool = False) -> VehicleMesh:
     mesh = MeshBuilder()
     radius = 0.13 if not long_body else 0.11
@@ -300,6 +355,7 @@ MESHES: dict[str, VehicleMesh] = {
     "compact_quad": _compact_quad(),
     "talon_delta": _talon_delta(),
     "manta_heavy": _manta_heavy(),
+    "smart_evader_ufo": _smart_evader_ufo(),
     "rocket_skyfall": _rocket(False),
     "rocket_lance": _rocket(True),
 }

@@ -336,7 +336,7 @@ class SetupScreen:
         footer_y = height - 38
         pygame.draw.line(surface, (39, 76, 89), (left, footer_y - 10), (left + content_width, footer_y - 10))
         footer = (
-            "Five drones + two rockets selectable on both sides • place both vehicles • no radar/lidar/rangefinder • "
+            "Six drones + two rockets selectable on both sides • place both vehicles • no radar/lidar/rangefinder • "
             "ground truth is verification-only"
         )
         surface.blit(self.small.render(footer, True, MUTED), (left, footer_y))
@@ -421,7 +421,10 @@ class SetupScreen:
 
 
 def run_headless(args: argparse.Namespace) -> int:
-    target_code = "SR1" if args.scenario == "rocket_attack" else "FX1"
+    target_code = {
+        "rocket_attack": "SR1",
+        "tricky": "SEV",
+    }.get(args.scenario, "FX1")
     config = SimulationConfig(scenario=args.scenario, target_code=target_code)
     simulation = InterceptionSimulation(config)
     steps = args.headless_steps if args.headless_steps is not None else 600
@@ -491,6 +494,9 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                 "target_model",
                 "interceptor_model",
                 "scenario",
+                "target_ai_state",
+                "target_ai_threat_range_m_truth_assumption",
+                "target_ai_closing_speed_m_s_truth_assumption",
             ]
         )
         for sample in simulation.telemetry:
@@ -533,6 +539,17 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                     simulation.target.spec.name,
                     simulation.interceptor.spec.name,
                     simulation.config.scenario,
+                    sample.target_ai_state,
+                    (
+                        ""
+                        if sample.target_ai_threat_range_m is None
+                        else f"{sample.target_ai_threat_range_m:.6f}"
+                    ),
+                    (
+                        ""
+                        if sample.target_ai_closing_speed_mps is None
+                        else f"{sample.target_ai_closing_speed_mps:.6f}"
+                    ),
                 ]
             )
     return output
@@ -630,6 +647,15 @@ def run_interactive() -> int:
                 continue
 
             if simulation is None:
+                continue
+            if (
+                event.type == pygame.MOUSEWHEEL
+                and not analysis_open
+                and not help_open
+                and not info_open
+                and not renderer.settings_visible
+            ):
+                renderer.adjust_zoom(event.y)
                 continue
             if (
                 event.type == pygame.MOUSEBUTTONDOWN

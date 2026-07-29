@@ -4,4 +4,5 @@ weave,True,True,6.983,0.0,9.222,14.955,54
 evasive,True,True,7.15,0.0,5.939,8.76,56
 braking,True,True,5.8,0.0,13.003,19.233,41
 rotating,True,True,6.733,0.0,6.935,11.304,52
+tricky,True,True,8.0,0.0,2.505,3.952,62
 rocket_attack,True,True,2.0,0.0,5.416,7.582,11

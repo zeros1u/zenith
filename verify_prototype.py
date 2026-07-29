@@ -12,7 +12,10 @@ from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfi
 
 
 def verify_scenario(scenario: str, duration_s: float) -> dict[str, object]:
-    target_code = "SR1" if scenario == "rocket_attack" else "FX1"
+    target_code = {
+        "rocket_attack": "SR1",
+        "tricky": "SEV",
+    }.get(scenario, "FX1")
     sim = InterceptionSimulation(
         SimulationConfig(scenario=scenario, target_code=target_code)
     )

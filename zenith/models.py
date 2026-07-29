@@ -127,6 +127,23 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         stall_speed=14.0,
         lift_efficiency=0.72,
     ),
+    DroneSpec(
+        "SEV",
+        "SMART EVADER",
+        (76, 236, 214),
+        Vec3(1.45, 0.38, 1.62),
+        86.0,
+        24.0,
+        30.0,
+        24.0,
+        0.0011,
+        "Sensor-aware adaptive evasion demonstrator",
+        "smart_evader_ufo",
+        flight_model="vectored_vtol",
+        max_turn_rate_deg=145.0,
+        stall_speed=0.0,
+        lift_efficiency=0.0,
+    ),
 )
 
 

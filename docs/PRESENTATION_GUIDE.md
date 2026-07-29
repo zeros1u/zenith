@@ -24,7 +24,7 @@ Point to the 1, 2, 3, and 5 second ovals:
 - the pixel ellipse is back-projected onto one plane through the estimated target, perpendicular to the sensor;
 - propulsion support, perspective, and track uncertainty make the border an outer bound under the stated model;
 - four large points remain the cardinal explanation, while all 96 rendered edge directions are tested;
-- green means `96/96`; red reports the complete count, and grey reports an unbounded camera crossing;
+- green edge segments pass our reachability check, red segments fail, a mixed edge is only partially reachable, and grey reports an unbounded camera crossing;
 - an unreachable oval remains visible and red instead of disappearing;
 - the largest green oval uses a confidence-weighted likely-motion point limited to 65% of its radius;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
@@ -42,7 +42,7 @@ Point out:
 
 Press `O` once. Point out that the detection brackets, metric readout, ovals, and maneuver guidance all disappear immediately. The fixed camera cannot follow the missing target. Autonomy turns the interceptor body using the last image bearing and bearing rate, without target truth. Press `O` again; only a target that physically re-enters the nose-mounted camera FOV can reacquire lock and restart guidance.
 
-Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Explain that this is a presentation-camera offset: it does not rotate the actual sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered sensor presentation.
+Hold the right mouse button to capture the pointer and inspect the scene without being stopped by a window edge. Hold `Shift` while moving the mouse to roll the horizon and view the prediction plane obliquely. Use the wheel to zoom. Explain that these are presentation-camera changes: they do not rotate or zoom the actual 90° sensor or change guidance, and vehicle keys are suppressed during capture. Release the right button to restore the pointer, then press `C` to return to the centered, default-zoom presentation.
 
 Press `F3` for the independent spectator/tactical camera. This is the clearest view for proving that the target and all four ovals occupy the same plane. Press `F1` at any time for the four-page explanation of every coordinate, color, force, guidance state, camera, and verification boundary.
 
@@ -55,10 +55,11 @@ Use `N` to show the selectable behaviors and threats:
 - weave tests continuous side motion;
 - evasive tests changing acceleration direction;
 - airbrake tests nonlinear speed changes;
-- rotating target tests apparent-size changes.
+- rotating target tests apparent-size changes;
+- tricky AI assumes the enemy knows our approach and reacts with physically bounded jinks, vertical breaks, sprints, speed shifts, and brake traps;
 - rocket attack selects a fast incoming target with rocket-specific physics and status.
 
-The six-scenario verifier can be shown from a terminal:
+The seven-scenario verifier can be shown from a terminal:
 
 ```powershell
 python verify_prototype.py
@@ -118,16 +119,25 @@ No. The renderer now uses original low-poly meshes with rotors, arms, fuselages,
 
 Yes. `Tab` cycles from autonomy to our interceptor, then to the target, then back to autonomy. `W/S` requests forward/reverse or braking, `A/D` turns, `Q/E` changes altitude, `Shift` requests full authority, and `Ctrl` uses an available airbrake. The colored authority row proves that a multirotor, fixed wing, and rocket do not receive the same capabilities. The player command still passes through the exact propulsion physics used by autonomous guidance.
 
+### “Does the Smart Evader cheat?”
+
+Only its explicitly labeled `TRICKY AI` target autopilot is allowed to know our true approach, because that test assumes an informed enemy. It uses that knowledge to choose its own deterministic maneuver, then obeys the target's normal acceleration, speed, turn, airbrake, drag, and gravity limits. The defense camera, tracker, ovals, and guidance receive no truth from it.
+
+### “Does mouse-wheel zoom improve detection?”
+
+No. It changes only the presentation camera used to inspect the scene. The synthetic defense sensor remains at its configured 90° field of view, so zoom cannot acquire a target, preserve lock, change an oval, or improve the range calculation.
+
 ## A clean live-demo sequence
 
 1. Start `run_zenith.bat`.
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
 3. Start and wait for signal confirmation.
 4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it and press `C` to center.
-5. Press `F3` for spectator view and show the common target plane. Red means at least one of 96 edge directions failed even if all four cardinal dots are green.
+5. Scroll to demonstrate presentation zoom, then press `F3` for spectator view and show the common target plane. Green/red edge segments show exactly which of the 96 directions pass, while only a completely green loop may be selected.
 6. Press `M` for the estimated-track map, then `G` for the saved-camera two-second check.
 7. Press `Tab` for our-vehicle control. Demonstrate drone gravity/lift with `X`, then restore autonomy.
 8. Press `F1` for the oval/aerodynamics reference, then `F2` for range degradation.
+9. Press `N`, select `SMART EVADER` plus `TRICKY AI`, and point to its live decision in the Target panel. Explain that target awareness is the declared adversary test assumption and remains isolated from defense guidance.
 9. Return onboard, press `O` to prove guidance loss, then restore the image and reacquire.
 10. Start a new run with `SKYFALL-R1` or `LANCE-M2` as **our interceptor**. Show automatic burn, RCS steering, and burnout; rockets remain available as incoming threats.
 11. Press `F5` to export the proof data.

@@ -4,13 +4,15 @@
 
 ZENITH is a proof-of-concept onboard software system that tells an interceptor which maneuver to execute using one monocular camera. Target model information is given by the exercise and is represented operationally as a signal lookup that starts only after a generic visual drone detection.
 
-The guidance algorithm does not read simulated target coordinates. Simulation truth has three isolated uses:
+The defense guidance algorithm does not read simulated target coordinates. Simulation truth has three isolated defense-side uses:
 
 1. creating the synthetic camera observation;
 2. detecting physical contact and applying crash physics;
 3. producing the marked `TRUE / ERROR` value and exported verification data.
 
 Our interceptor's position and velocity are propagated from its own commanded acceleration, which represents normal onboard inertial/state estimation. No external target range sensor is modeled.
+
+The optional `TRICKY AI` adversary is an explicit test-harness exception to this truth boundary. That scenario assumes the enemy knows about the interceptor, so only the target's own autopilot reads true relative range and closing speed to choose a maneuver. It cannot write to the detector, target track, oval solver, or interceptor command.
 
 ## 2. Coordinate system
 
@@ -31,7 +33,7 @@ Let the camera forward unit vector be **f**. Then:
 
 The target and interceptor define the line of sight. A plane perpendicular to that line is spanned by **r** and **u**, allowing the four oval-extreme calculations to be treated as a 2D reachability problem while the drones remain in a 3D world.
 
-The interactive renderer also has an independent presentation-camera offset. Right-button drag changes presentation yaw/pitch, `Shift` plus right-button drag changes screen roll, and `C` recenters it. These offsets never modify `camera_forward`, detections, tracking, or guidance; they only allow the already-calculated 3D result to be inspected from another angle.
+The interactive renderer also has an independent presentation-camera offset. Right-button drag changes presentation yaw/pitch, `Shift` plus right-button drag changes screen roll, the mouse wheel changes a bounded 24°–100° presentation field of view, and `C` recenters and resets zoom. These offsets never modify the configured 90° sensor, `camera_forward`, detections, tracking, or guidance; they only allow the already-calculated 3D result to be inspected from another angle.
 
 ## 3. Monocular pinhole range
 
@@ -185,7 +187,7 @@ radius X        = (support(+X) + support(-X)) t² / 4 × containment factor
 
 The orange dots show the unchanged-velocity trajectory inside the smallest oval.
 
-Four large cardinal points remain visible, but their connecting diamond does not cover diagonal ellipse points. The actual decision evaluates all 96 directions that render the border. Green means `96/96`; red reports the complete count; grey reports an invalid/unbounded horizon. Cardinal colors remain a readable summary and amber remains the unchanged-motion trajectory.
+Four large cardinal points remain visible, but their connecting diamond does not cover diagonal ellipse points. The actual decision evaluates all 96 directions that render the border. Each passing border segment is green and each failing segment is red; only a complete green `96/96` loop is selectable. Grey reports an invalid/unbounded horizon. Cardinal colors remain a readable summary and amber remains the unchanged-motion trajectory.
 
 ## 9. Reachability and maneuver choice
 
@@ -251,22 +253,23 @@ During target loss, player control of our interceptor overrides the automatic bo
 
 ## 12. Robustness evidence
 
-Six deterministic behaviors are included:
+Seven deterministic behaviors are included:
 
 - steady flight;
 - lateral/vertical weave;
 - piecewise evasive maneuvers;
 - repeated airbraking;
-- continuous target rotation.
+- continuous target rotation;
+- threat-aware tricky AI with speed shifts, lateral/vertical breaks, brake traps, and escape acceleration;
 - an incoming rocket attack.
 
-`verify_prototype.py` executes all six and reports identification, hit time, minimum separation, and range error. The rocket-attack row uses the SKYFALL-R1 target. The current checked-in verification report is `artifacts/verification.csv`.
+`verify_prototype.py` executes all seven and reports identification, hit time, minimum separation, and range error. The tricky row uses SMART EVADER deterministically through the same physically bounded integration as every other target; the rocket-attack row uses SKYFALL-R1. The current checked-in verification report is `artifacts/verification.csv`.
 
 Rotation is handled by known-model pose-compensated physical spans. Maneuvers are handled by the alpha-beta track, model acceleration limits, four-extreme ovals, and terminal velocity matching.
 
 ## 13. Known prototype boundaries
 
-- Five original low-poly drone meshes and two original rocket meshes are bundled. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
+- Six original low-poly drone meshes and two original rocket meshes are bundled. The SMART EVADER uses a saucer body, pointed +Z nose, stabilizers, keel, and twin rear drives so its direction remains unambiguous. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
 - The generic detector backend deterministically emits the synthetic camera bounding box. It represents the output contract of YOLO/DINO, not a trained neural network.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
 - The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
