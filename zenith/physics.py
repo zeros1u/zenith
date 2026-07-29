@@ -111,6 +111,16 @@ class DroneState:
         pose = Vec3(self.orientation.x, self.orientation.y, 0.0)
         return rotate_euler(WORLD_FORWARD, pose).normalized(WORLD_FORWARD)
 
+    def sensor_direction(self) -> Vec3:
+        """Rigid body-fixed camera axis, including a published mount cant."""
+        pose = Vec3(
+            self.orientation.x
+            + math.radians(self.spec.camera_mount_pitch_deg),
+            self.orientation.y,
+            0.0,
+        )
+        return rotate_euler(WORLD_FORWARD, pose).normalized(WORLD_FORWARD)
+
     def _drag_acceleration(self) -> Vec3:
         speed = self.velocity.length()
         passive_drag = self.velocity * (-self.spec.drag_coefficient * speed)
@@ -181,7 +191,12 @@ class DroneState:
         # sideways while maintaining altitude. Work in vertical/horizontal
         # components so a requested descent cannot be reflected through the
         # tilt cone into a large *upward* thrust vector.
-        max_tilt = math.radians(58.0 if self.spec.flight_model == "multirotor" else 46.0)
+        max_tilt_deg = (
+            self.spec.max_body_tilt_deg
+            if self.spec.max_body_tilt_deg > 0.0
+            else 58.0 if self.spec.flight_model == "multirotor" else 46.0
+        )
+        max_tilt = math.radians(max_tilt_deg)
         if self.engine_enabled:
             requested_vertical_thrust = max(
                 0.0,

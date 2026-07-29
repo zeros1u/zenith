@@ -106,6 +106,7 @@ class SetupScreen:
         self.target_index = 0
         self.scenario_index = 2
         self.sensor_index = 1
+        self.enemy_count = 1
         self.display_index = min(
             range(len(DISPLAY_OPTIONS)),
             key=lambda index: abs(DISPLAY_OPTIONS[index][0] - size[0])
@@ -267,7 +268,7 @@ class SetupScreen:
             ),
             (50, 82),
         )
-        pipeline = "VISUAL DETECTION  >  SIGNAL LOOKUP  >  PINHOLE RANGE  >  OVAL REACHABILITY  >  MANEUVER"
+        pipeline = "SYNTHETIC DETECTOR [YOLO/DINO ADAPTER INTERFACE]  >  SIGNAL LOOKUP  >  PINHOLE RANGE  >  OVALS  >  MANEUVER"
         surface.blit(self.small.render(pipeline, True, MUTED), (50, 113))
 
         content_width = min(1260, width - 90)
@@ -327,6 +328,26 @@ class SetupScreen:
                 index == self.sensor_index,
             )
 
+        contacts_x = left + 500
+        surface.blit(
+            self.small.render("ENEMY CONTACTS", True, MUTED),
+            (contacts_x, options_y),
+        )
+        for count in (1, 2, 3):
+            self._button(
+                surface,
+                f"enemy_count_{count}",
+                pygame.Rect(
+                    contacts_x + (count - 1) * 47,
+                    options_y + 23,
+                    40,
+                    38,
+                ),
+                str(count),
+                count == self.enemy_count,
+                TARGET_SPECS[self.target_index].color,
+            )
+
         launch_rect = pygame.Rect(left + content_width - 310, options_y + 16, 310, 54)
         self._button(surface, "launch", launch_rect, "START 60 Hz SIMULATION", True, GREEN)
         if self.error:
@@ -373,6 +394,8 @@ class SetupScreen:
                 self.scenario_index = int(key.split("_")[1])
             elif key.startswith("sensor_"):
                 self.sensor_index = int(key.split("_")[1])
+            elif key.startswith("enemy_count_"):
+                self.enemy_count = int(key.rsplit("_", 1)[1])
             elif key.startswith("display_"):
                 self.display_index = int(key.split("_")[1])
                 self.display_request = DISPLAY_OPTIONS[self.display_index]
@@ -409,6 +432,11 @@ class SetupScreen:
             self.error = "Both drones must start at least 2 m above ground."
             return None
         resolution = SENSOR_OPTIONS[self.sensor_index]
+        enemy_count = (
+            1
+            if TARGET_SPECS[self.target_index].vehicle_type == "rocket"
+            else self.enemy_count
+        )
         self.error = ""
         return SimulationConfig(
             interceptor_code=INTERCEPTOR_SPECS[self.interceptor_index].code,
@@ -417,6 +445,7 @@ class SetupScreen:
             target_position=target,
             scenario=SCENARIOS[self.scenario_index][0],
             camera=CameraModel(resolution[0], resolution[1], 90.0),
+            enemy_count=enemy_count,
         )
 
 
@@ -490,6 +519,10 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                 "interceptor_rcs_remaining_s",
                 "target_booster_remaining_s",
                 "target_rcs_remaining_s",
+                "active_contact_id",
+                "visible_contacts",
+                "total_contacts",
+                "priority_score_camera_tracks",
                 "target_type",
                 "target_model",
                 "interceptor_model",
@@ -535,8 +568,12 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                     f"{sample.interceptor_rcs_remaining_s:.6f}",
                     f"{sample.target_burn_remaining_s:.6f}",
                     f"{sample.target_rcs_remaining_s:.6f}",
-                    simulation.target.spec.vehicle_type,
-                    simulation.target.spec.name,
+                    sample.active_contact_id,
+                    sample.visible_contacts,
+                    sample.total_contacts,
+                    f"{sample.priority_score:.6f}",
+                    sample.target_type,
+                    sample.target_model,
                     simulation.interceptor.spec.name,
                     simulation.config.scenario,
                     sample.target_ai_state,

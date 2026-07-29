@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import Protocol, runtime_checkable
 
 from .math3d import (
     Vec3,
@@ -50,6 +51,26 @@ class Detection:
     camera_depth: float
     projected_vertices: tuple[tuple[float, float], ...]
     pose_estimate: Vec3 | None = None
+
+
+@runtime_checkable
+class ImageDetectorAdapter(Protocol):
+    """Optional boundary for YOLO/DINO-style sensor-frame integrations.
+
+    ZENITH's self-contained demo uses ``detect_box`` as a deterministic
+    synthetic image-recognition adapter. A real backend can implement this
+    protocol and return the same image-space observations without changing
+    tracking, ranging, prediction, or guidance.
+    """
+
+    name: str
+
+    def detect_frame(
+        self,
+        frame: object,
+        timestamp_s: float,
+    ) -> tuple[Detection, ...]:
+        ...
 
 
 @dataclass(slots=True)

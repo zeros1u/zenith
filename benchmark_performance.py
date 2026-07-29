@@ -20,9 +20,9 @@ FIXED_STEP = 1.0 / 60.0
 BENCHMARK_SIZE = (1050, 700)
 
 
-def simulation_ticks_per_second(ticks: int) -> float:
+def simulation_ticks_per_second(ticks: int, enemy_count: int = 1) -> float:
     simulation = InterceptionSimulation(
-        SimulationConfig(scenario="evasive")
+        SimulationConfig(scenario="evasive", enemy_count=enemy_count)
     )
     started = time.perf_counter()
     for _ in range(ticks):
@@ -31,9 +31,9 @@ def simulation_ticks_per_second(ticks: int) -> float:
     return ticks / max(elapsed, 1e-9)
 
 
-def complete_frames_per_second(frames: int) -> float:
+def complete_frames_per_second(frames: int, enemy_count: int = 1) -> float:
     simulation = InterceptionSimulation(
-        SimulationConfig(scenario="evasive")
+        SimulationConfig(scenario="evasive", enemy_count=enemy_count)
     )
     for _ in range(120):
         simulation.step(FIXED_STEP)
@@ -55,6 +55,13 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--ticks", type=int, default=300)
     parser.add_argument("--frames", type=int, default=120)
+    parser.add_argument(
+        "--enemies",
+        type=int,
+        choices=(1, 2, 3),
+        default=1,
+        help="number of independently tracked enemy contacts",
+    )
     args = parser.parse_args()
     if min(args.repeats, args.ticks, args.frames) <= 0:
         parser.error("repeats, ticks, and frames must be positive")
@@ -63,11 +70,11 @@ def main() -> int:
     gc.disable()
     try:
         tick_results = [
-            simulation_ticks_per_second(args.ticks)
+            simulation_ticks_per_second(args.ticks, args.enemies)
             for _ in range(args.repeats)
         ]
         frame_results = [
-            complete_frames_per_second(args.frames)
+            complete_frames_per_second(args.frames, args.enemies)
             for _ in range(args.repeats)
         ]
     finally:
@@ -78,7 +85,8 @@ def main() -> int:
     frame_median = statistics.median(frame_results)
     print(
         f"physics + guidance: {tick_median:.1f} ticks/s "
-        f"({tick_median / 60.0:.1f}x required 60 Hz)"
+        f"({tick_median / 60.0:.1f}x required 60 Hz), "
+        f"{args.enemies} contact(s)"
     )
     print(
         f"world + HUD + one tick: {frame_median:.1f} frames/s "

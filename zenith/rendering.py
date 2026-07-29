@@ -84,7 +84,7 @@ class WorldRenderer:
         self.presentation_fov_deg = self.DEFAULT_PRESENTATION_FOV_DEG
         self.panel_expanded = {
             "target": True,
-            "calculations": False,
+            "calculations": True,
             "own": True,
             "relative": True,
         }
@@ -229,7 +229,7 @@ class WorldRenderer:
             if key == "panels_reset":
                 self.panel_expanded = {
                     "target": True,
-                    "calculations": False,
+                    "calculations": True,
                     "own": True,
                     "relative": True,
                 }
@@ -287,7 +287,7 @@ class WorldRenderer:
             else:
                 base = ViewCamera(
                     followed.position,
-                    followed.forward_direction(),
+                    followed.sensor_direction(),
                     f"ONBOARD / {followed.spec.code} PLAYER",
                 )
         elif self.view_mode == 1:
@@ -1101,17 +1101,27 @@ class WorldRenderer:
                     False,
                 )
             )
-        if sim.target is not camera_vehicle:
+        for index, contact in enumerate(sim.contacts):
+            target = contact.vehicle
+            if target is camera_vehicle:
+                continue
+            active = index == sim.active_contact_index
+            if sim.control_mode is ControlMode.TARGET and active:
+                label = f"PLAYER // {contact.track_id} // {target.spec.code}"
+            elif active:
+                label = f"PRIORITY // {contact.track_id} // {target.spec.code}"
+            else:
+                label = f"CONTACT // {contact.track_id}"
             drone_draws.append(
                 (
-                    camera_coordinates(sim.target.position, camera.position, camera.forward).z,
-                    sim.target,
-                    (
-                        f"PLAYER // TARGET // {sim.target.spec.code}"
-                        if sim.control_mode is ControlMode.TARGET
-                        else "TARGET"
-                    ),
-                    sim.visual_locked,
+                    camera_coordinates(
+                        target.position,
+                        camera.position,
+                        camera.forward,
+                    ).z,
+                    target,
+                    label,
+                    contact.visual_locked,
                 )
             )
         target_bounds = None
@@ -1421,6 +1431,14 @@ class WorldRenderer:
         points.extend(self.estimated_target_trail[-80:])
         if estimated is not None:
             points.append(estimated)
+        for contact in sim.contacts:
+            contact_estimate = (
+                contact.track.position
+                if contact.track.position is not None
+                else contact.last_estimated_position
+            )
+            if contact_estimate is not None:
+                points.append(contact_estimate)
         min_x = min(point.x for point in points)
         max_x = max(point.x for point in points)
         min_z = min(point.z for point in points)
@@ -1497,6 +1515,32 @@ class WorldRenderer:
                     target_color,
                 ),
                 (target_px[0] + 8, target_px[1] - 7),
+            )
+        for index, contact in enumerate(sim.contacts):
+            if index == sim.active_contact_index:
+                continue
+            contact_estimate = (
+                contact.track.position
+                if contact.track.position is not None
+                else contact.last_estimated_position
+            )
+            if contact_estimate is None:
+                continue
+            altitude_delta = contact_estimate.y - own.y
+            brightness = clamp(0.55 + altitude_delta / 100.0, 0.28, 1.0)
+            contact_color = tuple(
+                int(channel * brightness)
+                for channel in contact.vehicle.spec.color
+            )
+            contact_px = map_point(contact_estimate)
+            pygame.draw.circle(panel, contact_color, contact_px, 4, 1)
+            panel.blit(
+                self.font_tiny.render(
+                    contact.track_id,
+                    True,
+                    contact_color,
+                ),
+                (contact_px[0] + 6, contact_px[1] - 6),
             )
 
         panel.blit(
@@ -1721,7 +1765,10 @@ class WorldRenderer:
         status_text = self.font_bold.render(sim.status, True, status_color)
         top.blit(status_text, (width - status_text.get_width() - 20, 10))
         details = self.font_tiny.render(
-            f"T+ {sim.time_s:06.2f}s   TIME x{time_scale:g}   {fps:4.0f} FPS   SENSOR {sim.config.camera.width_px}x{sim.config.camera.height_px}",
+            f"T+ {sim.time_s:06.2f}s   TIME x{time_scale:g}   {fps:4.0f} FPS   "
+            f"CONTACTS {sim.visible_contact_count}/{len(sim.contacts)}   "
+            f"PRIORITY {sim.active_contact.track_id}   "
+            f"SENSOR {sim.config.camera.width_px}x{sim.config.camera.height_px}",
             True,
             MUTED,
         )
@@ -1754,7 +1801,11 @@ class WorldRenderer:
         panel_width = (width - margin * 2 - gap * 3) // 4
         panel_height_expanded = 190
 
-        target_name = sim.target.spec.name if sim.identity_confirmed else "???"
+        target_name = (
+            f"{sim.active_contact_label} {sim.target.spec.name}"
+            if sim.identity_confirmed
+            else f"{sim.active_contact_label} ???"
+        )
         target_axial_accel = (
             sim.track.acceleration.dot(sim.track.velocity.normalized())
             if sim.track.velocity.length() > 0.2
@@ -1796,6 +1847,15 @@ class WorldRenderer:
         else:
             relative_camera = Vec3()
         calc_rows = [
+            (
+                "DETECTOR",
+                (
+                    "SYNTHETIC BOX + POSE"
+                    if sim.config.detector_backend == "synthetic_projection"
+                    else sim.config.detector_backend.upper()
+                ),
+                CYAN,
+            ),
             ("FORMULA", "Z = f × S / p", CYAN),
             ("FOCAL LENGTH", f"{sim.config.camera.focal_px:.1f} px"),
             ("LAST APPARENT / CONF" if sim.hit else "APPARENT / CONF", f"{max(sim.detection.width_px, sim.detection.height_px):.2f} px / {sim.detection.confidence*100:.0f}%"),
@@ -1891,10 +1951,15 @@ class WorldRenderer:
                     ),
                     MUTED,
                 ),
+                (
+                    "PRIORITY SCORE",
+                    f"{sim.active_contact.priority_score:.1f} / IMAGE TRACKS",
+                    CYAN,
+                ),
             ]
 
         panels = (
-            ("target", "TARGET VEHICLE", target_rows),
+            ("target", "PRIORITY TARGET", target_rows),
             ("calculations", "CALCULATIONS", calc_rows),
             ("own", "OUR VEHICLE", own_rows),
             ("relative", "RELATIVE", relative_rows),
@@ -2119,7 +2184,8 @@ class WorldRenderer:
                 (
                     "SENSOR PIPELINE",
                     [
-                        "No trained neural detector is bundled: a deterministic synthetic adapter returns a 2D box, center keypoint, bearing, subpixel size, confidence, and visual pose estimate.",
+                        "SYNTHETIC BOX + POSE is the honest default: ImageDetectorAdapter is the optional YOLO/DINO sensor-frame boundary; no weights are falsely claimed.",
+                        f"{len(sim.contacts)} contacts run independent boxes, signal timers, ranges, tracks, ovals, and guidance; {sim.active_contact.track_id} is camera-priority.",
                         "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
                         "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
                         f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
@@ -2138,8 +2204,8 @@ class WorldRenderer:
                 (
                     "THE FOUR BOTTOM PANELS",
                     [
-                        "TARGET VEHICLE: signal-resolved dimensions and maneuver limits.",
-                        "CALCULATIONS: measured pixels, confidence, range uncertainty, and Dx/Dy/Dz.",
+                        "PRIORITY TARGET: selected contact ID, signal-resolved dimensions, and maneuver limits.",
+                        "CALCULATIONS: detector, measured pixels, confidence, range uncertainty, and Dx/Dy/Dz; expanded by default.",
                         "OUR VEHICLE: integrated position, velocity, acceleration, engine/lift, and rocket fuel where applicable.",
                         "RELATIVE: image-track relative velocity, closing time, guidance, full-edge reachability, and track uncertainty.",
                     ],
@@ -2148,6 +2214,7 @@ class WorldRenderer:
                     "WHAT IS VERIFIABLE",
                     [
                         f"Sensor: {sim.config.camera.width_px} x {sim.config.camera.height_px}, focal length {sim.config.camera.focal_px:.1f} px.",
+                        f"Contacts visible/identified: {sim.visible_contact_count}/{sim.identified_contact_count} of {len(sim.contacts)}.",
                         f"Detected span: {max(sim.detection.width_px, sim.detection.height_px):.2f} px.",
                         f"True range: {sim.true_range_m:.2f} m [verification only].",
                         "F2 opens the resolution/error graph. F5 exports every sampled estimate and its marked truth comparison.",
@@ -2248,6 +2315,7 @@ class WorldRenderer:
                     "CAMERA AND SPECTATOR MODES",
                     [
                         "V cycles onboard sensor, chase, and spectator/tactical views. The fixed boresight appears only onboard.",
+                        "Aegis-Q4 and Smart Evader publish a fixed 6-degree upward mount and 24-degree body limit: no target-following gimbal exists.",
                         "F3 jumps directly to the spectator view, which watches both vehicles and is not attached to either pilot.",
                         "Right mouse captures unlimited presentation free-look; Shift+right mouse rolls; the wheel zooms; C centers and resets zoom.",
                         "Presentation free-look and zoom never change the 90-degree sensor, oval plane, detection, or guidance calculation.",
@@ -2257,6 +2325,7 @@ class WorldRenderer:
                     "PROOF BOUNDARY",
                     [
                         "Defense guidance never reads target truth; truth only renders the synthetic image, resolves contact, and supports verification.",
+                        "Multi-contact priority uses only apparent size, detector confidence, estimated range/closing/TTC, plus a 0.35s anti-flicker dwell.",
                         "TRICKY AI is the declared exception: only its target autopilot knows our approach; it cannot feed our sensor or guidance.",
                         "The detector/pose output, signal lookup, meshes, and aerodynamics are deterministic presentation adapters, not trained/deployed hardware.",
                         "CHECK 2s records an old camera frame and evaluates truth at T+2.",

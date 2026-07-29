@@ -53,6 +53,7 @@ Press `M` for the estimated-track X/Z minimap. Its wedge is the actual sensor FO
 
 Use `N` to show the selectable behaviors and threats:
 
+- `ENEMY CONTACTS` selects one, two, or three independently detected and tracked intruders; the HUD marks the camera-derived priority track and the minimap shows the others;
 - weave tests continuous side motion;
 - evasive tests changing acceleration direction;
 - airbrake tests nonlinear speed changes;
@@ -106,11 +107,15 @@ A naive fixed-width calculation is biased. ZENITH projects all eight corners of 
 
 ### “Where are YOLO or DINO?”
 
-No trained recognition model is bundled yet. The current milestone uses a deterministic synthetic detector/pose adapter with the same floating-point box, vehicle-center keypoint, bearing, confidence, and pose outputs that real models would provide. Subpixel box motion is preserved instead of rounded into unstable whole-pixel range steps. Identity comes from signal lookup, as required by the project idea. A future YOLO plus keypoint/pose-estimation adapter can replace this boundary without changing the camera, tracking, guidance, UI, or verification layers.
+No trained recognition model or weight file is bundled. The current milestone uses a deterministic synthetic detector/pose adapter with the same floating-point box, vehicle-center keypoint, bearing, confidence, and pose outputs that real models would provide. Subpixel box motion is preserved instead of rounded into unstable whole-pixel range steps. Identity comes from signal lookup, as required by the project idea. The `ImageDetectorAdapter` protocol is the explicit replacement boundary for YOLO or DINO, but actual inference also needs weights, dependencies, and sensor frames; the project does not falsely label those as present.
 
 ### “Why were Aegis-Q4 and Smart Evader tilting upward?”
 
-That was a real sign and initialization bug, now covered by regression tests. Both spawn level at half maximum speed with zero vertical velocity. Forward vectored thrust tilts the nose downward; any later climb is a gradual maneuver toward a higher target, not a spawn impulse.
+That was a real sign and initialization bug, now covered by regression tests. Both spawn level at half maximum speed with zero vertical velocity. Forward vectored thrust tilts the nose downward; any later climb is a gradual maneuver toward a higher target, not a spawn impulse. Their cameras are rigidly mounted at a published 6° upward cant, and their 24° body-tilt envelope prevents automatic flight from repeatedly throwing the target across the vertical FOV edge. It is a fixed transform and flight constraint, not a truth-following gimbal.
+
+### “How is the priority target chosen with several enemies?”
+
+Every contact is processed separately. The selector combines only detector confidence, apparent size, camera-estimated range, camera-estimated closing speed, and estimated time to contact. It requires a meaningful score advantage for 0.35 seconds while the current contact remains visible, which prevents lock flicker. It switches immediately only when the current track is lost and another visual track is available.
 
 ### “Why can Wraith-S miss even though it is fastest?”
 
@@ -139,7 +144,7 @@ No. It changes only the presentation camera used to inspect the scene. The synth
 ## A clean live-demo sequence
 
 1. Start `run_zenith.bat`.
-2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, and 1920×1080.
+2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, three enemy contacts, and 1920×1080.
 3. Start and wait for signal confirmation.
 4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it and press `C` to center.
 5. Scroll to demonstrate presentation zoom, then press `F3` for spectator view and show the common target plane. Green/red edge segments show exactly which of the 96 directions pass, while only a completely green loop may be selected.

@@ -27,6 +27,8 @@ class DroneSpec:
     lift_efficiency: float = 0.0
     main_burn_duration_s: float = 0.0
     rcs_duration_s: float = 0.0
+    camera_mount_pitch_deg: float = 0.0
+    max_body_tilt_deg: float = 0.0
 
     @property
     def size_label(self) -> str:
@@ -92,6 +94,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         "compact_quad",
         flight_model="multirotor",
         max_turn_rate_deg=125.0,
+        camera_mount_pitch_deg=-6.0,
+        max_body_tilt_deg=24.0,
     ),
     DroneSpec(
         "TLR",
@@ -143,6 +147,8 @@ DRONE_SPECS: tuple[DroneSpec, ...] = (
         max_turn_rate_deg=145.0,
         stall_speed=0.0,
         lift_efficiency=0.0,
+        camera_mount_pitch_deg=-6.0,
+        max_body_tilt_deg=24.0,
     ),
 )
 

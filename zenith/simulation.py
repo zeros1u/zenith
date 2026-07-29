@@ -30,7 +30,7 @@ from .math3d import (
     clamp,
     world_direction_from_camera,
 )
-from .models import DroneSpec, get_spec
+from .models import DRONE_SPECS, DroneSpec, get_spec
 from .physics import DroneState
 
 
@@ -53,6 +53,8 @@ class SimulationConfig:
     target_position: Vec3 = field(default_factory=lambda: Vec3(10.0, 36.0, 240.0))
     scenario: str = "evasive"
     camera: CameraModel = field(default_factory=CameraModel)
+    enemy_count: int = 1
+    detector_backend: str = "synthetic_projection"
 
 
 @dataclass(slots=True)
@@ -72,6 +74,12 @@ class TelemetrySample:
     interceptor_rcs_remaining_s: float
     target_burn_remaining_s: float
     target_rcs_remaining_s: float
+    active_contact_id: str
+    visible_contacts: int
+    total_contacts: int
+    priority_score: float
+    target_type: str
+    target_model: str
     target_ai_state: str
     target_ai_threat_range_m: float | None
     target_ai_closing_speed_mps: float | None
@@ -90,6 +98,35 @@ class PredictionCheck:
     projected_truth: Vec3 | None = None
 
 
+@dataclass(slots=True)
+class TargetContact:
+    """Independent image-derived state for one visible intruder."""
+
+    vehicle: DroneState
+    track_id: str
+    spawn_altitude_m: float
+    detection: Detection = field(
+        default_factory=lambda: Detection(
+            False, (0, 0, 0, 0), (0, 0), 0, 0, 0, 0, 0, 0, ()
+        )
+    )
+    range_estimate: RangeEstimate | None = None
+    track: TargetTrack = field(default_factory=TargetTrack)
+    guidance: GuidanceSolution | None = None
+    signal_progress: float = 0.0
+    identity_confirmed: bool = False
+    visual_locked: bool = False
+    lost_time_s: float = 0.0
+    reacquisition_count: int = 0
+    last_estimated_position: Vec3 | None = None
+    last_bearing_x_deg: float = 0.0
+    last_bearing_y_deg: float = 0.0
+    bearing_rate_x_deg_s: float = 0.0
+    bearing_rate_y_deg_s: float = 0.0
+    bearing_sample_valid: bool = False
+    priority_score: float = -math.inf
+
+
 class InterceptionSimulation:
     DRONE_SIGNAL_DELAY_S = 0.65
     ROCKET_SIGNAL_DELAY_S = 0.42
@@ -99,6 +136,11 @@ class InterceptionSimulation:
     CONTACT_TOLERANCE_M = 0.42
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
+        if self.config.detector_backend != "synthetic_projection":
+            raise ValueError(
+                "This build has no loaded image-model weights; "
+                "detector_backend must be 'synthetic_projection'."
+            )
         self.time_s = 0.0
         self.paused = False
         self.finished = False
@@ -188,7 +230,47 @@ class InterceptionSimulation:
             target_velocity,
             orientation=Vec3(0.0, math.pi if incoming_target else 0.25, 0.0),
         )
-        self.camera_forward = self.interceptor.forward_direction()
+        self.primary_target = self.target
+        self.targets: list[DroneState] = [self.target]
+        requested_enemy_count = int(clamp(float(self.config.enemy_count), 1.0, 3.0))
+        if incoming_target:
+            # A rocket attack remains a single-intruder terminal test. The
+            # optional multi-contact scene is intentionally a drone scenario.
+            requested_enemy_count = 1
+        self.config.enemy_count = requested_enemy_count
+        available_extra_specs = [
+            spec for spec in DRONE_SPECS if spec.code != target_spec.code
+        ]
+        extra_offsets = (
+            Vec3(-42.0, 5.0, -38.0),
+            Vec3(52.0, -4.0, 24.0),
+        )
+        for extra_index in range(requested_enemy_count - 1):
+            extra_spec = available_extra_specs[
+                (extra_index + DRONE_SPECS.index(target_spec) + 1)
+                % len(available_extra_specs)
+            ] if target_spec in DRONE_SPECS else available_extra_specs[extra_index]
+            offset = extra_offsets[extra_index]
+            extra_position = self.config.target_position + offset
+            direction_sign = -1.0 if extra_index % 2 else 1.0
+            extra_velocity = Vec3(
+                direction_sign * (6.0 + extra_index * 2.0),
+                0.0,
+                min(21.0, extra_spec.max_speed * (0.36 + extra_index * 0.03)),
+            )
+            self.targets.append(
+                DroneState(
+                    extra_spec,
+                    extra_position,
+                    extra_velocity,
+                    orientation=Vec3(
+                        0.0,
+                        0.18 * direction_sign,
+                        0.0,
+                    ),
+                )
+            )
+        self.camera_forward = self.interceptor.sensor_direction()
         self.search_anchor_forward = self.camera_forward
         self.search_direction = self.camera_forward
         self.search_hold_altitude_m = self.config.interceptor_position.y
@@ -202,6 +284,17 @@ class InterceptionSimulation:
         self.track = TargetTrack()
         self.guidance: GuidanceSolution | None = None
         self.last_estimated_position: Vec3 | None = None
+        self.contacts = [
+            TargetContact(
+                vehicle,
+                f"T{index + 1}",
+                vehicle.position.y,
+            )
+            for index, vehicle in enumerate(self.targets)
+        ]
+        self.active_contact_index = 0
+        self._priority_candidate_index = 0
+        self._priority_candidate_time_s = 0.0
         self.explosion_age_s = math.inf
         # The tricky target autopilot is deterministic so demonstrations and
         # verification runs are reproducible. It may use simulation truth
@@ -210,12 +303,29 @@ class InterceptionSimulation:
         self.evader_decision = "INACTIVE"
         self.evader_decision_until_s = 0.0
         self.evader_decision_index = 0
+        self.evader_brake_demonstrated = False
         self.evader_threat_range_m = math.inf
         self.evader_closing_speed_mps = 0.0
 
     @property
     def true_range_m(self) -> float:
         return self.interceptor.position.distance_to(self.target.position)
+
+    @property
+    def active_contact(self) -> TargetContact:
+        return self.contacts[self.active_contact_index]
+
+    @property
+    def visible_contact_count(self) -> int:
+        return sum(contact.visual_locked for contact in self.contacts)
+
+    @property
+    def identified_contact_count(self) -> int:
+        return sum(contact.identity_confirmed for contact in self.contacts)
+
+    @property
+    def active_contact_label(self) -> str:
+        return f"{self.active_contact.track_id}/{len(self.contacts)}"
 
     @property
     def target_spec_available(self) -> DroneSpec | None:
@@ -234,6 +344,45 @@ class InterceptionSimulation:
         if self.control_mode is ControlMode.TARGET:
             return self.target
         return None
+
+    def _store_active_contact(self) -> None:
+        """Persist the legacy active-target fields into its independent track."""
+        contact = self.active_contact
+        contact.detection = self.detection
+        contact.range_estimate = self.range_estimate
+        contact.track = self.track
+        contact.guidance = self.guidance
+        contact.signal_progress = self.signal_progress
+        contact.identity_confirmed = self.identity_confirmed
+        contact.visual_locked = self.visual_locked
+        contact.lost_time_s = self.lost_time_s
+        contact.reacquisition_count = self.reacquisition_count
+        contact.last_estimated_position = self.last_estimated_position
+        contact.last_bearing_x_deg = self.last_bearing_x_deg
+        contact.last_bearing_y_deg = self.last_bearing_y_deg
+        contact.bearing_rate_x_deg_s = self.bearing_rate_x_deg_s
+        contact.bearing_rate_y_deg_s = self.bearing_rate_y_deg_s
+        contact.bearing_sample_valid = self._bearing_sample_valid
+
+    def _load_active_contact(self) -> None:
+        """Expose the selected contact through the original single-target API."""
+        contact = self.active_contact
+        self.target = contact.vehicle
+        self.detection = contact.detection
+        self.range_estimate = contact.range_estimate
+        self.track = contact.track
+        self.guidance = contact.guidance
+        self.signal_progress = contact.signal_progress
+        self.identity_confirmed = contact.identity_confirmed
+        self.visual_locked = contact.visual_locked
+        self.lost_time_s = contact.lost_time_s
+        self.reacquisition_count = contact.reacquisition_count
+        self.last_estimated_position = contact.last_estimated_position
+        self.last_bearing_x_deg = contact.last_bearing_x_deg
+        self.last_bearing_y_deg = contact.last_bearing_y_deg
+        self.bearing_rate_x_deg_s = contact.bearing_rate_x_deg_s
+        self.bearing_rate_y_deg_s = contact.bearing_rate_y_deg_s
+        self._bearing_sample_valid = contact.bearing_sample_valid
 
     def set_manual_input(self, controls: ManualControlInput) -> None:
         self.manual_input = controls
@@ -358,37 +507,8 @@ class InterceptionSimulation:
         self._event(f"Camera image {state} by test control")
 
     def _sync_sensor_boresight(self) -> None:
-        """Rigidly mount the sensor optical axis to the interceptor nose."""
-        self.camera_forward = self.interceptor.forward_direction()
-
-    def _update_bearing_motion(self, dt: float, reset: bool = False) -> None:
-        """Filter image-plane motion without reading target ground truth."""
-        bearing_x = self.detection.bearing_x_deg
-        bearing_y = self.detection.bearing_y_deg
-        if self._bearing_sample_valid and not reset and dt > 1e-6:
-            raw_x = clamp(
-                (bearing_x - self.last_bearing_x_deg) / dt,
-                -120.0,
-                120.0,
-            )
-            raw_y = clamp(
-                (bearing_y - self.last_bearing_y_deg) / dt,
-                -90.0,
-                90.0,
-            )
-            alpha = 1.0 - math.exp(-5.0 * dt)
-            self.bearing_rate_x_deg_s += (
-                raw_x - self.bearing_rate_x_deg_s
-            ) * alpha
-            self.bearing_rate_y_deg_s += (
-                raw_y - self.bearing_rate_y_deg_s
-            ) * alpha
-        elif reset:
-            self.bearing_rate_x_deg_s = 0.0
-            self.bearing_rate_y_deg_s = 0.0
-        self.last_bearing_x_deg = bearing_x
-        self.last_bearing_y_deg = bearing_y
-        self._bearing_sample_valid = True
+        """Rigidly mount the sensor axis to its fixed published body cant."""
+        self.camera_forward = self.interceptor.sensor_direction()
 
     def _predicted_search_direction(self) -> Vec3:
         """Extrapolate the last image motion, then perform a horizon-safe scan."""
@@ -538,10 +658,18 @@ class InterceptionSimulation:
             (),
         )
 
-    def _target_command(self) -> Vec3:
-        spec = self.target.spec
-        velocity = self.target.velocity
+    def _target_command(
+        self,
+        target: DroneState | None = None,
+        contact_index: int | None = None,
+    ) -> Vec3:
+        target = target or self.target
+        if contact_index is None:
+            contact_index = self.active_contact_index
+        spec = target.spec
+        velocity = target.velocity
         scenario = self.config.scenario
+        phase_time = self.time_s + contact_index * 0.43
         incoming_rocket = (
             spec.vehicle_type == "rocket" or scenario == "rocket_attack"
         )
@@ -550,10 +678,10 @@ class InterceptionSimulation:
             if incoming_rocket
             else min(23.0, spec.max_speed * 0.42)
         )
-        target_altitude = self.config.target_position.y
+        target_altitude = self.contacts[contact_index].spawn_altitude_m
         stabilise = Vec3(
             0.0,
-            (target_altitude - self.target.position.y) * 0.55
+            (target_altitude - target.position.y) * 0.55
             - velocity.y * 1.15,
             cruise_z - velocity.z,
         )
@@ -561,32 +689,32 @@ class InterceptionSimulation:
         if spec.flight_model in ("fixed_wing", "rocket"):
             stabilise = stabilise + Vec3(
                 0.0,
-                max(0.0, 9.81 - self.target.lift_acceleration.y),
+                max(0.0, 9.81 - target.lift_acceleration.y),
                 0.0,
             )
-        self.target.airbrake = False
+        target.airbrake = False
 
-        if scenario == "tricky":
-            return self._smart_evader_command(stabilise)
+        if scenario == "tricky" and target is self.primary_target:
+            return self._smart_evader_command(target, stabilise)
         if scenario == "weave":
             return (
                 stabilise
                 + Vec3(
-                    math.sin(self.time_s * 1.55) * spec.lateral_accel * 0.10,
-                    math.sin(self.time_s * 0.83) * spec.lateral_accel * 0.04,
+                    math.sin(phase_time * 1.55) * spec.lateral_accel * 0.10,
+                    math.sin(phase_time * 0.83) * spec.lateral_accel * 0.04,
                     0.0,
                 )
             ).clamp_length(spec.max_accel)
         if scenario == "rocket_attack":
             maneuver_scale = 0.0 if spec.code == "SR1" else 0.04
             terminal_weave = Vec3(
-                math.sin(self.time_s * 1.2) * spec.lateral_accel * maneuver_scale,
-                math.sin(self.time_s * 0.7) * spec.lateral_accel * maneuver_scale * 0.45,
+                math.sin(phase_time * 1.2) * spec.lateral_accel * maneuver_scale,
+                math.sin(phase_time * 0.7) * spec.lateral_accel * maneuver_scale * 0.45,
                 0.0,
             )
             return (stabilise + terminal_weave).clamp_length(spec.max_accel)
-        if scenario == "evasive":
-            phase = int(self.time_s / 1.35) % 4
+        if scenario in ("evasive", "tricky"):
+            phase = int(phase_time / 1.35) % 4
             directions = (
                 Vec3(1.0, 0.32, 0.0),
                 Vec3(-0.65, -0.42, 0.25),
@@ -598,12 +726,12 @@ class InterceptionSimulation:
             evade = directions[phase].normalized() * spec.lateral_accel * 0.15
             return (stabilise + evade).clamp_length(spec.max_accel)
         if scenario == "braking":
-            cycle = self.time_s % 7.0
+            cycle = phase_time % 7.0
             if 3.0 < cycle < 5.2:
-                self.target.airbrake = True
+                target.airbrake = True
                 return Vec3(
                     0.0,
-                    (target_altitude - self.target.position.y) * 0.3,
+                    (target_altitude - target.position.y) * 0.3,
                     0.0,
                 )
             return stabilise.clamp_length(spec.max_accel)
@@ -616,6 +744,9 @@ class InterceptionSimulation:
     ) -> None:
         """Choose a deterministic, threat-aware maneuver for the tricky mode."""
         index = self.evader_decision_index
+        force_brake_demo = (
+            distance_m < 75.0 and not self.evader_brake_demonstrated
+        )
         if distance_m > 165.0 or closing_speed_mps < 2.0:
             choices = ("DECEPTIVE CRUISE", "OFFSET JINK", "SPEED SHIFT")
             duration = 1.15
@@ -643,18 +774,28 @@ class InterceptionSimulation:
         # The range bucket perturbs the sequence without introducing random
         # state, so identical inputs always produce identical demonstrations.
         range_phase = int(distance_m / 17.0)
-        self.evader_decision = choices[(index + range_phase) % len(choices)]
+        self.evader_decision = (
+            "BRAKE TRAP"
+            if force_brake_demo
+            else choices[(index + range_phase) % len(choices)]
+        )
+        if force_brake_demo:
+            self.evader_brake_demonstrated = True
         self.evader_decision_index += 1
         self.evader_decision_until_s = self.time_s + duration
         self._event(f"Target AI: {self.evader_decision}")
 
-    def _smart_evader_command(self, stabilise: Vec3) -> Vec3:
+    def _smart_evader_command(
+        self,
+        target: DroneState,
+        stabilise: Vec3,
+    ) -> Vec3:
         """Reactive target autopilot constrained by the selected craft limits."""
-        spec = self.target.spec
-        relative = self.interceptor.position - self.target.position
+        spec = target.spec
+        relative = self.interceptor.position - target.position
         distance = relative.length()
         threat_direction = relative.normalized(Vec3(0.0, 0.0, -1.0))
-        relative_velocity = self.interceptor.velocity - self.target.velocity
+        relative_velocity = self.interceptor.velocity - target.velocity
         closing = max(0.0, -relative_velocity.dot(threat_direction))
         self.evader_threat_range_m = distance
         self.evader_closing_speed_mps = closing
@@ -681,7 +822,7 @@ class InterceptionSimulation:
             # Alternating axial changes complicate a constant-velocity track.
             speed_sign = -1.0 if self.evader_decision_index % 2 else 1.0
             maneuver = (
-                self.target.velocity.normalized(away)
+                target.velocity.normalized(away)
                 * spec.max_accel
                 * 0.55
                 * speed_sign
@@ -694,11 +835,11 @@ class InterceptionSimulation:
         elif decision == "SPRINT":
             maneuver = away * spec.max_accel + lateral * authority * 0.18
         elif decision == "BRAKE TRAP":
-            self.target.airbrake = True
+            target.airbrake = True
             maneuver = lateral * authority * 0.20
         elif decision == "VERTICAL BREAK":
             vertical_sign = -1.0 if self.evader_decision_index % 2 else 1.0
-            if self.target.position.y < 12.0:
+            if target.position.y < 12.0:
                 vertical_sign = 1.0
             maneuver = (
                 Vec3(0.0, vertical_sign * spec.max_accel, 0.0)
@@ -723,97 +864,131 @@ class InterceptionSimulation:
 
         # Close to the ground, vertical recovery overrides any downward break.
         ground_recovery = (
-            Vec3(0.0, (10.0 - self.target.position.y) * 3.0, 0.0)
-            if self.target.position.y < 10.0
+            Vec3(0.0, (10.0 - target.position.y) * 3.0, 0.0)
+            if target.position.y < 10.0
             else Vec3()
         )
         return (stabilise * 0.55 + maneuver + ground_recovery).clamp_length(
             spec.max_accel
         )
 
-    def _update_sensor(self, dt: float) -> None:
-        # The camera is not a target-following gimbal. Its FOV can move only
-        # when the interceptor airframe turns.
-        self._sync_sensor_boresight()
-        if self.lost_time_s > 0.0:
-            # Autonomy may turn the airframe using only the last observed image
-            # bearing and bearing rate; it never points the camera using truth.
-            self.search_direction = self._predicted_search_direction()
+    @staticmethod
+    def _update_contact_bearing_motion(
+        contact: TargetContact,
+        dt: float,
+        reset: bool,
+    ) -> None:
+        """Filter one contact's image motion without using world truth."""
+        bearing_x = contact.detection.bearing_x_deg
+        bearing_y = contact.detection.bearing_y_deg
+        if contact.bearing_sample_valid and not reset and dt > 1e-6:
+            raw_x = clamp(
+                (bearing_x - contact.last_bearing_x_deg) / dt,
+                -120.0,
+                120.0,
+            )
+            raw_y = clamp(
+                (bearing_y - contact.last_bearing_y_deg) / dt,
+                -90.0,
+                90.0,
+            )
+            alpha = 1.0 - math.exp(-5.0 * dt)
+            contact.bearing_rate_x_deg_s += (
+                raw_x - contact.bearing_rate_x_deg_s
+            ) * alpha
+            contact.bearing_rate_y_deg_s += (
+                raw_y - contact.bearing_rate_y_deg_s
+            ) * alpha
+        elif reset:
+            contact.bearing_rate_x_deg_s = 0.0
+            contact.bearing_rate_y_deg_s = 0.0
+        contact.last_bearing_x_deg = bearing_x
+        contact.last_bearing_y_deg = bearing_y
+        contact.bearing_sample_valid = True
 
-        self.detection = detect_box(
-            self.target,
+    def _sense_contact(self, contact: TargetContact, dt: float) -> None:
+        """Run the same detector, signal, range and track pipeline per target."""
+        contact.detection = detect_box(
+            contact.vehicle,
             self.interceptor.position,
             self.camera_forward,
             self.config.camera,
             self.time_s,
         )
         if self.sensor_occluded:
-            self.detection = self._empty_detection(self.detection.camera_depth)
-        incoming_rocket = self.target.spec.vehicle_type == "rocket"
-        was_locked = self.visual_locked
-        if self.identity_confirmed:
-            # Known-model detection can remain valid at a smaller apparent size
-            # than the initial generic-object / signal-query threshold.
-            minimum_lock_pixels = 2.0 if was_locked else 2.5
-        else:
-            minimum_lock_pixels = 3.0
-        signal_delay = (
-            self.ROCKET_SIGNAL_DELAY_S
-            if incoming_rocket
-            else self.DRONE_SIGNAL_DELAY_S
+            contact.detection = self._empty_detection(
+                contact.detection.camera_depth
+            )
+
+        was_locked = contact.visual_locked
+        previous_lost_time = contact.lost_time_s
+        minimum_lock_pixels = (
+            2.0 if contact.identity_confirmed and was_locked
+            else 2.5 if contact.identity_confirmed
+            else 3.0
         )
-        visual_detection = self.detection.visible and max(
-            self.detection.width_px, self.detection.height_px
+        visual_detection = contact.detection.visible and max(
+            contact.detection.width_px,
+            contact.detection.height_px,
         ) >= minimum_lock_pixels
 
-        previous_lost_time = self.lost_time_s
         if visual_detection:
-            self._update_bearing_motion(
+            self._update_contact_bearing_motion(
+                contact,
                 dt,
                 reset=not was_locked and previous_lost_time > 0.25,
             )
-            self.visual_locked = True
-            self.lost_time_s = 0.0
+            contact.visual_locked = True
+            contact.lost_time_s = 0.0
             if not was_locked:
-                if self.identity_confirmed:
-                    self.reacquisition_count += 1
-                    self._event("Visual lock reacquired by image detector")
+                if contact.identity_confirmed:
+                    contact.reacquisition_count += 1
+                    self._event(
+                        f"{contact.track_id} visual lock reacquired by image detector"
+                    )
                 else:
-                    self._event("Visual detector acquired an unknown aerial vehicle")
+                    self._event(
+                        f"{contact.track_id} detector acquired unknown aerial vehicle"
+                    )
         else:
-            if was_locked:
+            if was_locked and contact is self.active_contact:
                 self.search_anchor_forward = self.camera_forward
                 self.search_direction = self.camera_forward
                 self.search_hold_altitude_m = self.interceptor.position.y
-                self._event("Visual lock lost; guidance disabled")
-            self.visual_locked = False
-            self.lost_time_s += dt
-            self.range_estimate = None
+                self._event(
+                    f"{contact.track_id} visual lock lost; guidance disabled"
+                )
+            contact.visual_locked = False
+            contact.lost_time_s += dt
+            contact.range_estimate = None
 
-        if self.visual_locked and not self.identity_confirmed:
-            self.signal_progress += dt
-            if self.status == "SEARCHING":
-                self.status = "VISUAL LOCK / SIGNAL QUERY"
-            if self.signal_progress >= signal_delay:
-                self.identity_confirmed = True
-                self.status = "IDENTITY CONFIRMED"
-                self._event(f"Signal match: {self.target.spec.name}")
-        elif not self.visual_locked and not self.identity_confirmed:
-            self.signal_progress = max(0.0, self.signal_progress - dt * 0.5)
-            self.status = "SEARCHING"
+        signal_delay = (
+            self.ROCKET_SIGNAL_DELAY_S
+            if contact.vehicle.spec.vehicle_type == "rocket"
+            else self.DRONE_SIGNAL_DELAY_S
+        )
+        if contact.visual_locked and not contact.identity_confirmed:
+            contact.signal_progress += dt
+            if contact.signal_progress >= signal_delay:
+                contact.identity_confirmed = True
+                self._event(
+                    f"{contact.track_id} signal match: {contact.vehicle.spec.name}"
+                )
+        elif not contact.visual_locked and not contact.identity_confirmed:
+            contact.signal_progress = max(
+                0.0,
+                contact.signal_progress - dt * 0.5,
+            )
 
-        if self.identity_confirmed and self.visual_locked:
+        if contact.identity_confirmed and contact.visual_locked:
             if not was_locked and previous_lost_time > 0.25:
-                # A stale metric track must not silently become a current lock.
-                # Reacquisition begins a fresh camera-derived velocity estimate.
-                self.track = TargetTrack()
-            # Pose comes from the synthetic image-recognition output. The
-            # estimator does not read the target state directly.
-            pose_estimate = self.detection.pose_estimate
-            self.range_estimate = (
+                # Reacquisition begins a new camera-derived velocity estimate.
+                contact.track = TargetTrack()
+            pose_estimate = contact.detection.pose_estimate
+            contact.range_estimate = (
                 estimate_range(
-                    self.detection,
-                    self.target.spec,
+                    contact.detection,
+                    contact.vehicle.spec,
                     pose_estimate,
                     self.camera_forward,
                     self.config.camera,
@@ -821,28 +996,113 @@ class InterceptionSimulation:
                 if pose_estimate is not None
                 else None
             )
-            if self.range_estimate is not None:
+            if contact.range_estimate is not None:
                 estimated_position = position_from_detection(
                     self.interceptor.position,
                     self.camera_forward,
-                    self.detection,
-                    self.range_estimate.distance_m,
+                    contact.detection,
+                    contact.range_estimate.distance_m,
                 )
-                self.last_estimated_position = estimated_position
-                self.track.confidence = self.detection.confidence
-                self.track.update(
+                contact.last_estimated_position = estimated_position
+                contact.track.confidence = contact.detection.confidence
+                contact.track.update(
                     estimated_position,
                     self.time_s,
                     rapid_velocity_tracking=(
-                        self.target.spec.vehicle_type == "rocket"
+                        contact.vehicle.spec.vehicle_type == "rocket"
                     ),
                 )
-                self.track.position_sigma_m = max(
-                    self.track.position_sigma_m,
-                    min(12.0, self.range_estimate.sigma_m),
+                contact.track.position_sigma_m = max(
+                    contact.track.position_sigma_m,
+                    min(12.0, contact.range_estimate.sigma_m),
                 )
-        elif self.identity_confirmed:
+
+    def _contact_priority(self, contact: TargetContact) -> float:
+        """Threat score derived only from detector and metric-track outputs."""
+        if not contact.visual_locked:
+            return -math.inf
+        apparent = max(
+            contact.detection.width_px,
+            contact.detection.height_px,
+        )
+        score = contact.detection.confidence * 24.0 + min(30.0, apparent)
+        if contact.track.position is None or contact.track.sample_count < 2:
+            return score
+        relative = contact.track.position - self.interceptor.position
+        estimated_range = max(0.1, relative.length())
+        line = relative.normalized(self.camera_forward)
+        closing = max(
+            0.0,
+            (self.interceptor.velocity - contact.track.velocity).dot(line),
+        )
+        time_to_contact = (
+            estimated_range / closing
+            if closing > 0.5
+            else math.inf
+        )
+        score += min(80.0, closing * 1.4)
+        if math.isfinite(time_to_contact):
+            score += 180.0 / (1.0 + time_to_contact)
+        score += 35.0 / (1.0 + estimated_range / 80.0)
+        return score
+
+    def _choose_priority_contact(self, dt: float) -> None:
+        for contact in self.contacts:
+            contact.priority_score = self._contact_priority(contact)
+        if len(self.contacts) == 1 or self.control_mode is ControlMode.TARGET:
+            return
+        best_index = max(
+            range(len(self.contacts)),
+            key=lambda index: self.contacts[index].priority_score,
+        )
+        current = self.active_contact
+        best = self.contacts[best_index]
+        if best_index == self.active_contact_index:
+            self._priority_candidate_index = best_index
+            self._priority_candidate_time_s = 0.0
+            return
+        # A visible current target needs a meaningful score advantage and a
+        # short dwell. This prevents frame-to-frame priority thrashing.
+        advantage = best.priority_score - current.priority_score
+        immediate = not current.visual_locked and best.visual_locked
+        if not immediate and advantage < 8.0:
+            self._priority_candidate_time_s = 0.0
+            return
+        if self._priority_candidate_index != best_index:
+            self._priority_candidate_index = best_index
+            self._priority_candidate_time_s = 0.0
+        self._priority_candidate_time_s += dt
+        if immediate or self._priority_candidate_time_s >= 0.35:
+            previous = current.track_id
+            self.active_contact_index = best_index
+            self._priority_candidate_time_s = 0.0
+            self.search_anchor_forward = self.camera_forward
+            self.search_direction = self.camera_forward
+            self._event(
+                f"Priority switched {previous} -> {best.track_id} from image tracks"
+            )
+
+    def _update_sensor(self, dt: float) -> None:
+        # The camera is not a target-following gimbal. Its FOV can move only
+        # when the interceptor airframe turns.
+        self._store_active_contact()
+        self._sync_sensor_boresight()
+        if self.lost_time_s > 0.0:
+            self.search_direction = self._predicted_search_direction()
+
+        for contact in self.contacts:
+            self._sense_contact(contact, dt)
+        self._choose_priority_contact(dt)
+        self._load_active_contact()
+
+        if self.identity_confirmed and not self.visual_locked:
             self.status = "TARGET LOST / SEARCHING"
+        elif self.identity_confirmed:
+            self.status = "IDENTITY CONFIRMED"
+        elif self.visual_locked:
+            self.status = "VISUAL LOCK / SIGNAL QUERY"
+        else:
+            self.status = "SEARCHING"
 
     def _record_telemetry(self, dt: float) -> None:
         self._telemetry_timer += dt
@@ -868,6 +1128,12 @@ class InterceptionSimulation:
                 max(0.0, self.interceptor.rcs_remaining_s),
                 max(0.0, self.target.main_burn_remaining_s),
                 max(0.0, self.target.rcs_remaining_s),
+                self.active_contact.track_id,
+                self.visible_contact_count,
+                len(self.contacts),
+                self.active_contact.priority_score,
+                self.target.spec.vehicle_type,
+                self.target.spec.name,
                 self.evader_decision,
                 (
                     self.evader_threat_range_m
@@ -893,7 +1159,8 @@ class InterceptionSimulation:
             # After contact, guidance and target autopilots are disabled. Each
             # crashed body receives exactly one gravity integration per tick.
             self.interceptor.integrate(Vec3(), dt)
-            self.target.integrate(Vec3(), dt)
+            for target in self.targets:
+                target.integrate(Vec3(), dt)
             self._sync_sensor_boresight()
             self._update_prediction_check()
             self.status = self.success_message
@@ -901,28 +1168,36 @@ class InterceptionSimulation:
                 self.finished = True
             return
 
-        previous_relative = self.target.position - self.interceptor.position
+        previous_relatives = [
+            target.position - self.interceptor.position
+            for target in self.targets
+        ]
 
         self._update_sensor(dt)
-        if (
-            self.identity_confirmed
-            and self.visual_locked
-            and self.track.position is not None
-        ):
-            self.guidance = solve_guidance(
-                self.interceptor,
-                self.track,
-                self.target.spec,
-                self.camera_forward,
-                self.config.camera.focal_px,
-                self.terminal_mode,
-            )
-            advisory_command = (
-                self.guidance.commanded_acceleration if self.guidance else Vec3()
-            )
+        for contact in self.contacts:
+            if (
+                contact.identity_confirmed
+                and contact.visual_locked
+                and contact.track.position is not None
+            ):
+                contact.guidance = solve_guidance(
+                    self.interceptor,
+                    contact.track,
+                    contact.vehicle.spec,
+                    self.camera_forward,
+                    self.config.camera.focal_px,
+                    self.terminal_mode,
+                )
+            else:
+                contact.guidance = None
+        self._load_active_contact()
+        if self.guidance is not None:
+            advisory_command = self.guidance.commanded_acceleration
             if self.status != "INTERCEPT GUIDANCE":
                 self.status = "INTERCEPT GUIDANCE"
-                self._event("Oval reachability guidance active")
+                self._event(
+                    f"{self.active_contact.track_id} oval reachability guidance active"
+                )
         elif self.visual_locked:
             # Bearing-only pursuit while the signal lookup runs.
             self.guidance = None
@@ -949,79 +1224,108 @@ class InterceptionSimulation:
             if self.control_mode is ControlMode.AUTO:
                 self.manual_command = ManualCommand()
 
-        if self.control_mode is ControlMode.TARGET:
-            self.manual_command = self.manual_controller.command(
-                self.target,
-                self.manual_input,
-                dt,
-            )
-            target_command = self.manual_command.acceleration
-        else:
-            target_command = self._target_command()
-
         interceptor_yaw = (
             self.manual_command.desired_yaw_rad
             if self.control_mode is ControlMode.INTERCEPTOR
             else None
         )
-        target_yaw = (
-            self.manual_command.desired_yaw_rad
-            if self.control_mode is ControlMode.TARGET
-            else None
-        )
+        target_commands: list[Vec3] = []
+        target_yaws: list[float | None] = []
+        for index, target in enumerate(self.targets):
+            if (
+                self.control_mode is ControlMode.TARGET
+                and target is self.target
+            ):
+                self.manual_command = self.manual_controller.command(
+                    target,
+                    self.manual_input,
+                    dt,
+                )
+                target_commands.append(self.manual_command.acceleration)
+                target_yaws.append(self.manual_command.desired_yaw_rad)
+            else:
+                target_commands.append(self._target_command(target, index))
+                target_yaws.append(None)
         self.interceptor.integrate(interceptor_command, dt, interceptor_yaw)
-        self.target.integrate(target_command, dt, target_yaw)
+        for target, command, target_yaw in zip(
+            self.targets,
+            target_commands,
+            target_yaws,
+        ):
+            target.integrate(command, dt, target_yaw)
         self._sync_sensor_boresight()
         self._update_prediction_check()
         if (
             self.config.scenario == "rotating"
             and self.control_mode is not ControlMode.TARGET
         ):
-            if self.target.spec.flight_model in ("multirotor", "vectored_vtol"):
-                self.target.orientation = Vec3(
-                    self.target.orientation.x,
-                    self.target.orientation.y + 1.45 * dt,
-                    math.sin(self.time_s * 2.4) * 1.1,
-                )
-            else:
-                # Directional craft may roll about their flight axis, but their
-                # nose remains tied to their physically integrated velocity.
-                self.target.orientation = Vec3(
-                    self.target.orientation.x,
-                    self.target.orientation.y,
-                    math.sin(self.time_s * 2.4) * 0.65,
-                )
+            for index, target in enumerate(self.targets):
+                phase = self.time_s * 2.4 + index * 0.7
+                if target.spec.flight_model in (
+                    "multirotor",
+                    "vectored_vtol",
+                ):
+                    target.orientation = Vec3(
+                        target.orientation.x,
+                        target.orientation.y + 1.45 * dt,
+                        math.sin(phase) * 1.1,
+                    )
+                else:
+                    # Directional craft may roll about their flight axis, but
+                    # the nose remains tied to integrated velocity.
+                    target.orientation = Vec3(
+                        target.orientation.x,
+                        target.orientation.y,
+                        math.sin(phase) * 0.65,
+                    )
 
-        # Continuous relative segment test prevents high-speed tunnelling.
-        current_relative = self.target.position - self.interceptor.position
-        segment = current_relative - previous_relative
-        denominator = segment.length_squared()
-        closest_t = (
-            clamp(-previous_relative.dot(segment) / denominator, 0.0, 1.0)
-            if denominator > 1e-9
-            else 0.0
-        )
-        closest = previous_relative + segment * closest_t
-        collision_distance = (
-            self.interceptor.spec.collision_radius + self.target.spec.collision_radius
-            + self.CONTACT_TOLERANCE_M
-        )
-        if closest.length() <= collision_distance and not self.hit:
+        # Continuous relative segment tests prevent tunnelling through any
+        # separately tracked intruder.
+        for index, (target, previous_relative) in enumerate(
+            zip(self.targets, previous_relatives)
+        ):
+            current_relative = target.position - self.interceptor.position
+            segment = current_relative - previous_relative
+            denominator = segment.length_squared()
+            closest_t = (
+                clamp(
+                    -previous_relative.dot(segment) / denominator,
+                    0.0,
+                    1.0,
+                )
+                if denominator > 1e-9
+                else 0.0
+            )
+            closest = previous_relative + segment * closest_t
+            collision_distance = (
+                self.interceptor.spec.collision_radius
+                + target.spec.collision_radius
+                + self.CONTACT_TOLERANCE_M
+            )
+            if closest.length() > collision_distance or self.hit:
+                continue
+            self._store_active_contact()
+            self.active_contact_index = index
+            self._load_active_contact()
             self.hit = True
             self.hit_time_s = self.time_s
             self.status = self.success_message
             self._event(self.success_message)
-            impact = (self.interceptor.position + self.target.position) * 0.5
+            impact = (self.interceptor.position + target.position) * 0.5
             self.interceptor.position = impact
-            self.target.position = impact
-            average_velocity = (self.interceptor.velocity + self.target.velocity) * 0.5
+            target.position = impact
+            average_velocity = (
+                self.interceptor.velocity + target.velocity
+            ) * 0.5
             self.interceptor.velocity = average_velocity + Vec3(-2.0, 1.5, 0.0)
-            self.target.velocity = average_velocity + Vec3(2.0, 2.5, 0.0)
+            target.velocity = average_velocity + Vec3(2.0, 2.5, 0.0)
             self.interceptor.crashed = True
-            self.target.crashed = True
+            target.crashed = True
             self.interceptor.engine_enabled = False
-            self.target.engine_enabled = False
+            target.engine_enabled = False
             self.explosion_age_s = 0.0
             self.clear_manual_input()
+            break
 
+        self._store_active_contact()
         self._record_telemetry(dt)

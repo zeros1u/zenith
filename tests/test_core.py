@@ -10,6 +10,7 @@ from app import (
     DEFAULT_TIME_SCALE_INDEX,
     DISPLAY_OPTIONS,
     SENSOR_OPTIONS,
+    SetupScreen,
     TIME_SCALES,
     WINDOW_SIZE,
 )
@@ -64,6 +65,14 @@ class InterfaceConfigTests(unittest.TestCase):
         self.assertEqual(SENSOR_OPTIONS[1], (1920, 1080))
         self.assertEqual(TIME_SCALES[DEFAULT_TIME_SCALE_INDEX], 0.5)
         self.assertEqual(CameraModel().horizontal_fov_deg, 90.0)
+
+    def test_setup_can_request_three_separately_tracked_enemies(self) -> None:
+        setup = SetupScreen(WINDOW_SIZE)
+        setup.enemy_count = 3
+        config = setup.build_config()
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config.enemy_count, 3)
 
     def test_mouse_free_look_does_not_change_sensor_direction(self) -> None:
         sim = InterceptionSimulation(SimulationConfig())
@@ -189,10 +198,10 @@ class InterfaceConfigTests(unittest.TestCase):
         surface = pygame.Surface(WINDOW_SIZE)
         renderer.draw_hud(surface, sim, 0.5, 60.0)
         self.assertTrue(renderer.panel_expanded["target"])
-        self.assertFalse(renderer.panel_expanded["calculations"])
+        self.assertTrue(renderer.panel_expanded["calculations"])
         calculations_header = renderer.click_regions["panel:calculations"]
         renderer.handle_left_click(calculations_header.center, sim)
-        self.assertTrue(renderer.panel_expanded["calculations"])
+        self.assertFalse(renderer.panel_expanded["calculations"])
         renderer.minimap_visible = True
         renderer.settings_visible = True
         renderer.verification_visible = True
@@ -1088,6 +1097,79 @@ class ProjectTests(unittest.TestCase):
                     sim.interceptor.forward_direction().y,
                     1e-9,
                 )
+
+    def test_vectored_camera_mounts_keep_a_continuous_body_fixed_lock(self) -> None:
+        for interceptor_code in ("AQ4", "SEV"):
+            with self.subTest(interceptor=interceptor_code):
+                sim = InterceptionSimulation(
+                    SimulationConfig(
+                        interceptor_code=interceptor_code,
+                        target_code="FX1",
+                        scenario="evasive",
+                    )
+                )
+                mount_angle = angle_between(
+                    sim.interceptor.forward_direction(),
+                    sim.interceptor.sensor_direction(),
+                )
+                self.assertAlmostEqual(
+                    mount_angle,
+                    math.radians(
+                        abs(sim.interceptor.spec.camera_mount_pitch_deg)
+                    ),
+                    places=7,
+                )
+                maximum_pitch = 0.0
+                for _ in range(60 * 25):
+                    sim.step()
+                    maximum_pitch = max(
+                        maximum_pitch,
+                        abs(math.degrees(sim.interceptor.orientation.x)),
+                    )
+                    if sim.hit:
+                        break
+                self.assertTrue(sim.hit)
+                self.assertEqual(sim.reacquisition_count, 0)
+                self.assertLessEqual(
+                    maximum_pitch,
+                    sim.interceptor.spec.max_body_tilt_deg + 0.1,
+                )
+
+    def test_multi_enemy_mode_tracks_and_solves_every_contact(self) -> None:
+        sim = InterceptionSimulation(
+            SimulationConfig(
+                target_code="FX1",
+                scenario="evasive",
+                enemy_count=3,
+            )
+        )
+        self.assertEqual(len(sim.targets), 3)
+        self.assertEqual(len({id(contact.track) for contact in sim.contacts}), 3)
+        for _ in range(60 * 3):
+            sim.step()
+        self.assertEqual(sim.visible_contact_count, 3)
+        self.assertEqual(sim.identified_contact_count, 3)
+        self.assertTrue(
+            all(contact.track.sample_count > 2 for contact in sim.contacts)
+        )
+        self.assertTrue(
+            all(contact.guidance is not None for contact in sim.contacts)
+        )
+        self.assertTrue(
+            all(math.isfinite(contact.priority_score) for contact in sim.contacts)
+        )
+        self.assertEqual(sim.active_contact_index, 1)
+        self.assertTrue(
+            any("Priority switched" in message for _, message in sim.events)
+        )
+        self.assertIn(sim.target, sim.targets)
+        self.assertIs(sim.target, sim.active_contact.vehicle)
+
+    def test_unloaded_ai_backend_cannot_be_falsely_selected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no loaded image-model weights"):
+            InterceptionSimulation(
+                SimulationConfig(detector_backend="yolo")
+            )
 
     def test_displayed_oval_radius_is_frame_stable(self) -> None:
         # AQ4 at long range used to cross a 3 px -> 4 px rounding boundary,
