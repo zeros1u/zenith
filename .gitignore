@@ -2,3 +2,9 @@ __pycache__/
 *.py[cod]
 exports/
 .pytest_cache/
+.venv-yolo/
+datasets/zenith_yolo/
+runs/
+/yolo*.pt
+/yolo_*_stdout.log
+/yolo_*_stderr.log

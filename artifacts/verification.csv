@@ -1,8 +1,8 @@
-scenario,identity,hit,hit_time_s,minimum_range_m,range_mae_m,range_rmse_m,samples
-steady,True,True,11.833,0.0,1.922,2.719,96
-weave,True,True,11.833,0.0,2.417,3.767,96
-evasive,True,True,12.083,0.0,1.625,2.717,98
-braking,True,True,9.617,0.0,2.053,3.031,77
-rotating,True,True,12.133,0.0,0.913,1.334,99
-tricky,True,True,10.817,0.0,0.881,1.243,87
-rocket_attack,True,True,2.083,0.0,5.545,7.623,11
+scenario,identity,hit,hit_time_s,minimum_range_m,range_mae_m,range_rmse_m,samples,detector,inference_ms
+steady,True,True,11.833,0.0,1.922,2.719,96,synthetic_projection,0.0
+weave,True,True,11.833,0.0,2.417,3.767,96,synthetic_projection,0.0
+evasive,True,True,12.083,0.0,1.625,2.717,98,synthetic_projection,0.0
+braking,True,True,9.617,0.0,2.053,3.031,77,synthetic_projection,0.0
+rotating,True,True,12.133,0.0,0.913,1.334,99,synthetic_projection,0.0
+tricky,True,True,10.817,0.0,0.881,1.243,87,synthetic_projection,0.0
+rocket_attack,True,True,2.083,0.0,5.545,7.623,11,synthetic_projection,0.0

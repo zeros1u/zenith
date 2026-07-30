@@ -1,0 +1,13 @@
+{
+  "weights": "models/zenith_yolo.pt",
+  "base_model": "yolo11n.pt",
+  "epochs_requested": 40,
+  "image_size": 960,
+  "dataset": "datasets/zenith_yolo/zenith.yaml",
+  "sha256": "d572832f485c6e7c3daecef4595d039a2588d7444d97b2b42a1f342e2f802b54",
+  "precision": 0.9872303670497607,
+  "recall": 0.8770226537216829,
+  "map50": 0.9100824374026447,
+  "map50_95": 0.708613857967559,
+  "fitness": 0.708613857967559
+}

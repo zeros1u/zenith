@@ -106,11 +106,19 @@ Gravity is continuously applied at `9.81 m/s²` to every airborne vehicle. A pow
 
 ### “What happens when the target rotates?”
 
-A naive fixed-width calculation is biased. ZENITH projects all eight corners of the known 3D dimensions using a pose estimate and fits both horizontal and vertical spans.
+A naive fixed-width calculation is biased. The deterministic fallback projects all eight corners of the known 3D dimensions using its declared pose estimate and fits both spans. Plain YOLO boxes do not contain 3D pose, so YOLO mode deliberately avoids simulator orientation. Drones use their known largest planform dimension with the detected box major axis and one fixed `1.10` held-out box-calibration factor. A long rocket uses its known cross-section with the box minor axis, which stays transverse from nose-on through side-on views. The full bounding diameter contributes to an explicit ambiguity term rather than becoming an overestimated point range. The calibration never reads true range or pose at runtime.
 
-### “Where are YOLO or DINO?”
+### “Is YOLO really running?”
 
-No trained recognition model or weight file is bundled. The current milestone uses a deterministic synthetic detector/pose adapter with the same floating-point box, vehicle-center keypoint, bearing, confidence, and pose outputs that real models would provide. Subpixel box motion is preserved instead of rounded into unstable whole-pixel range steps. Identity comes from signal lookup, as required by the project idea. The `ImageDetectorAdapter` protocol is the explicit replacement boundary for YOLO or DINO, but actual inference also needs weights, dependencies, and sensor frames; the project does not falsely label those as present.
+Yes. Select `DETECTOR: YOLO CUSTOM`. A custom Ultralytics model receives a clean BGR frame from the rigid onboard camera and returns generic `aerial_target` boxes plus confidence. The HUD reports the active backend and measured inference milliseconds. Runtime YOLO does not receive simulator annotations, target coordinates, velocity, pose, identity, or capabilities. A regression test patches the old synthetic detector and proves YOLO runtime does not call it. `SYNTHETIC BOX + POSE` remains an explicitly labeled fallback for computers without the ML environment.
+
+YOLO deliberately detects only the generic aerial shape. The later simulated signal query still provides the exact model and exercise-given capabilities. Because plain YOLO boxes contain no 3D pose, the YOLO range path uses declared planform/cross-section assumptions and reports the remaining orientation/confidence uncertainty. The custom weights were trained on generated ZENITH frames, so this proves real inference and a replaceable physical-camera boundary—not field accuracy on real outdoor footage.
+
+On the held-out generated validation set, the bundled checkpoint measured 0.987 precision, 0.877 recall, 0.910 mAP50, and 0.709 mAP50-95. These numbers are reproducible in `models/zenith_yolo_metrics.json`; do not present them as real-world camera accuracy.
+
+### “Why might YOLO acquire later than the synthetic detector?”
+
+At the default 240 m start, a small drone can occupy only two or three pixels. A trained model cannot recover detail that the selected camera did not capture. YOLO honestly remains in search until enough pixels are present; the synthetic fallback can measure subpixel projection because it is a deterministic mathematical test adapter. A real deployment would choose optics/resolution for the required acquisition range and train on representative physical-camera data.
 
 ### “Why were Aegis-Q4 and Smart Evader tilting upward?”
 
@@ -142,7 +150,7 @@ Only its explicitly labeled `TRICKY AI` target autopilot is allowed to know our 
 
 ### “Does mouse-wheel zoom improve detection?”
 
-No. It changes only the presentation camera used to inspect the scene. The synthetic defense sensor remains at its configured 90° field of view, so zoom cannot acquire a target, preserve lock, change an oval, or improve the range calculation.
+No. It changes only the presentation camera used to inspect the scene. The defense sensor remains at its configured 90° field of view in both YOLO and synthetic modes, so zoom cannot acquire a target, preserve lock, change an oval, or improve the range calculation.
 
 ## A clean live-demo sequence
 

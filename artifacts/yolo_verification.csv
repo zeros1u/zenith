@@ -1,0 +1,8 @@
+scenario,identity,hit,hit_time_s,minimum_range_m,range_mae_m,range_rmse_m,samples,detector,inference_ms
+steady,True,True,9.6,0.0,19.514,30.388,72,yolo,29.971
+weave,True,True,9.75,0.0,19.587,31.528,73,yolo,24.179
+evasive,True,True,10.083,0.0,16.491,28.668,80,yolo,24.799
+braking,True,True,7.4,0.0,25.903,35.174,53,yolo,37.445
+rotating,True,True,8.15,0.0,22.833,34.458,64,yolo,35.489
+tricky,True,True,11.25,0.0,28.361,44.975,89,yolo,32.966
+rocket_attack,True,True,2.083,0.0,21.412,28.361,13,yolo,30.301

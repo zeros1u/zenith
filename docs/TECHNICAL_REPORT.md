@@ -4,15 +4,16 @@
 
 ZENITH is a proof-of-concept onboard software system that tells an interceptor which maneuver to execute using one monocular camera. Target model information is given by the exercise and is represented operationally as a signal lookup that starts only after a generic visual drone detection.
 
-The defense guidance algorithm does not read simulated target coordinates. Simulation truth has three isolated defense-side uses:
+The defense guidance algorithm does not read simulated target coordinates. Simulation truth has four isolated boundary uses:
 
-1. creating the synthetic camera observation;
+1. rasterizing the virtual world into a clean onboard sensor image, or creating the explicitly selected synthetic fallback observation;
 2. detecting physical contact and applying crash physics;
-3. producing the marked `TRUE / ERROR` value and exported verification data.
+3. producing the marked `TRUE / ERROR` value and exported verification data;
+4. binding generic image tracks to the simulated actors that answer the exercise's later signal lookup.
 
 Our interceptor's position and velocity are propagated from its own commanded acceleration, which represents normal onboard inertial/state estimation. No external target range sensor is modeled.
 
-No trained neural detector is claimed in this milestone. A deterministic synthetic camera adapter uses truth only to generate a detector-style floating-point 2D box, vehicle-center image keypoint, bearing, confidence, and imperfect visual pose output. All defense-side estimation after that boundary consumes those outputs rather than target state.
+The bundled custom Ultralytics YOLO model is a real trained detector for the generic `aerial_target` class. Its runtime method receives only a BGR pixel array from the rigid virtual camera and returns boxes and confidence. The same renderer's exact simulator annotations are exposed only through a separately named offline dataset-generation method; runtime inference cannot access them. A deterministic synthetic box/pose adapter remains an explicitly labeled fallback. All defense-side estimation after either boundary consumes detector output rather than target state.
 
 The optional multi-contact setup creates up to three intruders. The detector, signal timer, pinhole range estimate, filtered metric track, uncertainty, prediction ovals, and guidance solution are stored separately for every contact. At most two contacts participate in one shared maneuver. Their ellipses are compared only at an equal prediction horizon (`1↔1`, `2↔2`, `3↔3`, or `5↔5`) after conversion to the frozen camera's normalized image plane. This makes the comparison independent of their different target depths. A pair qualifies only when each ellipse center lies inside the other, their intersection centroid is physically reachable at that horizon, and both tracks remain visually valid. The largest qualifying shared horizon is selected. When our reach enters either member's smaller nested oval, that contact becomes a sticky committed lock until its visual detection is lost. Apparent size, confidence, estimated range, closing speed, and TTC break ties between qualifying pairs; exact simulated target coordinates are not inputs to this choice.
 
@@ -72,7 +73,9 @@ A width-only estimate fails when a rectangular target rotates. For box dimension
 Sx(ψ) = |W cos ψ| + |L sin ψ|
 ```
 
-ZENITH uses all eight known-model corners and the synthetic detector adapter's imperfect visual pose output to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The range estimator does not read target orientation directly. The full fit matters at terminal distance because different corners no longer have equal depth.
+In fallback mode, ZENITH uses all eight known-model corners and the synthetic detector adapter's imperfect visual pose output to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The range estimator does not read target orientation directly. The full fit matters at terminal distance because different corners no longer have equal depth.
+
+Plain YOLO detection supplies no 3D pose. ZENITH therefore uses two verifiable known-shape rules instead of substituting simulator orientation. A drone uses `S = 1.10 max(width, length)` with the box's major pixel axis; `1.10` is one fixed held-out calibration for the trained model's tiny-object box-size bias, not a runtime truth correction. A long rocket uses `S = max(width, height)` with the box's minor axis; for a roughly axial body that minor dimension remains its cross-section from nose-on through side-on views. The full known-model bounding diameter `sqrt(W² + H² + L²)` contributes to the ambiguity audit and declared orientation/confidence uncertainty rather than becoming a systematically high point estimate. This remains less precise than a physical keypoint/pose model.
 
 The display retains a naive width-only result internally, allowing the compensated method to be compared later when realistic models and a pose detector are connected.
 
@@ -133,12 +136,12 @@ These are not arbitrary labels: the application recalculates the table for which
 
 ## 6. Detection and signal sequence
 
-The current `detect_box` backend is not YOLO, DINO, or another trained recognizer. It is a deterministic simulation adapter with the same floating-point box, center-keypoint, and pose output boundary expected from a generic detector plus keypoint/pose estimator. Preserving subpixel box coordinates avoids an artificial 3 px to 4 px range step; the uncertainty calculation still includes a half-pixel edge envelope. This makes the camera-to-guidance software testable now without presenting synthetic detections as a trained AI model.
+`YOLO CUSTOM` uses a trained nano detector at 960-pixel model input size. The software sensor renderer supplies a label-free BGR frame. Every detector sample evaluates a native-pixel crop fixed at the sensor boresight; every fifth sample also evaluates the complete field of view in the same batch, and a miss restores full-FOV evaluation until acquisition. The crop is taken from the same image and is never moved toward simulator truth; it prevents a 1920/3840 sensor target from being erased by whole-frame downscaling. The model returns `xyxy`, confidence, and class. It is sampled at 30 Hz while physics/guidance remain at 60 Hz. Multi-object association compares only current/previous image centers. A one-time seed binds generic tracks to simulated signal responders but cannot enter range, filtering, priority, ovals, overlap selection, or commands. `SYNTHETIC BOX + POSE` remains a deterministic fallback and is never labeled as YOLO.
 
 The implemented state machine is:
 
 1. `SEARCHING`
-2. a generic aerial object with at least 3 px apparent span becomes `VISUAL LOCK / SIGNAL QUERY`
+2. a generic aerial object detected above the active backend's confidence/pixel threshold becomes `VISUAL LOCK / SIGNAL QUERY`
 3. a simulated lookup resolves the known target specification after 0.65 s for drones or 0.42 s for fast incoming rockets
 4. the range estimator, metric track, and oval guidance activate
 5. any later loss becomes `TARGET LOST / SEARCHING`, clears guidance immediately, and extrapolates the filtered image-plane bearing rate for no more than 1.5 seconds
@@ -246,7 +249,7 @@ Collision uses the closest separation across the entire relative-motion segment 
 
 ## 11. Player takeover and control authority
 
-`Tab` cycles between autonomous guidance, player control of our interceptor, player control of the target, and autonomy again. Entering a player mode copies the vehicle's current heading and altitude into the assisted controller, so authority transfer does not create an artificial pose or speed jump. The presentation camera follows the controlled vehicle, while the synthetic defense sensor remains independent.
+`Tab` cycles between autonomous guidance, player control of our interceptor, player control of the target, and autonomy again. Entering a player mode copies the vehicle's current heading and altitude into the assisted controller, so authority transfer does not create an artificial pose or speed jump. The presentation camera follows the controlled vehicle, while the rigid defense sensor and its selected detector remain independent.
 
 The player does not write position or velocity directly. `W/S`, `A/D`, and `Q/E` create forward, turn, and vertical requests; `Shift` requests the full available bound, `Ctrl` activates a supported airbrake, and `X` cuts or restarts the selected engine. Those requests pass through the normal 60 Hz flight model:
 
@@ -275,12 +278,13 @@ Seven deterministic behaviors are included:
 
 `verify_prototype.py` executes all seven and reports identification, hit time, minimum separation, and range error. The tricky row uses SMART EVADER deterministically through the same physically bounded integration as every other target; the rocket-attack row uses SKYFALL-R1. The current checked-in verification report is `artifacts/verification.csv`.
 
-Rotation is handled by known-model pose-compensated physical spans. Maneuvers are handled by the alpha-beta track, model acceleration limits, four-extreme ovals, and terminal velocity matching.
+In deterministic fallback mode, rotation is handled by known-model pose-compensated physical spans. Plain YOLO supplies no pose, so its separate range path uses the declared planform/cross-section rules and reports larger ambiguity instead of reading simulator orientation. Maneuvers are handled by the alpha-beta track, model acceleration limits, full 96-direction ellipse border, and terminal velocity matching.
 
 ## 13. Known prototype boundaries
 
 - Six original low-poly drone meshes and two original rocket meshes are bundled. The SMART EVADER uses a saucer body, pointed +Z nose, stabilizers, keel, and twin rear drives so its direction remains unambiguous. They are recognizable real-time silhouettes rather than photorealistic Blender assets.
-- The generic detector backend deterministically emits a synthetic floating-point camera box, center keypoint, bearing, confidence, and imperfect pose estimate. It represents a future detector/keypoint/pose output contract, not a trained neural network.
+- The custom YOLO weights are trained on generated ZENITH frames. This proves actual model inference and a replaceable pixel boundary, not accuracy on real outdoor camera footage. The synthetic box/pose backend remains a separately labeled fallback.
+- Targets at long range may occupy only two or three pixels. YOLO correctly cannot guarantee recognition without sufficient sensor information; field deployment requires optics and resolution sized for the acquisition range.
 - The signal lookup is simulated; it is a state and data-flow demonstration, not radio hardware.
 - The current oval is a conservative acceleration-support envelope in the 2D camera plane. A production system would also propagate range-axis uncertainty, latency, pose confidence, wind, actuator dynamics, and safety constraints.
 - The lift model is not CFD. Production aerodynamics require measured lift/drag curves, mass, wing area, angle of attack, wind, control-surface dynamics, and flight-test validation.

@@ -11,13 +11,23 @@ import statistics
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
 
 
-def verify_scenario(scenario: str, duration_s: float) -> dict[str, object]:
+def verify_scenario(
+    scenario: str,
+    duration_s: float,
+    detector_backend: str = "synthetic_projection",
+    yolo_weights_path: str | None = None,
+) -> dict[str, object]:
     target_code = {
         "rocket_attack": "SR1",
         "tricky": "SEV",
     }.get(scenario, "FX1")
     sim = InterceptionSimulation(
-        SimulationConfig(scenario=scenario, target_code=target_code)
+        SimulationConfig(
+            scenario=scenario,
+            target_code=target_code,
+            detector_backend=detector_backend,
+            yolo_weights_path=yolo_weights_path,
+        )
     )
     minimum_range = math.inf
     for _ in range(round(duration_s * 60)):
@@ -41,6 +51,8 @@ def verify_scenario(scenario: str, duration_s: float) -> dict[str, object]:
         "range_mae_m": round(mean_absolute, 3),
         "range_rmse_m": round(rmse, 3),
         "samples": len(errors),
+        "detector": detector_backend,
+        "inference_ms": round(sim.detector_metrics.inference_ms, 3),
     }
 
 
@@ -48,8 +60,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=float, default=30.0)
     parser.add_argument("--csv", type=Path, help="optional path for a machine-readable report")
+    parser.add_argument(
+        "--detector",
+        choices=("synthetic_projection", "yolo"),
+        default="synthetic_projection",
+    )
+    parser.add_argument("--yolo-weights")
     args = parser.parse_args()
-    rows = [verify_scenario(key, args.duration) for key, _ in SCENARIOS]
+    rows = [
+        verify_scenario(
+            key,
+            args.duration,
+            args.detector,
+            args.yolo_weights,
+        )
+        for key, _ in SCENARIOS
+    ]
 
     headers = (
         "scenario",
@@ -60,7 +86,10 @@ def main() -> int:
         "range_mae_m",
         "range_rmse_m",
         "samples",
+        "detector",
+        "inference_ms",
     )
+    print(f"Detector: {args.detector}")
     print(
         f"{'SCENARIO':<14} {'ID':>3} {'HIT':>4} {'HIT(s)':>8} "
         f"{'MIN(m)':>8} {'MAE(m)':>8} {'RMSE(m)':>9} {'N':>5}"

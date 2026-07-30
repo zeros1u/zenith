@@ -30,6 +30,11 @@ from zenith.rendering import (
     WorldRenderer,
 )
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
+from zenith.vision import (
+    DEFAULT_YOLO_WEIGHTS,
+    VisionBackendUnavailable,
+    yolo_package_present,
+)
 
 
 DISPLAY_OPTIONS = (
@@ -107,6 +112,11 @@ class SetupScreen:
         self.scenario_index = 2
         self.sensor_index = 1
         self.enemy_count = 1
+        self.detector_backend = (
+            "yolo"
+            if yolo_package_present()
+            else "synthetic_projection"
+        )
         self.display_index = min(
             range(len(DISPLAY_OPTIONS)),
             key=lambda index: abs(DISPLAY_OPTIONS[index][0] - size[0])
@@ -268,8 +278,37 @@ class SetupScreen:
             ),
             (50, 82),
         )
-        pipeline = "SYNTHETIC DETECTOR [YOLO/DINO ADAPTER INTERFACE]  >  SIGNAL LOOKUP  >  PINHOLE RANGE  >  OVALS  >  MANEUVER"
+        pipeline = (
+            "PIXELS  >  DETECTION  >  SIGNAL LOOKUP  >  PINHOLE RANGE  >  "
+            "OVALS  >  MANEUVER"
+        )
         surface.blit(self.small.render(pipeline, True, MUTED), (50, 113))
+        yolo_available = yolo_package_present()
+        backend_text = (
+            "DETECTOR: YOLO CUSTOM"
+            if self.detector_backend == "yolo"
+            else "DETECTOR: SYNTHETIC"
+        )
+        if self.detector_backend == "yolo" and not yolo_available:
+            backend_text = (
+                "YOLO WEIGHTS REQUIRED"
+                if not DEFAULT_YOLO_WEIGHTS.is_file()
+                else "YOLO ENVIRONMENT REQUIRED"
+            )
+        self._button(
+            surface,
+            "detector_toggle",
+            pygame.Rect(width - 286, 101, 238, 31),
+            backend_text,
+            True,
+            (
+                GREEN
+                if self.detector_backend == "yolo" and yolo_available
+                else CYAN
+                if self.detector_backend == "synthetic_projection"
+                else RED
+            ),
+        )
 
         content_width = min(1260, width - 90)
         left = (width - content_width) // 2
@@ -399,6 +438,12 @@ class SetupScreen:
             elif key.startswith("display_"):
                 self.display_index = int(key.split("_")[1])
                 self.display_request = DISPLAY_OPTIONS[self.display_index]
+            elif key == "detector_toggle":
+                self.detector_backend = (
+                    "synthetic_projection"
+                    if self.detector_backend == "yolo"
+                    else "yolo"
+                )
             elif key == "launch":
                 return self.build_config()
         return None
@@ -446,6 +491,7 @@ class SetupScreen:
             scenario=SCENARIOS[self.scenario_index][0],
             camera=CameraModel(resolution[0], resolution[1], 90.0),
             enemy_count=enemy_count,
+            detector_backend=self.detector_backend,
         )
 
 
@@ -454,7 +500,12 @@ def run_headless(args: argparse.Namespace) -> int:
         "rocket_attack": "SR1",
         "tricky": "SEV",
     }.get(args.scenario, "FX1")
-    config = SimulationConfig(scenario=args.scenario, target_code=target_code)
+    config = SimulationConfig(
+        scenario=args.scenario,
+        target_code=target_code,
+        detector_backend=args.detector,
+        yolo_weights_path=args.yolo_weights,
+    )
     simulation = InterceptionSimulation(config)
     steps = args.headless_steps if args.headless_steps is not None else 600
     for _ in range(steps):
@@ -480,6 +531,15 @@ def run_headless(args: argparse.Namespace) -> int:
     result = {
         "version": "prototype-02",
         "scenario": args.scenario,
+        "detector_backend": simulation.config.detector_backend,
+        "detector_inference_ms": round(
+            simulation.detector_metrics.inference_ms,
+            3,
+        ),
+        "detector_detection_count": (
+            simulation.detector_metrics.detection_count
+        ),
+        "detector_device": simulation.detector_metrics.device,
         "steps": steps,
         "simulation_time_s": round(simulation.time_s, 3),
         "identity_confirmed": simulation.identity_confirmed,
@@ -525,6 +585,10 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                 "priority_score_camera_tracks",
                 "target_type",
                 "target_model",
+                "detector_backend",
+                "detector_inference_ms",
+                "detector_detection_count",
+                "detector_device",
                 "multi_guidance_mode",
                 "shared_pair",
                 "shared_horizon_s",
@@ -577,6 +641,10 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                     f"{sample.priority_score:.6f}",
                     sample.target_type,
                     sample.target_model,
+                    sample.detector_backend,
+                    f"{sample.detector_inference_ms:.6f}",
+                    sample.detector_detection_count,
+                    sample.detector_device,
                     sample.multi_guidance_mode,
                     sample.shared_pair or "",
                     (
@@ -685,8 +753,13 @@ def run_interactive() -> int:
                     )
                     setup.size = requested_display
                 if config is not None:
+                    try:
+                        candidate = InterceptionSimulation(config)
+                    except (ValueError, VisionBackendUnavailable) as exc:
+                        setup.error = str(exc)
+                        continue
                     current_config = config
-                    simulation = InterceptionSimulation(config)
+                    simulation = candidate
                     renderer = WorldRenderer()
                     app_state = "simulation"
                     accumulator = 0.0
@@ -929,6 +1002,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scenario",
         choices=[key for key, _ in SCENARIOS],
         default="evasive",
+    )
+    parser.add_argument(
+        "--detector",
+        choices=("synthetic_projection", "yolo"),
+        default="synthetic_projection",
+    )
+    parser.add_argument(
+        "--yolo-weights",
+        help="optional custom YOLO .pt path; defaults to models/zenith_yolo.pt",
     )
     parser.add_argument("--screenshot", help="save the final headless frame as a PNG")
     return parser.parse_args(argv)

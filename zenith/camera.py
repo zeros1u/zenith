@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Protocol, runtime_checkable
 
 from .math3d import (
     Vec3,
@@ -17,6 +16,9 @@ from .math3d import (
 from .models import DroneSpec
 from .meshes import transformed_vertices
 from .physics import DroneState
+
+
+YOLO_DRONE_BOX_CALIBRATION = 1.10
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,26 +53,6 @@ class Detection:
     camera_depth: float
     projected_vertices: tuple[tuple[float, float], ...]
     pose_estimate: Vec3 | None = None
-
-
-@runtime_checkable
-class ImageDetectorAdapter(Protocol):
-    """Optional boundary for YOLO/DINO-style sensor-frame integrations.
-
-    ZENITH's self-contained demo uses ``detect_box`` as a deterministic
-    synthetic image-recognition adapter. A real backend can implement this
-    protocol and return the same image-space observations without changing
-    tracking, ranging, prediction, or guidance.
-    """
-
-    name: str
-
-    def detect_frame(
-        self,
-        frame: object,
-        timestamp_s: float,
-    ) -> tuple[Detection, ...]:
-        ...
 
 
 @dataclass(slots=True)
@@ -292,6 +274,70 @@ def estimate_range(
         naive_distance,
         span_x,
         span_y,
+    )
+
+
+def estimate_range_without_pose(
+    detection: Detection,
+    spec: DroneSpec,
+    camera: CameraModel,
+) -> RangeEstimate | None:
+    """Known-size range for a detector box that supplies no target pose.
+
+    Drones use their largest known planform dimension with the box major axis.
+    Long rockets use their known cross-section with the box minor axis, which
+    remains the cross-section from nose-on through side-on views. The full
+    bounding diameter contributes to uncertainty but is not used as a biased
+    point estimate. No simulator orientation enters this calculation.
+    """
+    if not detection.visible:
+        return None
+    if spec.flight_model == "rocket":
+        apparent = min(detection.width_px, detection.height_px)
+        physical_span = max(spec.dimensions.x, spec.dimensions.y)
+    else:
+        apparent = max(detection.width_px, detection.height_px)
+        # Tiny-object model boxes average about 10% wider than the exact
+        # rendered silhouette labels. This fixed validation calibration is
+        # part of the detector model, not a truth-derived runtime correction.
+        physical_span = (
+            max(spec.dimensions.x, spec.dimensions.z)
+            * YOLO_DRONE_BOX_CALIBRATION
+        )
+    if apparent < 1.0:
+        return None
+    physical_diameter = spec.dimensions.length()
+    optical_depth = camera.focal_px * physical_span / apparent
+    ray_scale = math.sqrt(
+        1.0
+        + math.tan(math.radians(detection.bearing_x_deg)) ** 2
+        + math.tan(math.radians(detection.bearing_y_deg)) ** 2
+    )
+    distance = optical_depth * ray_scale
+    quantization_fraction = 0.5 / apparent
+    shape_ambiguity = max(
+        0.0,
+        physical_diameter - physical_span,
+    ) / physical_diameter
+    orientation_fraction = 0.08 + 0.10 * shape_ambiguity + 0.14 * (
+        1.0 - clamp(detection.confidence, 0.0, 1.0)
+    )
+    sigma = distance * math.sqrt(
+        quantization_fraction**2 + orientation_fraction**2
+    )
+    conservative_diameter_distance = (
+        camera.focal_px
+        * physical_diameter
+        / max(detection.width_px, detection.height_px)
+        * ray_scale
+    )
+    return RangeEstimate(
+        distance,
+        optical_depth,
+        max(0.15, sigma),
+        conservative_diameter_distance,
+        physical_span,
+        physical_span,
     )
 
 

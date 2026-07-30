@@ -17,8 +17,10 @@ from app import (
 from zenith.camera import (
     CameraModel,
     Detection,
+    YOLO_DRONE_BOX_CALIBRATION,
     detect_box,
     estimate_range,
+    estimate_range_without_pose,
     minimum_horizontal_resolution,
     range_from_apparent_size,
 )
@@ -47,6 +49,16 @@ from zenith.rendering import (
     WorldRenderer,
 )
 from zenith.simulation import InterceptionSimulation, SCENARIOS, SimulationConfig
+from zenith.vision import (
+    DetectorMetrics,
+    FrameDetection,
+    SensorFrameRenderer,
+    UltralyticsYOLODetector,
+    VisionBackendUnavailable,
+    associate_frame_detections,
+    frame_detection_to_camera,
+    yolo_package_present,
+)
 
 
 class VectorTests(unittest.TestCase):
@@ -57,6 +69,171 @@ class VectorTests(unittest.TestCase):
         self.assertAlmostEqual(forward.length(), 1.0)
         self.assertAlmostEqual(right.dot(up), 0.0, places=7)
         self.assertAlmostEqual(right.dot(forward), 0.0, places=7)
+
+
+class VisionAdapterTests(unittest.TestCase):
+    def test_bundled_yolo_weights_detect_a_rendered_target(self) -> None:
+        if not yolo_package_present():
+            self.skipTest("optional trained YOLO environment is unavailable")
+        sim = InterceptionSimulation(
+            SimulationConfig(
+                target_position=Vec3(0.0, 28.0, 70.0),
+                scenario="steady",
+                detector_backend="yolo",
+            )
+        )
+        sim.step()
+        self.assertEqual(sim.detector_metrics.backend_name, "YOLO CUSTOM")
+        self.assertGreater(sim.detector_metrics.inference_ms, 0.0)
+        self.assertGreaterEqual(sim.detector_metrics.detection_count, 1)
+        self.assertTrue(sim.visual_locked)
+
+    def test_runtime_sensor_renderer_returns_pixels_without_annotations(self) -> None:
+        renderer = SensorFrameRenderer()
+        state = DroneState(
+            DRONE_SPECS[0],
+            Vec3(0.0, 0.0, 20.0),
+            Vec3(),
+        )
+        frame = renderer.render_bgr(
+            (state,),
+            Vec3(),
+            Vec3(0.0, 0.0, 1.0),
+            CameraModel(320, 180, 90.0),
+            (320, 180),
+        )
+        self.assertEqual(frame.shape, (180, 320, 3))
+        self.assertEqual(str(frame.dtype), "uint8")
+
+        labeled_frame, labels = renderer.render_labeled_bgr(
+            (state,),
+            Vec3(),
+            Vec3(0.0, 0.0, 1.0),
+            CameraModel(320, 180, 90.0),
+            (320, 180),
+        )
+        self.assertEqual(labeled_frame.shape, frame.shape)
+        self.assertEqual(len(labels), 1)
+
+    def test_yolo_small_target_crop_is_fixed_at_sensor_boresight(self) -> None:
+        detector = UltralyticsYOLODetector(model=object())
+        renderer = SensorFrameRenderer()
+        frame = renderer.render_bgr(
+            (),
+            Vec3(),
+            Vec3(0.0, 0.0, 1.0),
+            CameraModel(1920, 1080, 90.0),
+            (1920, 1080),
+        )
+        views = detector._inference_views(frame)
+        self.assertEqual(len(views), 2)
+        self.assertEqual(views[0][1], (0.0, 0.0))
+        self.assertEqual(views[1][0].shape, (540, 960, 3))
+        self.assertEqual(views[1][1], (480.0, 270.0))
+
+        detector._frame_index = 1
+        crop_only = detector._inference_views(frame)
+        self.assertEqual(len(crop_only), 1)
+        self.assertEqual(crop_only[0][1], (480.0, 270.0))
+
+    def test_full_frame_and_crop_boxes_are_merged_by_image_geometry(self) -> None:
+        detections = (
+            FrameDetection(
+                (98.0, 98.0, 106.0, 106.0),
+                0.91,
+                0,
+                "aerial_target",
+            ),
+            FrameDetection(
+                (101.0, 99.0, 108.0, 107.0),
+                0.72,
+                0,
+                "aerial_target",
+            ),
+            FrameDetection(
+                (280.0, 100.0, 289.0, 109.0),
+                0.84,
+                0,
+                "aerial_target",
+            ),
+        )
+        merged = UltralyticsYOLODetector._merge_overlapping(detections)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0].confidence, 0.91)
+        self.assertEqual(merged[1].confidence, 0.84)
+
+    def test_yolo_box_maps_to_sensor_without_simulator_pose(self) -> None:
+        detection = frame_detection_to_camera(
+            FrameDetection(
+                (100.0, 50.0, 300.0, 150.0),
+                0.82,
+                0,
+                "aerial_target",
+            ),
+            (400, 200),
+            CameraModel(800, 400, 90.0),
+        )
+        self.assertEqual(detection.bbox, (200.0, 100.0, 600.0, 300.0))
+        self.assertEqual(detection.center_px, (400.0, 200.0))
+        self.assertAlmostEqual(detection.bearing_x_deg, 0.0)
+        self.assertAlmostEqual(detection.bearing_y_deg, 0.0)
+        self.assertIsNone(detection.pose_estimate)
+
+    def test_multi_box_association_uses_image_centers(self) -> None:
+        detections = (
+            FrameDetection((320, 30, 380, 90), 0.8, 0, "aerial_target"),
+            FrameDetection((20, 25, 80, 85), 0.9, 0, "aerial_target"),
+        )
+        assignments = associate_frame_detections(
+            ((50.0, 55.0), (350.0, 60.0)),
+            detections,
+            (400, 200),
+        )
+        self.assertEqual(assignments, {0: 1, 1: 0})
+
+    def test_yolo_runtime_does_not_call_synthetic_box_detector(self) -> None:
+        class FakeDetector:
+            name = "YOLO TEST"
+            device = "cpu"
+            last_metrics = DetectorMetrics("YOLO TEST", 4.0, 1, "cpu")
+
+            def detect_frame(self, frame, timestamp_s):
+                del frame, timestamp_s
+                return (
+                    FrameDetection(
+                        (560.0, 300.0, 720.0, 420.0),
+                        0.91,
+                        0,
+                        "aerial_target",
+                    ),
+                )
+
+        class FakeRenderer:
+            def render_bgr(self, *args, **kwargs):
+                del args, kwargs
+                return object()
+
+        with (
+            patch(
+                "zenith.simulation.UltralyticsYOLODetector",
+                return_value=FakeDetector(),
+            ),
+            patch(
+                "zenith.simulation.SensorFrameRenderer",
+                return_value=FakeRenderer(),
+            ),
+        ):
+            sim = InterceptionSimulation(
+                SimulationConfig(
+                    detector_backend="yolo",
+                    yolo_weights_path="test-double.pt",
+                )
+            )
+        with patch("zenith.simulation.detect_box") as synthetic_detector:
+            sim.step()
+        synthetic_detector.assert_not_called()
+        self.assertTrue(sim.visual_locked)
+        self.assertAlmostEqual(sim.detection.confidence, 0.91)
 
 
 class InterfaceConfigTests(unittest.TestCase):
@@ -258,6 +435,58 @@ class CameraTests(unittest.TestCase):
         # At this distance the target is only a few pixels wide. The error must
         # remain inside the estimator's explicit pixel-quantisation uncertainty.
         self.assertLess(error, estimate.sigma_m)
+
+    def test_pose_free_yolo_range_uses_known_image_spans(self) -> None:
+        camera = CameraModel(2000, 1125, 90)
+        drone_detection = Detection(
+            True,
+            (996.5, 561.5, 1003.5, 563.5),
+            (1000.0, 562.5),
+            7.0,
+            2.0,
+            0.0,
+            0.0,
+            0.9,
+            0.0,
+            (),
+            None,
+        )
+        drone_estimate = estimate_range_without_pose(
+            drone_detection,
+            DRONE_SPECS[0],
+            camera,
+        )
+        self.assertIsNotNone(drone_estimate)
+        assert drone_estimate is not None
+        self.assertAlmostEqual(
+            drone_estimate.distance_m,
+            100.0 * YOLO_DRONE_BOX_CALIBRATION,
+        )
+        self.assertGreater(drone_estimate.sigma_m, 0.0)
+
+        # A side-on rocket has a long major box axis, but its minor axis still
+        # exposes the known circular cross-section without simulator pose.
+        rocket_detection = Detection(
+            True,
+            (972.5, 559.75, 1027.5, 565.25),
+            (1000.0, 562.5),
+            55.0,
+            5.5,
+            0.0,
+            0.0,
+            0.9,
+            0.0,
+            (),
+            None,
+        )
+        rocket_estimate = estimate_range_without_pose(
+            rocket_detection,
+            ROCKET_SPECS[0],
+            camera,
+        )
+        self.assertIsNotNone(rocket_estimate)
+        assert rocket_estimate is not None
+        self.assertAlmostEqual(rocket_estimate.distance_m, 100.0)
 
     def test_subpixel_box_change_does_not_create_a_range_step(self) -> None:
         camera = CameraModel(1920, 1080, 90)
@@ -1249,9 +1478,15 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(sim.multi_guidance_mode.startswith("COMMITTED"))
 
     def test_unloaded_ai_backend_cannot_be_falsely_selected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "no loaded image-model weights"):
+        with self.assertRaisesRegex(
+            VisionBackendUnavailable,
+            "weights not found",
+        ):
             InterceptionSimulation(
-                SimulationConfig(detector_backend="yolo")
+                SimulationConfig(
+                    detector_backend="yolo",
+                    yolo_weights_path="models/definitely_missing.pt",
+                )
             )
 
     def test_displayed_oval_radius_is_frame_stable(self) -> None:

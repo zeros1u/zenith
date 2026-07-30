@@ -2,6 +2,8 @@
 
 ZENITH is a windowed interactive desktop proof-of-concept for vision-only interception. It estimates an intruder's range from a monocular camera, builds conservative maneuver-containment ovals, and outputs the maneuver for a propulsion-constrained interceptor. No radar, lidar, rangefinder, or target ground-truth coordinates are used by the guidance calculation.
 
+The setup offers two explicitly labeled perception backends. `YOLO CUSTOM` rasterizes a clean rigid-camera BGR frame, runs the bundled custom `aerial_target` weights, and passes only its boxes and confidence values into the existing signal, range, tracking, oval, and guidance pipeline. `SYNTHETIC BOX + POSE` remains a dependency-free deterministic fallback. YOLO detects a generic aerial target; it deliberately does not reveal the exact vehicle model, because the project idea obtains dimensions and maneuver limits from the later simulated signal lookup.
+
 The project includes six controllable drones with distinct low-poly quadcopter, swept-wing, delta-wing, blended-wing, and directional UFO-style meshes. `WRAITH-S` is the fastest drone; `TALON-R` turns harder; and `SMART EVADER` combines high acceleration, braking, and turn authority with a separate threat-aware `TRICKY AI` behavior. The setup can launch one, two, or three enemy contacts. Every contact gets an independent detection, signal identity, range/velocity track, oval solution, and camera-derived threat score. Multi-contact guidance compares only equal horizons—2-second with 2-second, 5-second with 5-second—and steers toward the center of one qualifying two-target overlap. Once our physical reach enters either member's smaller nested oval, guidance commits to that contact. Two literal single-stage rockets are selectable on either side. Each ignites automatically, expends a finite nonrestartable booster, uses a separate limited RCS steering budget, and then coasts under drag and gravity.
 
 ![DPI-aware windowed setup](artifacts/setup_windowed.png)
@@ -11,6 +13,18 @@ The project includes six controllable drones with distinct low-poly quadcopter, 
 ![Three independent tracks with a two-target shared-overlap aim](artifacts/multi_contact_demo.png)
 
 ![In-app same-horizon overlap explanation](artifacts/multi_contact_info.png)
+
+![Clean sensor frame used by custom YOLO](artifacts/yolo_sensor_frame.png)
+
+![Setup selecting the bundled custom-YOLO backend](artifacts/yolo_setup.png)
+
+![Custom-YOLO closed loop with measured inference timing](artifacts/yolo_closed_loop.png)
+
+![Generated custom-YOLO training examples and exact offline labels](artifacts/yolo_dataset_preview.jpg)
+
+![Actual custom-YOLO predictions on held-out frames](artifacts/yolo_inference_preview.jpg)
+
+![Custom-YOLO training and validation curves](artifacts/yolo_training_results.png)
 
 ![Smart Evader and separate Tricky AI setup](artifacts/smart_evader_setup.png)
 
@@ -47,7 +61,13 @@ The project includes six controllable drones with distinct low-poly quadcopter, 
 
 On Windows, double-click `run_zenith.bat`. The application is DPI-aware, opens in a resizable 1050 × 700 window, and is not fullscreen even when Windows display scaling is 125% or 150%. The setup screen offers 1050 × 700, 1152 × 720, and 1280 × 800 window sizes independently of the simulated camera resolution.
 
-Or run it from a terminal:
+For the trained YOLO backend, create the isolated environment once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_yolo.ps1
+```
+
+`run_zenith.bat` automatically uses that environment. Select `DETECTOR: YOLO CUSTOM` on the setup screen. The fallback installation needs only Pygame:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -59,7 +79,7 @@ The installed environment needs Python 3.11+ and Pygame 2.6+.
 ## Recommended first demonstration
 
 1. Keep `TALON-R` as our interceptor and `FALCON-X1` as the target.
-2. Select `EVASIVE MANEUVERS`, `1920 × 1080`, and start the simulation. For the multi-target demonstration, also select `3` under `ENEMY CONTACTS`.
+2. Select `DETECTOR: YOLO CUSTOM`, `EVASIVE MANEUVERS`, `1920 × 1080`, and start the simulation. For the multi-target demonstration, also select `3` under `ENEMY CONTACTS`.
 3. Observe the target label change from `UNKNOWN / QUERYING` to `FALCON-X1`.
 4. Point out the 1, 2, 3, and 5 second prediction ovals. The four large dots are the cardinal summary, but the border color tests all 96 displayed edge directions. Green segments are reachable and red segments are blocked; only a completely green `96/96` edge can be selected and receive a faint green fill. Red never fills the center.
    In multi-contact mode, the cyan region is the intersection of a same-horizon pair, and the white diamond is its shared centroid. Once the interceptor enters one contact's smaller nested oval, the HUD changes from `SHARED` to `COMMITTED`.
@@ -136,7 +156,7 @@ flowchart LR
     J --> K[Acceleration command]
 ```
 
-The defense guidance never reads the simulation's exact target position: truth is used to create the synthetic detector output, detect physical contact, and calculate the explicitly marked verification error. The guidance path reads each detector box, vehicle-center image keypoint, bearing, pose output, signal-resolved model data, successive camera-derived position measurements, and our drone's own integrated state. Target velocity and acceleration are estimated from changes between those image-derived measurements; they are not copied from a target's simulated state. Floating-point detector boxes preserve subpixel motion, while explicit half-pixel uncertainty still represents finite image resolution. This avoids a false 3 px to 4 px range discontinuity. The optional `TRICKY AI` target controller is a separately declared adversary test harness: because that scenario assumes the enemy knows about us, it reads our true relative approach to choose its own bounded maneuver, but cannot feed truth back into detection or guidance. The sensor is rigidly body-mounted: it cannot turn toward truth, preserve lock with a hidden gimbal, or see behind the airframe. AEGIS-Q4 and SMART EVADER publish a fixed 6° upward camera cant and a 24° body-tilt limit so their automatic maneuver controller does not repeatedly throw its own forward camera across the vertical FOV boundary. A lost visual detection invalidates guidance immediately; the last metric track is not coasted as if it were a current lock. The search system filters the final image-plane bearing rate, extrapolates it for at most 1.5 seconds, then asks the autonomous interceptor airframe to perform a widening horizon-limited scan while holding altitude and about half maximum speed. If the player controls our vehicle, only the player can turn the body and therefore the camera.
+The defense guidance never reads the simulation's exact target position. In `YOLO CUSTOM` mode, scene truth stops at the software sensor renderer: the model receives only a clean BGR pixel array, and runtime code cannot access the offline dataset annotations. A one-time association seed binds generic image tracks to the simulated actors that answer the exercise's later signal query; seed coordinates never enter range, tracking, ovals, priority, or guidance. In fallback mode, truth instead stops at the explicitly labeled synthetic detector adapter. Physical collision and marked verification data necessarily use truth in both modes. The guidance path reads detector boxes/bearings/confidence, signal-resolved model data, successive camera-derived position measurements, and our drone's own integrated state. Target velocity and acceleration are estimated from those measurements rather than copied from target state. YOLO supplies no hidden target pose: drones use a known planform span with the box major axis, while long rockets use their known cross-section with the box minor axis; the full bounding diameter contributes only to the declared uncertainty/audit value. The optional `TRICKY AI` target controller is a separately declared adversary test harness: it may observe our approach to choose its own bounded maneuver, but cannot feed truth back into detection or guidance. The rigid sensor cannot turn toward truth, preserve lock through a hidden gimbal, or see behind the airframe. A lost image detection invalidates guidance; search uses only the final filtered image-bearing history.
 
 At every 60 Hz update the current sensor pose is frozen and each mathematical ellipse bounds the pixels the identified target could occupy after 1, 2, 3, or 5 seconds. The bound includes propulsion support, perspective at the closest permitted future depth, and the track's position/velocity uncertainty. It is then back-projected onto the plane through the estimated target, perpendicular to the current optical axis. If the future set could cross the camera plane, the horizon is labeled `UNBOUNDED / CAMERA CROSSING` instead of drawing a dishonest finite oval.
 
@@ -161,7 +181,20 @@ python benchmark_performance.py
 python benchmark_performance.py --enemies 3
 ```
 
+The trained backend can be exercised separately through the isolated environment:
+
+```powershell
+.\.venv-yolo\Scripts\python.exe app.py --headless-steps 1800 --detector yolo
+.\.venv-yolo\Scripts\python.exe verify_prototype.py --duration 30 --detector yolo
+```
+
 The verifier reports identification, interception result, hit time, minimum separation, and range-estimation MAE/RMSE. The automated suite additionally checks all 96 edge directions, green-only fill semantics, diagonal failure despite `4/4` cardinals, weighted-point limits, camera-crossing invalidation, detector-pose isolation, subpixel range continuity, frame-stable rendered oval radii, level Aegis/Smart starts, correct vectored pitch direction, saved-frame two-second containment, every drone as a baseline interceptor, half-speed no-lock cruise, onboard-only boresight, finite rocket burnout/RCS, both rockets as interceptors and targets, visual lock loss/reacquisition, gravity/aerodynamics, and every default interception scenario.
+
+The checked-in [synthetic verification report](artifacts/verification.csv) and
+[custom-YOLO verification report](artifacts/yolo_verification.csv) both record
+successful physical contact in all seven scenarios. The YOLO CSV intentionally
+shows larger monocular range error at tiny apparent sizes; model inference
+misses are never replaced with synthetic boxes.
 
 The benchmark runs the same evasive simulation and complete 1050 × 700 software-rendering path repeatedly without opening a window. Its numbers are machine-dependent; it does not reduce the fixed 60 Hz physics rate or skip any of the 96 displayed edge checks.
 
@@ -180,8 +213,17 @@ zenith/
   meshes.py               Bundled procedural drone and rocket polygon meshes
   physics.py              60 Hz gravity, lift/stall, thrust, drag, and impacts
   rendering.py            3D scene, HUD, spectator, analysis, full info display
+  vision.py               Clean sensor renderer, YOLO inference, box association
   simulation.py           Detection → signal → guidance state machine
+tools/
+  generate_yolo_dataset.py Deterministic labeled sensor-frame generation
+  train_yolo.py            GPU training, validation, and weight export
+  create_yolo_preview.py    Held-out model-prediction evidence montage
+models/zenith_yolo.pt      Bundled custom aerial-target detector weights
+models/zenith_yolo_metrics.json Held-out metrics and model SHA-256
+models/README.md            Model card, intended use, and limitations
 tests/test_core.py        Automated numerical and scenario checks
+docs/YOLO_INTEGRATION.md  Training, runtime boundary, metrics, limitations
 docs/TECHNICAL_REPORT.md  Equations, assumptions, degradation analysis
 docs/PRESENTATION_GUIDE.md Suggested presentation and likely questions
 docs/VERIFICATION_AUDIT.md Requirement-to-code-and-test evidence matrix
@@ -189,7 +231,7 @@ docs/VERIFICATION_AUDIT.md Requirement-to-code-and-test evidence matrix
 
 ## Prototype boundary
 
-There is no trained neural image-recognition model or downloaded weight file in this milestone, so the UI deliberately labels the active backend `SYNTHETIC BOX + POSE`. The generic visual detector is a deterministic synthetic-camera adapter: simulation truth is used inside that adapter to emit a floating-point 2D box, vehicle-center image keypoint, bearing, confidence, and imperfect pose estimate for every contact—the outputs a real detection/keypoint/pose stack would provide. Defense estimation and guidance consume only those outputs. Model identity deliberately does **not** come from the detector; it becomes available through the simulated post-detection signal lookup described in the project idea. `ImageDetectorAdapter` in `zenith/camera.py` defines the optional sensor-frame boundary for a later YOLO or DINO backend. Such a backend still needs model weights, its matching Python dependencies, and rendered or physical camera frames; none are silently downloaded or falsely claimed here. It can replace the detector layer without changing range, tracking, shared-overlap guidance, or HUD code.
+The bundled YOLO weights are trained on software-rendered ZENITH imagery, not real outdoor footage. This proves real model inference and a replaceable pixel boundary; it does not prove field readiness. Deployment on a physical drone would require representative real camera data, domain adaptation, calibrated optics, adverse-weather and lighting evaluation, measured false-positive/false-negative rates, hardware timing, redundant safety systems, and regulatory review. At long range the target may occupy only two or three pixels, which is genuinely insufficient for reliable recognition; YOLO mode honestly remains in search until the image contains enough information.
 
 The aerodynamic layer is intentionally a verifiable presentation model, not computational fluid dynamics: gravity is exact, while lift uses exposed stall-speed and lift-efficiency parameters plus the current flight-path direction and airspeed. A production vehicle would require measured lift/drag curves, mass, wing area, wind, control-surface dynamics, and hardware validation.
 

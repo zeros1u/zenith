@@ -7,7 +7,11 @@ import math
 
 import pygame
 
-from .camera import minimum_horizontal_resolution, model_vertices
+from .camera import (
+    YOLO_DRONE_BOX_CALIBRATION,
+    minimum_horizontal_resolution,
+    model_vertices,
+)
 from .controls import ControlMode
 from .guidance import PredictionOval
 from .math3d import (
@@ -1076,6 +1080,35 @@ class WorldRenderer:
         sim: InterceptionSimulation,
     ) -> None:
         if (
+            sim.config.detector_backend == "yolo"
+            and sim.visual_locked
+            and sim.detection.visible
+        ):
+            width, height = surface.get_size()
+            display_focal = width / (
+                2.0
+                * math.tan(
+                    math.radians(self.presentation_fov_deg) * 0.5
+                )
+            )
+            focal_scale = display_focal / sim.config.camera.focal_px
+            center_x = width * 0.5 + (
+                sim.detection.center_px[0]
+                - sim.config.camera.width_px * 0.5
+            ) * focal_scale
+            center_y = height * 0.5 + (
+                sim.detection.center_px[1]
+                - sim.config.camera.height_px * 0.5
+            ) * focal_scale
+            half_width = sim.detection.width_px * focal_scale * 0.5
+            half_height = sim.detection.height_px * focal_scale * 0.5
+            bounds = (
+                int(center_x - half_width),
+                int(center_y - half_height),
+                int(center_x + half_width),
+                int(center_y + half_height),
+            )
+        if (
             not bounds
             or self.view_mode != 0
             or self.free_look_active
@@ -1994,19 +2027,42 @@ class WorldRenderer:
             )
         else:
             relative_camera = Vec3()
+        apparent_range_span = (
+            min(sim.detection.width_px, sim.detection.height_px)
+            if sim.config.detector_backend == "yolo"
+            and sim.target.spec.flight_model == "rocket"
+            else max(sim.detection.width_px, sim.detection.height_px)
+        )
+        detector_value = (
+            (
+                f"YOLO {sim.detector_metrics.inference_ms:.1f}ms "
+                f"{sim.detector_metrics.detection_count} BOX"
+            )
+            if sim.config.detector_backend == "yolo"
+            else "SYNTHETIC BOX + POSE"
+        )
         calc_rows = [
             (
                 "DETECTOR",
-                (
-                    "SYNTHETIC BOX + POSE"
-                    if sim.config.detector_backend == "synthetic_projection"
-                    else sim.config.detector_backend.upper()
-                ),
-                CYAN,
+                detector_value if sim.detector_error is None else "YOLO ERROR",
+                GREEN
+                if sim.config.detector_backend == "yolo"
+                and sim.detector_error is None
+                else RED
+                if sim.detector_error is not None
+                else CYAN,
             ),
             ("FORMULA", "Z = f × S / p", CYAN),
             ("FOCAL LENGTH", f"{sim.config.camera.focal_px:.1f} px"),
-            ("LAST APPARENT / CONF" if sim.hit else "APPARENT / CONF", f"{max(sim.detection.width_px, sim.detection.height_px):.2f} px / {sim.detection.confidence*100:.0f}%"),
+            (
+                "LAST RANGE p / CONF"
+                if sim.hit
+                else "RANGE p / CONF",
+                (
+                    f"{apparent_range_span:.2f} px / "
+                    f"{sim.detection.confidence*100:.0f}%"
+                ),
+            ),
             ("RANGE AT IMPACT" if sim.hit else "RANGE EST.", f"{estimate.distance_m:.2f} ± {estimate.sigma_m:.2f} m" if estimate else "WAITING FOR SIZE"),
             ("LAST Dx  LEFT/RIGHT" if sim.hit else "Dx  LEFT/RIGHT", f"{relative_camera.x:+.2f} m" if estimate else "---"),
             ("LAST Dy  UP/DOWN" if sim.hit else "Dy  UP/DOWN", f"{relative_camera.y:+.2f} m" if estimate else "---"),
@@ -2175,8 +2231,23 @@ class WorldRenderer:
         spec = sim.target.spec
         camera = sim.config.camera
         focal = camera.focal_px
+        yolo_range = sim.config.detector_backend == "yolo"
+        if yolo_range:
+            reference_size = (
+                max(spec.dimensions.x, spec.dimensions.y)
+                if spec.flight_model == "rocket"
+                else max(spec.dimensions.x, spec.dimensions.z)
+                * YOLO_DRONE_BOX_CALIBRATION
+            )
+        else:
+            reference_size = spec.dimensions.x
+        apparent_range_span = (
+            min(sim.detection.width_px, sim.detection.height_px)
+            if yolo_range and spec.flight_model == "rocket"
+            else max(sim.detection.width_px, sim.detection.height_px)
+        )
         pixels = list(range(2, 201, 2))
-        ranges = [focal * spec.dimensions.x / value for value in pixels]
+        ranges = [focal * reference_size / value for value in pixels]
         max_range = min(1600.0, ranges[0])
 
         def graph_point(pixel: float, distance: float) -> tuple[int, int]:
@@ -2194,11 +2265,11 @@ class WorldRenderer:
 
         # +/- half-pixel edge quantisation envelope.
         upper = [
-            graph_point(pixel, focal * spec.dimensions.x / max(0.5, pixel - 0.5))
+            graph_point(pixel, focal * reference_size / max(0.5, pixel - 0.5))
             for pixel in pixels
         ]
         lower = [
-            graph_point(pixel, focal * spec.dimensions.x / (pixel + 0.5))
+            graph_point(pixel, focal * reference_size / (pixel + 0.5))
             for pixel in reversed(pixels)
         ]
         band = upper + lower
@@ -2215,15 +2286,26 @@ class WorldRenderer:
         right_x = graph.right + 34
         right_width = width - margin - 28 - right_x
         overlay.blit(self.font_bold.render("WHY SMALL TARGETS ARE DIFFICULT", True, AMBER), (right_x, graph.top))
+        range_method_lines = (
+            [
+                "YOLO supplies no 3D pose. The calculation uses",
+                "a known planform/cross-section span and declares",
+                "orientation/confidence uncertainty in the HUD.",
+            ]
+            if yolo_range
+            else [
+                "Pose-compensated fitting uses the known 3D",
+                "dimensions. A width-only estimate is also logged",
+                "so rotation sensitivity remains verifiable.",
+            ]
+        )
         explanation = [
             "A ±0.5 px box-edge error produces approximately:",
             "    relative range error ≈ ±0.5 / p",
             "At 4 px:  ±12.5%    At 20 px: ±2.5%",
             "At 100 px: ±0.5%",
             "",
-            "Pose-compensated fitting uses the known 3D",
-            "dimensions. A width-only estimate is also logged",
-            "so rotation sensitivity remains verifiable.",
+            *range_method_lines,
         ]
         y = graph.top + 30
         for line in explanation:
@@ -2243,7 +2325,10 @@ class WorldRenderer:
         y += 24
         for distance in (100, 250, 500, 1000):
             resolution = minimum_horizontal_resolution(
-                distance, spec.dimensions.x, camera.horizontal_fov_deg, 12
+                distance,
+                reference_size,
+                camera.horizontal_fov_deg,
+                12,
             )
             color = GREEN if resolution <= 3840 else (AMBER if resolution <= 7680 else RED)
             line = f"{distance:4d} m  →  {resolution:5d} horizontal pixels"
@@ -2254,9 +2339,13 @@ class WorldRenderer:
         overlay.blit(self.font_bold.render("CURRENT FRAME VERIFICATION", True, AMBER), (right_x, y))
         y += 30
         current_lines = [
-            f"Target: {spec.name} ({spec.dimensions.x:.2f} m reference width)",
+            (
+                f"Target: {spec.name} "
+                f"({reference_size:.2f} m "
+                f"{'known image span' if yolo_range else 'reference width'})"
+            ),
             f"Sensor focal length: {focal:.2f} px",
-            f"Measured bounding span: {max(sim.detection.width_px, sim.detection.height_px):.3f} px",
+            f"Ranging pixel span p: {apparent_range_span:.3f} px",
             f"Estimated range: {sim.range_estimate.distance_m:.3f} m" if sim.range_estimate else "Estimated range: waiting for identity",
             f"Ground-truth range: {sim.true_range_m:.3f} m [verification only]",
         ]
@@ -2356,10 +2445,15 @@ class WorldRenderer:
                 (
                     "SENSOR PIPELINE",
                     [
-                        "SYNTHETIC BOX + POSE is the honest default: ImageDetectorAdapter is the optional YOLO/DINO sensor-frame boundary; no weights are falsely claimed.",
+                        (
+                            f"Active detector: YOLO CUSTOM WEIGHTS; last inference {sim.detector_metrics.inference_ms:.1f} ms on {sim.detector_metrics.device}."
+                            if sim.config.detector_backend == "yolo"
+                            else "Active detector: SYNTHETIC BOX + POSE; select YOLO CUSTOM on setup to use trained pixel inference."
+                        ),
                         f"{len(sim.contacts)} contacts run independent boxes, signal timers, ranges, tracks, ovals, and guidance; current state: {sim.multi_guidance_mode}.",
-                        "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
-                        "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
+                        "Only after visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
+                        "YOLO receives a clean BGR sensor frame without HUD, labels, ovals, actor coordinates, or dataset annotations.",
+                        "Range uses pinhole known-size ranging; YOLO uses a known planform/cross-section span and declares larger pose ambiguity.",
                         f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
                         f"Current camera estimate: {estimated_range}",
                     ],

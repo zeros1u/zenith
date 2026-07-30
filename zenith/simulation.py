@@ -11,6 +11,7 @@ from .camera import (
     RangeEstimate,
     detect_box,
     estimate_range,
+    estimate_range_without_pose,
     position_from_detection,
 )
 from .controls import (
@@ -36,6 +37,15 @@ from .math3d import (
 )
 from .models import DRONE_SPECS, DroneSpec, get_spec
 from .physics import DroneState
+from .vision import (
+    DEFAULT_YOLO_WEIGHTS,
+    DetectorMetrics,
+    SensorFrameRenderer,
+    UltralyticsYOLODetector,
+    VisionBackendUnavailable,
+    associate_frame_detections,
+    frame_detection_to_camera,
+)
 
 
 SCENARIOS = (
@@ -59,6 +69,8 @@ class SimulationConfig:
     camera: CameraModel = field(default_factory=CameraModel)
     enemy_count: int = 1
     detector_backend: str = "synthetic_projection"
+    yolo_weights_path: str | None = None
+    yolo_inference_hz: float = 30.0
 
 
 @dataclass(slots=True)
@@ -84,6 +96,10 @@ class TelemetrySample:
     priority_score: float
     target_type: str
     target_model: str
+    detector_backend: str
+    detector_inference_ms: float
+    detector_detection_count: int
+    detector_device: str
     multi_guidance_mode: str
     shared_pair: str | None
     shared_horizon_s: float | None
@@ -132,6 +148,7 @@ class TargetContact:
     bearing_rate_y_deg_s: float = 0.0
     bearing_sample_valid: bool = False
     priority_score: float = -math.inf
+    image_model_center_px: tuple[float, float] | None = None
 
 
 class InterceptionSimulation:
@@ -143,11 +160,38 @@ class InterceptionSimulation:
     CONTACT_TOLERANCE_M = 0.42
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig()
-        if self.config.detector_backend != "synthetic_projection":
+        if self.config.detector_backend not in (
+            "synthetic_projection",
+            "yolo",
+        ):
             raise ValueError(
-                "This build has no loaded image-model weights; "
-                "detector_backend must be 'synthetic_projection'."
+                "detector_backend must be 'synthetic_projection' or 'yolo'."
             )
+        self.frame_detector: UltralyticsYOLODetector | None = None
+        self.sensor_frame_renderer: SensorFrameRenderer | None = None
+        self.detector_metrics = DetectorMetrics(
+            "SYNTHETIC BOX + POSE",
+            0.0,
+            0,
+            "SIMULATION",
+        )
+        self.detector_error: str | None = None
+        self._next_detector_frame_s = 0.0
+        self._last_detector_frame_s = 0.0
+        self.detector_frame_size = (
+            self.config.camera.width_px,
+            self.config.camera.height_px,
+        )
+        self._yolo_seed_centers: list[
+            tuple[float, float] | None
+        ] = []
+        if self.config.detector_backend == "yolo":
+            weights_path = (
+                self.config.yolo_weights_path or str(DEFAULT_YOLO_WEIGHTS)
+            )
+            self.frame_detector = UltralyticsYOLODetector(weights_path)
+            self.sensor_frame_renderer = SensorFrameRenderer()
+            self.detector_metrics = self.frame_detector.last_metrics
         self.time_s = 0.0
         self.paused = False
         self.finished = False
@@ -299,6 +343,30 @@ class InterceptionSimulation:
             )
             for index, vehicle in enumerate(self.targets)
         ]
+        if self.frame_detector is not None:
+            frame_width, frame_height = self.detector_frame_size
+            scale_x = frame_width / self.config.camera.width_px
+            scale_y = frame_height / self.config.camera.height_px
+            # One-time association seed inside the simulated sensor boundary.
+            # It binds generic YOLO boxes to the simulated actors that answer
+            # the later signal query; none of these seed measurements are sent
+            # to range, tracking, ovals, priority, or guidance.
+            for contact in self.contacts:
+                seed = detect_box(
+                    contact.vehicle,
+                    self.interceptor.position,
+                    self.camera_forward,
+                    self.config.camera,
+                    self.time_s,
+                )
+                self._yolo_seed_centers.append(
+                    (
+                        seed.center_px[0] * scale_x,
+                        seed.center_px[1] * scale_y,
+                    )
+                    if seed.visible
+                    else None
+                )
         self.active_contact_index = 0
         self._priority_candidate_index = 0
         self._priority_candidate_time_s = 0.0
@@ -515,6 +583,7 @@ class InterceptionSimulation:
     def toggle_sensor_occlusion(self) -> None:
         """Presentation control for proving lock-loss behavior deterministically."""
         self.sensor_occluded = not self.sensor_occluded
+        self._next_detector_frame_s = 0.0
         state = "blocked" if self.sensor_occluded else "restored"
         self._event(f"Camera image {state} by test control")
 
@@ -918,14 +987,106 @@ class InterceptionSimulation:
         contact.last_bearing_y_deg = bearing_y
         contact.bearing_sample_valid = True
 
-    def _sense_contact(self, contact: TargetContact, dt: float) -> None:
-        """Run the same detector, signal, range and track pipeline per target."""
-        contact.detection = detect_box(
-            contact.vehicle,
+    def _sense_yolo_contacts(self, dt: float) -> bool:
+        """Render one sensor frame and process only YOLO-produced boxes."""
+        detector = self.frame_detector
+        renderer = self.sensor_frame_renderer
+        if detector is None or renderer is None:
+            return False
+        if self.time_s + 1e-9 < self._next_detector_frame_s:
+            return False
+        interval = 1.0 / max(1.0, self.config.yolo_inference_hz)
+        observation_dt = max(
+            dt,
+            self.time_s - self._last_detector_frame_s,
+        )
+        self._last_detector_frame_s = self.time_s
+        self._next_detector_frame_s = self.time_s + interval
+        frame = renderer.render_bgr(
+            self.targets,
             self.interceptor.position,
             self.camera_forward,
             self.config.camera,
-            self.time_s,
+            self.detector_frame_size,
+            occluded=self.sensor_occluded,
+        )
+        try:
+            frame_detections = (
+                ()
+                if self.sensor_occluded
+                else detector.detect_frame(frame, self.time_s)
+            )
+            self.detector_metrics = (
+                DetectorMetrics(
+                    detector.name,
+                    detector.last_metrics.inference_ms,
+                    0,
+                    detector.last_metrics.device,
+                )
+                if self.sensor_occluded
+                else detector.last_metrics
+            )
+            self.detector_error = None
+        except VisionBackendUnavailable as exc:
+            frame_detections = ()
+            self.detector_error = str(exc)
+            self.detector_metrics = DetectorMetrics(
+                detector.name,
+                0.0,
+                0,
+                detector.device,
+            )
+            self._event(f"YOLO ERROR: {self.detector_error}")
+
+        expected_centers = [
+            contact.image_model_center_px
+            if contact.image_model_center_px is not None
+            else self._yolo_seed_centers[index]
+            if index < len(self._yolo_seed_centers)
+            else None
+            for index, contact in enumerate(self.contacts)
+        ]
+        assignments = associate_frame_detections(
+            expected_centers,
+            frame_detections,
+            self.detector_frame_size,
+        )
+        for contact_index, contact in enumerate(self.contacts):
+            detection_index = assignments.get(contact_index)
+            if detection_index is None:
+                observation = self._empty_detection()
+            else:
+                frame_detection = frame_detections[detection_index]
+                contact.image_model_center_px = frame_detection.center_px
+                observation = frame_detection_to_camera(
+                    frame_detection,
+                    self.detector_frame_size,
+                    self.config.camera,
+                )
+            self._sense_contact(
+                contact,
+                observation_dt,
+                detection_override=observation,
+            )
+        return True
+
+    def _sense_contact(
+        self,
+        contact: TargetContact,
+        dt: float,
+        detection_override: Detection | None = None,
+    ) -> None:
+        """Run the same detector, signal, range and track pipeline per target."""
+        contact.detection = (
+            detection_override
+            if detection_override is not None
+            else detect_box(
+                contact.vehicle,
+                self.interceptor.position,
+                self.camera_forward,
+                self.config.camera,
+                self.time_s,
+            )
         )
         if self.sensor_occluded:
             contact.detection = self._empty_detection(
@@ -1006,6 +1167,12 @@ class InterceptionSimulation:
                     self.config.camera,
                 )
                 if pose_estimate is not None
+                else estimate_range_without_pose(
+                    contact.detection,
+                    contact.vehicle.spec,
+                    self.config.camera,
+                )
+                if self.config.detector_backend == "yolo"
                 else None
             )
             if contact.range_estimate is not None:
@@ -1324,8 +1491,11 @@ class InterceptionSimulation:
         if self.lost_time_s > 0.0:
             self.search_direction = self._predicted_search_direction()
 
-        for contact in self.contacts:
-            self._sense_contact(contact, dt)
+        if self.frame_detector is not None:
+            self._sense_yolo_contacts(dt)
+        else:
+            for contact in self.contacts:
+                self._sense_contact(contact, dt)
         self._choose_priority_contact(dt)
         self._load_active_contact()
 
@@ -1368,6 +1538,10 @@ class InterceptionSimulation:
                 self.active_contact.priority_score,
                 self.target.spec.vehicle_type,
                 self.target.spec.name,
+                self.config.detector_backend,
+                self.detector_metrics.inference_ms,
+                self.detector_metrics.detection_count,
+                self.detector_metrics.device,
                 self.multi_guidance_mode,
                 (
                     "+".join(
