@@ -24,8 +24,10 @@ from zenith.camera import (
 )
 from zenith.controls import ControlMode, ManualControlInput
 from zenith.guidance import (
+    PredictionOval,
     TargetTrack,
     build_prediction_ovals,
+    shared_oval_overlap,
     solve_guidance,
 )
 from zenith.math3d import Vec3, angle_between, basis_from_forward, clamp
@@ -431,6 +433,60 @@ class GuidanceTests(unittest.TestCase):
             x = offset.dot(oval.plane_x) / oval.radius_x
             y = offset.dot(oval.plane_y) / oval.radius_y
             self.assertAlmostEqual(x * x + y * y, 1.0, places=7)
+
+    def test_shared_overlap_requires_matching_horizons_and_mutual_centers(self) -> None:
+        observer = Vec3()
+
+        def oval(
+            horizon: float,
+            center: Vec3,
+            radius_x: float,
+            radius_y: float,
+        ) -> PredictionOval:
+            plane_x = Vec3(1, 0, 0)
+            plane_y = Vec3(0, 1, 0)
+            plane_normal = Vec3(0, 0, 1)
+            extremes = (
+                center + plane_x * radius_x,
+                center - plane_x * radius_x,
+                center + plane_y * radius_y,
+                center - plane_y * radius_y,
+            )
+            return PredictionOval(
+                horizon_s=horizon,
+                center=center,
+                ballistic_center=center,
+                extremes=extremes,
+                reachable=(True, True, True, True),
+                plane_x=plane_x,
+                plane_y=plane_y,
+                plane_normal=plane_normal,
+                radius_x=radius_x,
+                radius_y=radius_y,
+                edge_points=extremes,
+                edge_reachable=(True, True, True, True),
+                observer_position=observer,
+            )
+
+        first = oval(2.0, Vec3(0, 0, 100), 30, 20)
+        second = oval(2.0, Vec3(10, 0, 120), 48, 18)
+        self.assertNotEqual(first.radius_x, second.radius_x)
+        self.assertNotEqual(first.radius_y, second.radius_y)
+        overlap = shared_oval_overlap(first, second, observer)
+        self.assertIsNotNone(overlap)
+        assert overlap is not None
+        self.assertEqual(overlap.horizon_s, 2.0)
+        self.assertGreater(overlap.normalized_area, 0.0)
+        self.assertGreater(len(overlap.polygon_world), 8)
+        self.assertTrue(first.contains_projected(overlap.aim_point))
+        self.assertTrue(second.contains_projected(overlap.aim_point))
+
+        mismatched_horizon = oval(3.0, Vec3(10, 0, 120), 48, 18)
+        self.assertIsNone(
+            shared_oval_overlap(first, mismatched_horizon, observer)
+        )
+        non_mutual = oval(2.0, Vec3(80, 0, 120), 20, 18)
+        self.assertIsNone(shared_oval_overlap(first, non_mutual, observer))
 
     def test_guidance_aims_inside_largest_fully_reachable_weighted_oval(self) -> None:
         interceptor = DroneState(
@@ -1145,8 +1201,13 @@ class ProjectTests(unittest.TestCase):
         )
         self.assertEqual(len(sim.targets), 3)
         self.assertEqual(len({id(contact.track) for contact in sim.contacts}), 3)
+        shared_snapshot = None
+        shared_pair_snapshot = None
         for _ in range(60 * 3):
             sim.step()
+            if sim.shared_overlap is not None:
+                shared_snapshot = sim.shared_overlap
+                shared_pair_snapshot = sim.shared_overlap_pair
         self.assertEqual(sim.visible_contact_count, 3)
         self.assertEqual(sim.identified_contact_count, 3)
         self.assertTrue(
@@ -1158,12 +1219,34 @@ class ProjectTests(unittest.TestCase):
         self.assertTrue(
             all(math.isfinite(contact.priority_score) for contact in sim.contacts)
         )
-        self.assertEqual(sim.active_contact_index, 1)
+        self.assertIsNotNone(shared_snapshot)
+        self.assertIsNotNone(shared_pair_snapshot)
+        assert shared_snapshot is not None
+        self.assertIn(
+            shared_snapshot.horizon_s,
+            (1.0, 2.0, 3.0, 5.0),
+        )
         self.assertTrue(
-            any("Priority switched" in message for _, message in sim.events)
+            shared_snapshot.first.contains_projected(
+                shared_snapshot.aim_point
+            )
+        )
+        self.assertTrue(
+            shared_snapshot.second.contains_projected(
+                shared_snapshot.aim_point
+            )
+        )
+        self.assertTrue(
+            any("Shared aim" in message for _, message in sim.events)
         )
         self.assertIn(sim.target, sim.targets)
         self.assertIs(sim.target, sim.active_contact.vehicle)
+        for _ in range(60 * 12):
+            sim.step()
+            if sim.multi_committed_contact_index is not None:
+                break
+        self.assertIsNotNone(sim.multi_committed_contact_index)
+        self.assertTrue(sim.multi_guidance_mode.startswith("COMMITTED"))
 
     def test_unloaded_ai_backend_cannot_be_falsely_selected(self) -> None:
         with self.assertRaisesRegex(ValueError, "no loaded image-model weights"):

@@ -525,6 +525,9 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                 "priority_score_camera_tracks",
                 "target_type",
                 "target_model",
+                "multi_guidance_mode",
+                "shared_pair",
+                "shared_horizon_s",
                 "interceptor_model",
                 "scenario",
                 "target_ai_state",
@@ -574,6 +577,13 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
                     f"{sample.priority_score:.6f}",
                     sample.target_type,
                     sample.target_model,
+                    sample.multi_guidance_mode,
+                    sample.shared_pair or "",
+                    (
+                        ""
+                        if sample.shared_horizon_s is None
+                        else f"{sample.shared_horizon_s:.6f}"
+                    ),
                     simulation.interceptor.spec.name,
                     simulation.config.scenario,
                     sample.target_ai_state,

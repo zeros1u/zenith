@@ -30,6 +30,9 @@ Point to the 1, 2, 3, and 5 second ovals:
 - the largest green oval uses a confidence-weighted likely-motion point limited to 65% of its radius;
 - if no complete oval works, the system follows the unchanged-trajectory prediction;
 - reaching the one-second region activates camera-derived terminal collision lead.
+- with several contacts, only equal horizons are paired: 2-second with 2-second, never 2-second with 5-second;
+- cyan marks the shared image-plane intersection of one qualifying two-target pair, and the white diamond marks its centroid;
+- once our reach enters either member's smaller nested oval, the state becomes `COMMITTED` and normal single-target interception finishes the maneuver.
 
 ### 4. Prove it is camera-driven — 60 seconds
 
@@ -53,7 +56,7 @@ Press `M` for the estimated-track X/Z minimap. Its wedge is the actual sensor FO
 
 Use `N` to show the selectable behaviors and threats:
 
-- `ENEMY CONTACTS` selects one, two, or three independently detected and tracked intruders; the HUD marks the camera-derived priority track and the minimap shows the others;
+- `ENEMY CONTACTS` selects one, two, or three independently detected and tracked intruders; the HUD shows `SHARED T1+T2 / 5s OVERLAP` while aiming between a qualifying pair and later changes to `COMMITTED` after entering a smaller nested oval;
 - weave tests continuous side motion;
 - evasive tests changing acceleration direction;
 - airbrake tests nonlinear speed changes;
@@ -113,9 +116,9 @@ No trained recognition model or weight file is bundled. The current milestone us
 
 That was a real sign and initialization bug, now covered by regression tests. Both spawn level at half maximum speed with zero vertical velocity. Forward vectored thrust tilts the nose downward; any later climb is a gradual maneuver toward a higher target, not a spawn impulse. Their cameras are rigidly mounted at a published 6° upward cant, and their 24° body-tilt envelope prevents automatic flight from repeatedly throwing the target across the vertical FOV edge. It is a fixed transform and flight constraint, not a truth-following gimbal.
 
-### “How is the priority target chosen with several enemies?”
+### “How does guidance work with several enemies?”
 
-Every contact is processed separately. The selector combines only detector confidence, apparent size, camera-estimated range, camera-estimated closing speed, and estimated time to contact. It requires a meaningful score advantage for 0.35 seconds while the current contact remains visible, which prevents lock flicker. It switches immediately only when the current track is lost and another visual track is available.
+Every contact is processed separately. At most one pair affects the command. The solver compares equal horizons only and converts both ellipses to the frozen camera's normalized image plane, so different target depths do not invalidate the overlap. A pair qualifies when each center lies inside the other's ellipse and our vehicle can reach the shared centroid by that horizon. It initially steers toward that cyan overlap. Once our reach enters either target's smaller nested oval, the higher camera-derived threat becomes a sticky committed lock. Exact target truth is never used for pairing or commitment.
 
 ### “Why can Wraith-S miss even though it is fastest?”
 

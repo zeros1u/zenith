@@ -171,6 +171,18 @@ class GuidanceSolution:
 
 
 @dataclass(slots=True)
+class SharedOvalOverlap:
+    """Intersection of two same-horizon target ellipses in the camera image."""
+
+    horizon_s: float
+    first: PredictionOval
+    second: PredictionOval
+    aim_point: Vec3
+    polygon_world: tuple[Vec3, ...]
+    normalized_area: float
+
+
+@dataclass(slots=True)
 class _ReachabilityContext:
     position: Vec3
     velocity: Vec3
@@ -273,6 +285,284 @@ def point_is_reachable(interceptor: DroneState, point: Vec3, horizon_s: float) -
         point,
         horizon_s,
     )
+
+
+def _normalized_image_ellipse(
+    oval: PredictionOval,
+    observer: Vec3,
+    plane_x: Vec3,
+    plane_y: Vec3,
+    plane_normal: Vec3,
+) -> tuple[float, float, float, float, float] | None:
+    relative = oval.center - observer
+    depth = relative.dot(plane_normal)
+    if depth <= 1e-6:
+        return None
+    return (
+        relative.dot(plane_x) / depth,
+        relative.dot(plane_y) / depth,
+        oval.radius_x / depth,
+        oval.radius_y / depth,
+        depth,
+    )
+
+
+def _ellipse_contains_image_point(
+    ellipse: tuple[float, float, float, float, float],
+    point: tuple[float, float],
+    tolerance: float = 1e-8,
+) -> bool:
+    center_x, center_y, radius_x, radius_y, _ = ellipse
+    x = (point[0] - center_x) / max(radius_x, 1e-9)
+    y = (point[1] - center_y) / max(radius_y, 1e-9)
+    return x * x + y * y <= 1.0 + tolerance
+
+
+def _ellipse_polygon(
+    ellipse: tuple[float, float, float, float, float],
+    count: int = 32,
+) -> list[tuple[float, float]]:
+    center_x, center_y, radius_x, radius_y, _ = ellipse
+    return [
+        (
+            center_x + radius_x * math.cos(math.tau * index / count),
+            center_y + radius_y * math.sin(math.tau * index / count),
+        )
+        for index in range(count)
+    ]
+
+
+def _clip_convex_polygon(
+    subject: list[tuple[float, float]],
+    clip_polygon: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Sutherland-Hodgman intersection for counter-clockwise polygons."""
+
+    def cross(
+        first: tuple[float, float],
+        second: tuple[float, float],
+        third: tuple[float, float],
+    ) -> float:
+        return (
+            (second[0] - first[0]) * (third[1] - first[1])
+            - (second[1] - first[1]) * (third[0] - first[0])
+        )
+
+    def line_intersection(
+        start: tuple[float, float],
+        end: tuple[float, float],
+        clip_start: tuple[float, float],
+        clip_end: tuple[float, float],
+    ) -> tuple[float, float]:
+        segment_x = end[0] - start[0]
+        segment_y = end[1] - start[1]
+        clip_x = clip_end[0] - clip_start[0]
+        clip_y = clip_end[1] - clip_start[1]
+        denominator = segment_x * clip_y - segment_y * clip_x
+        if abs(denominator) <= 1e-12:
+            return end
+        offset_x = clip_start[0] - start[0]
+        offset_y = clip_start[1] - start[1]
+        amount = (offset_x * clip_y - offset_y * clip_x) / denominator
+        return (
+            start[0] + segment_x * amount,
+            start[1] + segment_y * amount,
+        )
+
+    output = subject
+    for index, clip_start in enumerate(clip_polygon):
+        if not output:
+            break
+        clip_end = clip_polygon[(index + 1) % len(clip_polygon)]
+        source = output
+        output = []
+        previous = source[-1]
+        previous_inside = cross(clip_start, clip_end, previous) >= -1e-12
+        for current in source:
+            current_inside = cross(clip_start, clip_end, current) >= -1e-12
+            if current_inside:
+                if not previous_inside:
+                    output.append(
+                        line_intersection(
+                            previous,
+                            current,
+                            clip_start,
+                            clip_end,
+                        )
+                    )
+                output.append(current)
+            elif previous_inside:
+                output.append(
+                    line_intersection(
+                        previous,
+                        current,
+                        clip_start,
+                        clip_end,
+                    )
+                )
+            previous = current
+            previous_inside = current_inside
+    return output
+
+
+def _polygon_centroid_and_area(
+    polygon: list[tuple[float, float]],
+) -> tuple[tuple[float, float], float] | None:
+    if len(polygon) < 3:
+        return None
+    twice_area = 0.0
+    centroid_x = 0.0
+    centroid_y = 0.0
+    for index, current in enumerate(polygon):
+        following = polygon[(index + 1) % len(polygon)]
+        cross = current[0] * following[1] - following[0] * current[1]
+        twice_area += cross
+        centroid_x += (current[0] + following[0]) * cross
+        centroid_y += (current[1] + following[1]) * cross
+    if abs(twice_area) <= 1e-12:
+        return None
+    return (
+        (
+            centroid_x / (3.0 * twice_area),
+            centroid_y / (3.0 * twice_area),
+        ),
+        abs(twice_area) * 0.5,
+    )
+
+
+def shared_oval_overlap(
+    first: PredictionOval,
+    second: PredictionOval,
+    observer: Vec3,
+) -> SharedOvalOverlap | None:
+    """Find a mutual same-horizon overlap in the frozen camera image plane.
+
+    Qualification is intentionally stronger than border intersection: each
+    target ellipse center must lie inside the other ellipse, matching the
+    presentation rule that the drones are "inside each other's ovals."
+    """
+    if (
+        abs(first.horizon_s - second.horizon_s) > 1e-6
+        or first.invalid_reason is not None
+        or second.invalid_reason is not None
+        or first.plane_normal.dot(second.plane_normal) < 0.999999
+        or first.plane_x.dot(second.plane_x) < 0.999999
+        or first.plane_y.dot(second.plane_y) < 0.999999
+    ):
+        return None
+    plane_x = first.plane_x
+    plane_y = first.plane_y
+    plane_normal = first.plane_normal
+    first_image = _normalized_image_ellipse(
+        first,
+        observer,
+        plane_x,
+        plane_y,
+        plane_normal,
+    )
+    second_image = _normalized_image_ellipse(
+        second,
+        observer,
+        plane_x,
+        plane_y,
+        plane_normal,
+    )
+    if first_image is None or second_image is None:
+        return None
+    if not (
+        _ellipse_contains_image_point(
+            first_image,
+            (second_image[0], second_image[1]),
+        )
+        and _ellipse_contains_image_point(
+            second_image,
+            (first_image[0], first_image[1]),
+        )
+    ):
+        return None
+    intersection = _clip_convex_polygon(
+        _ellipse_polygon(first_image),
+        _ellipse_polygon(second_image),
+    )
+    centroid_and_area = _polygon_centroid_and_area(intersection)
+    if centroid_and_area is None:
+        return None
+    centroid, area = centroid_and_area
+    shared_depth = (first_image[4] + second_image[4]) * 0.5
+
+    def image_to_world(point: tuple[float, float]) -> Vec3:
+        return (
+            observer
+            + plane_normal * shared_depth
+            + plane_x * (point[0] * shared_depth)
+            + plane_y * (point[1] * shared_depth)
+        )
+
+    return SharedOvalOverlap(
+        first.horizon_s,
+        first,
+        second,
+        image_to_world(centroid),
+        tuple(image_to_world(point) for point in intersection),
+        area,
+    )
+
+
+def command_toward_shared_aim(
+    interceptor: DroneState,
+    aim_point: Vec3,
+    reference_velocity: Vec3,
+) -> Vec3:
+    """Create a normal propulsion-constrained command toward a shared aim."""
+    aim = Vec3(aim_point.x, max(2.0, aim_point.y), aim_point.z)
+    to_aim = aim - interceptor.position
+    distance = to_aim.length()
+    line = to_aim.normalized(interceptor.forward_direction())
+    if interceptor.spec.flight_model == "fixed_wing":
+        maximum_closing = max(
+            12.0,
+            min(22.0, interceptor.spec.max_speed * 0.30),
+        )
+    else:
+        maximum_closing = max(
+            18.0,
+            min(32.0, interceptor.spec.max_speed * 0.62),
+        )
+    desired_closing = clamp(
+        distance * 0.18 + 10.0,
+        10.0,
+        maximum_closing,
+    )
+    desired_velocity = (
+        reference_velocity + line * desired_closing
+    ).clamp_length(interceptor.spec.max_speed)
+    command = (desired_velocity - interceptor.velocity) * 2.8
+    relative_velocity = reference_velocity - interceptor.velocity
+    lateral_relative = relative_velocity - line * relative_velocity.dot(line)
+    command = command + lateral_relative * 4.0
+    if interceptor.spec.flight_model == "rocket":
+        rocket_forward = interceptor.velocity.normalized(
+            interceptor.forward_direction()
+        )
+        steering_error = line - rocket_forward * line.dot(rocket_forward)
+        steering = (
+            steering_error.normalized() * interceptor.spec.lateral_accel
+            if steering_error.length() > 1e-6
+            else Vec3()
+        )
+        command = rocket_forward * interceptor.spec.max_accel + steering
+    if interceptor.spec.flight_model in ("fixed_wing", "rocket"):
+        command = command + WORLD_UP * max(
+            0.0,
+            9.81 - interceptor.lift_acceleration.y,
+        )
+    command_limit = interceptor.spec.max_accel
+    if interceptor.spec.flight_model in ("fixed_wing", "rocket"):
+        command_limit = math.hypot(
+            max(interceptor.spec.max_accel, interceptor.spec.brake_accel),
+            interceptor.spec.lateral_accel,
+        )
+    return command.clamp_length(command_limit)
 
 
 def _project_to_target_plane(

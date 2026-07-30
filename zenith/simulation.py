@@ -22,7 +22,11 @@ from .controls import (
 from .guidance import (
     GuidanceSolution,
     PredictionOval,
+    SharedOvalOverlap,
     TargetTrack,
+    command_toward_shared_aim,
+    point_is_reachable,
+    shared_oval_overlap,
     solve_guidance,
 )
 from .math3d import (
@@ -80,6 +84,9 @@ class TelemetrySample:
     priority_score: float
     target_type: str
     target_model: str
+    multi_guidance_mode: str
+    shared_pair: str | None
+    shared_horizon_s: float | None
     target_ai_state: str
     target_ai_threat_range_m: float | None
     target_ai_closing_speed_mps: float | None
@@ -295,6 +302,11 @@ class InterceptionSimulation:
         self.active_contact_index = 0
         self._priority_candidate_index = 0
         self._priority_candidate_time_s = 0.0
+        self.shared_overlap: SharedOvalOverlap | None = None
+        self.shared_overlap_pair: tuple[int, int] | None = None
+        self.multi_committed_contact_index: int | None = None
+        self.multi_commit_horizon_s: float | None = None
+        self.multi_guidance_mode = "SINGLE TARGET"
         self.explosion_age_s = math.inf
         # The tricky target autopilot is deterministic so demonstrations and
         # verification runs are reproducible. It may use simulation truth
@@ -1049,6 +1061,17 @@ class InterceptionSimulation:
     def _choose_priority_contact(self, dt: float) -> None:
         for contact in self.contacts:
             contact.priority_score = self._contact_priority(contact)
+        if self.multi_committed_contact_index is not None:
+            committed = self.contacts[self.multi_committed_contact_index]
+            if committed.visual_locked:
+                self.active_contact_index = self.multi_committed_contact_index
+                return
+            self._event(
+                f"{committed.track_id} committed lock lost; overlap search resumed"
+            )
+            self.multi_committed_contact_index = None
+            self.multi_commit_horizon_s = None
+            self.multi_guidance_mode = "SINGLE TARGET"
         if len(self.contacts) == 1 or self.control_mode is ControlMode.TARGET:
             return
         best_index = max(
@@ -1081,6 +1104,217 @@ class InterceptionSimulation:
             self._event(
                 f"Priority switched {previous} -> {best.track_id} from image tracks"
             )
+
+    def _contact_entry_horizon(
+        self,
+        contact: TargetContact,
+        below_horizon_s: float = 2.0,
+    ) -> float | None:
+        """Smallest nested oval entered below the current shared horizon."""
+        guidance = contact.guidance
+        if guidance is None or not guidance.ovals:
+            return None
+        for oval in guidance.ovals:
+            if (
+                oval.horizon_s >= below_horizon_s - 1e-6
+                or oval.invalid_reason is not None
+            ):
+                continue
+            entry_point = oval.likely_point or oval.center
+            if point_is_reachable(
+                self.interceptor,
+                entry_point,
+                oval.horizon_s,
+            ):
+                return oval.horizon_s
+        return None
+
+    def _update_multi_contact_guidance(self) -> Vec3 | None:
+        """Aim at one same-horizon two-target overlap until entry commits."""
+        previous_pair = self.shared_overlap_pair
+        previous_mode = self.multi_guidance_mode
+        self.shared_overlap = None
+        self.shared_overlap_pair = None
+        if len(self.contacts) < 2:
+            self.multi_guidance_mode = "SINGLE TARGET"
+            return None
+        if self.control_mode is ControlMode.TARGET:
+            self.multi_guidance_mode = "PLAYER TARGET CONTROL"
+            return None
+
+        if self.multi_committed_contact_index is not None:
+            committed_index = self.multi_committed_contact_index
+            committed = self.contacts[committed_index]
+            if committed.visual_locked and committed.guidance is not None:
+                if self.active_contact_index != committed_index:
+                    self._store_active_contact()
+                    self.active_contact_index = committed_index
+                    self._load_active_contact()
+                self.multi_guidance_mode = (
+                    f"COMMITTED {committed.track_id} / "
+                    f"{self.multi_commit_horizon_s or 1.0:.0f}s OVAL ENTRY"
+                )
+                return None
+            self.multi_committed_contact_index = None
+            self.multi_commit_horizon_s = None
+
+        eligible = [
+            index
+            for index, contact in enumerate(self.contacts)
+            if contact.visual_locked
+            and contact.identity_confirmed
+            and contact.guidance is not None
+        ]
+        selected: tuple[
+            float,
+            int,
+            int,
+            SharedOvalOverlap,
+        ] | None = None
+        # Equal horizon is the rule: 5s is compared only with 5s, then 3s,
+        # 2s, and 1s. The largest reachable shared horizon wins.
+        for oval_index in range(3, -1, -1):
+            candidates: list[
+                tuple[float, int, int, SharedOvalOverlap]
+            ] = []
+            for first_position, first_index in enumerate(eligible):
+                first_contact = self.contacts[first_index]
+                assert first_contact.guidance is not None
+                for second_index in eligible[first_position + 1:]:
+                    second_contact = self.contacts[second_index]
+                    assert second_contact.guidance is not None
+                    overlap = shared_oval_overlap(
+                        first_contact.guidance.ovals[oval_index],
+                        second_contact.guidance.ovals[oval_index],
+                        self.interceptor.position,
+                    )
+                    if overlap is None or not point_is_reachable(
+                        self.interceptor,
+                        overlap.aim_point,
+                        overlap.horizon_s,
+                    ):
+                        continue
+                    pair_score = (
+                        first_contact.priority_score
+                        + second_contact.priority_score
+                        + min(40.0, overlap.normalized_area * 2000.0)
+                    )
+                    candidates.append(
+                        (
+                            pair_score,
+                            first_index,
+                            second_index,
+                            overlap,
+                        )
+                    )
+            if candidates:
+                selected = max(candidates, key=lambda item: item[0])
+                break
+
+        if selected is None:
+            fallback_entries = [
+                (
+                    index,
+                    self._contact_entry_horizon(contact),
+                )
+                for index, contact in enumerate(self.contacts)
+                if contact.visual_locked and contact.identity_confirmed
+            ]
+            fallback_entries = [
+                item for item in fallback_entries if item[1] is not None
+            ]
+            if fallback_entries:
+                commit_index, entry_horizon = max(
+                    fallback_entries,
+                    key=lambda item: self.contacts[item[0]].priority_score,
+                )
+                committed = self.contacts[commit_index]
+                self._store_active_contact()
+                self.active_contact_index = commit_index
+                self.multi_committed_contact_index = commit_index
+                self.multi_commit_horizon_s = entry_horizon
+                self._load_active_contact()
+                self.multi_guidance_mode = (
+                    f"COMMITTED {committed.track_id} / "
+                    f"{entry_horizon:.0f}s OVAL ENTRY"
+                )
+                self._event(
+                    f"{committed.track_id} committed after entering "
+                    f"its {entry_horizon:.0f}s oval"
+                )
+                return None
+            self.multi_guidance_mode = (
+                f"PRIORITY TARGET {self.active_contact.track_id}"
+            )
+            return None
+
+        _, first_index, second_index, overlap = selected
+        pair = (first_index, second_index)
+        pair_entries = [
+            (
+                index,
+                self._contact_entry_horizon(
+                    self.contacts[index],
+                    overlap.horizon_s,
+                ),
+            )
+            for index in pair
+        ]
+        pair_entries = [
+            item for item in pair_entries if item[1] is not None
+        ]
+        if pair_entries:
+            commit_index, entry_horizon = max(
+                pair_entries,
+                key=lambda item: self.contacts[item[0]].priority_score,
+            )
+            committed = self.contacts[commit_index]
+            self._store_active_contact()
+            self.active_contact_index = commit_index
+            self.multi_committed_contact_index = commit_index
+            self.multi_commit_horizon_s = entry_horizon
+            self._load_active_contact()
+            self.multi_guidance_mode = (
+                f"COMMITTED {committed.track_id} / "
+                f"{entry_horizon:.0f}s OVAL ENTRY"
+            )
+            self._event(
+                f"{committed.track_id} committed after entering "
+                f"its {entry_horizon:.0f}s oval"
+            )
+            return None
+        self.shared_overlap = overlap
+        self.shared_overlap_pair = pair
+        first_contact = self.contacts[first_index]
+        second_contact = self.contacts[second_index]
+        pair_priority_index = max(
+            pair,
+            key=lambda index: self.contacts[index].priority_score,
+        )
+        if self.active_contact_index != pair_priority_index:
+            self._store_active_contact()
+            self.active_contact_index = pair_priority_index
+            self._load_active_contact()
+        self.multi_guidance_mode = (
+            f"SHARED {first_contact.track_id}+{second_contact.track_id} "
+            f"/ {overlap.horizon_s:.0f}s OVERLAP"
+        )
+        if (
+            previous_pair != pair
+            or not previous_mode.startswith("SHARED")
+        ):
+            self._event(
+                f"Shared aim: {first_contact.track_id}+"
+                f"{second_contact.track_id} {overlap.horizon_s:.0f}s overlap"
+            )
+        reference_velocity = (
+            first_contact.track.velocity + second_contact.track.velocity
+        ) * 0.5
+        return command_toward_shared_aim(
+            self.interceptor,
+            overlap.aim_point,
+            reference_velocity,
+        )
 
     def _update_sensor(self, dt: float) -> None:
         # The camera is not a target-following gimbal. Its FOV can move only
@@ -1134,6 +1368,20 @@ class InterceptionSimulation:
                 self.active_contact.priority_score,
                 self.target.spec.vehicle_type,
                 self.target.spec.name,
+                self.multi_guidance_mode,
+                (
+                    "+".join(
+                        self.contacts[index].track_id
+                        for index in self.shared_overlap_pair
+                    )
+                    if self.shared_overlap_pair is not None
+                    else None
+                ),
+                (
+                    self.shared_overlap.horizon_s
+                    if self.shared_overlap is not None
+                    else None
+                ),
                 self.evader_decision,
                 (
                     self.evader_threat_range_m
@@ -1191,7 +1439,11 @@ class InterceptionSimulation:
             else:
                 contact.guidance = None
         self._load_active_contact()
-        if self.guidance is not None:
+        shared_command = self._update_multi_contact_guidance()
+        if shared_command is not None:
+            advisory_command = shared_command
+            self.status = f"MULTI-CONTACT / {self.multi_guidance_mode}"
+        elif self.guidance is not None:
             advisory_command = self.guidance.commanded_acceleration
             if self.status != "INTERCEPT GUIDANCE":
                 self.status = "INTERCEPT GUIDANCE"
@@ -1214,7 +1466,9 @@ class InterceptionSimulation:
                 dt,
             )
             interceptor_command = self.manual_command.acceleration
-            if self.guidance is not None:
+            if shared_command is not None:
+                self.status = "PLAYER CONTROL / SHARED-OVERLAP ADVISORY"
+            elif self.guidance is not None:
                 self.status = "PLAYER CONTROL / GUIDANCE ADVISORY"
             elif not self.visual_locked:
                 self.status = "PLAYER CONTROL / SENSOR SEARCH"

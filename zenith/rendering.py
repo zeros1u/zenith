@@ -695,6 +695,14 @@ class WorldRenderer:
             )
             for oval in sim.guidance.ovals
         ]
+        shared_polygon_projected = (
+            [
+                self._project_cached(point, camera, *surface_size)
+                for point in sim.shared_overlap.polygon_world
+            ]
+            if sim.shared_overlap is not None
+            else []
+        )
 
         # A faint fill makes the nested prediction regions readable against
         # both sky and ground while leaving the synthetic target unobscured.
@@ -722,6 +730,19 @@ class WorldRenderer:
                     and max(ys) - min(ys) <= surface_size[1] * 2
                 ):
                     pygame.draw.polygon(fill_layer, (*fill_color, 14), polygon)
+        if (
+            len(shared_polygon_projected) >= 3
+            and all(point is not None for point in shared_polygon_projected)
+        ):
+            pygame.draw.polygon(
+                fill_layer,
+                (*CYAN, 34),
+                [
+                    point[:2]
+                    for point in shared_polygon_projected
+                    if point is not None
+                ],
+            )
         surface.blit(fill_layer, (0, 0))
 
         for oval, projected_edge in projected_ovals:
@@ -856,6 +877,120 @@ class WorldRenderer:
                     (label_projected[0] + 5, label_projected[1] - 8),
                 )
 
+        if (
+            len(shared_polygon_projected) >= 3
+            and all(point is not None for point in shared_polygon_projected)
+        ):
+            pygame.draw.lines(
+                surface,
+                CYAN,
+                True,
+                [
+                    point[:2]
+                    for point in shared_polygon_projected
+                    if point is not None
+                ],
+                2,
+            )
+
+        if (
+            sim.shared_overlap is not None
+            and sim.shared_overlap_pair is not None
+        ):
+            secondary_index = next(
+                (
+                    index
+                    for index in sim.shared_overlap_pair
+                    if index != sim.active_contact_index
+                ),
+                sim.shared_overlap_pair[1],
+            )
+            secondary_contact = sim.contacts[secondary_index]
+            secondary_guidance = secondary_contact.guidance
+            if secondary_guidance is not None:
+                secondary_oval = next(
+                    (
+                        oval
+                        for oval in secondary_guidance.ovals
+                        if abs(
+                            oval.horizon_s
+                            - sim.shared_overlap.horizon_s
+                        )
+                        < 1e-6
+                    ),
+                    None,
+                )
+                if secondary_oval is not None:
+                    secondary_edge = [
+                        self._project_cached(
+                            point,
+                            camera,
+                            *surface_size,
+                        )
+                        for point in secondary_oval.edge_points
+                    ]
+                    secondary_colors = [
+                        GREEN if reachable else RED
+                        for reachable in secondary_oval.edge_reachable
+                    ]
+                    if (
+                        secondary_edge
+                        and len(set(secondary_colors)) == 1
+                        and all(
+                            point is not None
+                            for point in secondary_edge
+                        )
+                    ):
+                        pygame.draw.lines(
+                            surface,
+                            secondary_colors[0],
+                            True,
+                            [
+                                point[:2]
+                                for point in secondary_edge
+                                if point is not None
+                            ],
+                            2,
+                        )
+                    else:
+                        for index, first in enumerate(secondary_edge):
+                            second = secondary_edge[
+                                (index + 1) % len(secondary_edge)
+                            ]
+                            if first is None or second is None:
+                                continue
+                            color = (
+                                secondary_colors[index]
+                                if index < len(secondary_colors)
+                                else RED
+                            )
+                            pygame.draw.line(
+                                surface,
+                                color,
+                                first[:2],
+                                second[:2],
+                                2,
+                            )
+                    secondary_center = self._project_cached(
+                        secondary_oval.center,
+                        camera,
+                        *surface_size,
+                    )
+                    if secondary_center is not None:
+                        label = self.font_tiny.render(
+                            f"PAIR {secondary_contact.track_id} "
+                            f"+{secondary_oval.horizon_s:.0f}s",
+                            True,
+                            CYAN,
+                        )
+                        surface.blit(
+                            label,
+                            (
+                                secondary_center[0] + 9,
+                                secondary_center[1] + 9,
+                            ),
+                        )
+
         ballistic_points = [
             sim.track.position
             + sim.track.velocity * (step * 0.5)
@@ -875,9 +1010,14 @@ class WorldRenderer:
             if projected:
                 pygame.draw.circle(surface, AMBER, projected[:2], 2)
 
+        displayed_aim_point = (
+            sim.shared_overlap.aim_point
+            if sim.shared_overlap is not None
+            else sim.guidance.aim_point
+        )
         aim = (
             self._project_cached(
-                sim.guidance.aim_point,
+                displayed_aim_point,
                 camera,
                 *surface_size,
             )
@@ -889,12 +1029,20 @@ class WorldRenderer:
             diamond = ((x, y - 9), (x + 9, y), (x, y + 9), (x - 9, y))
             pygame.draw.polygon(surface, WHITE, diamond, 2)
             surface.blit(
-                self.font_tiny.render("AIM", True, WHITE),
+                self.font_tiny.render(
+                    (
+                        "SHARED OVERLAP AIM"
+                        if sim.shared_overlap is not None
+                        else "AIM"
+                    ),
+                    True,
+                    WHITE,
+                ),
                 (x + 12, y - 7),
             )
 
         legend = self.font_tiny.render(
-            "OVAL EDGE  GREEN=REACHABLE  RED=BLOCKED  MIXED=PARTIAL",
+            "OVAL EDGE  GREEN=REACHABLE  RED=BLOCKED  CYAN=SHARED OVERLAP",
             True,
             WHITE,
         )
@@ -1926,15 +2074,32 @@ class WorldRenderer:
                 else "---"
             )
             relative_z = f"{relative_v.z:+.2f} m/s" if sim.visual_locked else "---"
+            displayed_guidance_mode = (
+                sim.multi_guidance_mode
+                if len(sim.contacts) > 1
+                else guidance.mode
+                if guidance
+                else "BEARING PURSUIT"
+                if sim.visual_locked
+                else "NO VISUAL LOCK"
+            )
             relative_rows = [
                 ("REL. Vx / Vy", relative_xy),
                 ("REL. Vz", relative_z),
                 ("CLOSING SPEED", f"{guidance.closing_speed:+.2f} m/s" if guidance else "---"),
                 ("TIME TO CONTACT", f"{guidance.time_to_contact_s:.2f} s" if guidance and math.isfinite(guidance.time_to_contact_s) else "---"),
-                ("GUIDANCE", guidance.mode if guidance else ("BEARING PURSUIT" if sim.visual_locked else "NO VISUAL LOCK")),
+                ("GUIDANCE", displayed_guidance_mode),
                 (
                     "OVAL / EDGE",
                     (
+                        f"SHARED {sim.shared_overlap.horizon_s:.0f}s / "
+                        f"{sim.contacts[sim.shared_overlap_pair[0]].track_id}+"
+                        f"{sim.contacts[sim.shared_overlap_pair[1]].track_id}"
+                        if (
+                            sim.shared_overlap is not None
+                            and sim.shared_overlap_pair is not None
+                        )
+                        else
                         f"{guidance.selected_horizon_s:.1f}s / "
                         f"{guidance.reachable_count}/{guidance.reachable_total}"
                         if guidance and guidance.selected_horizon_s
@@ -2150,12 +2315,19 @@ class WorldRenderer:
             if sim.range_estimate is not None
             else "unavailable without a current known-model detection"
         )
-        current_guidance = (
-            f"{sim.guidance.mode}; aim "
-            f"({sim.guidance.aim_point.x:+.1f}, "
-            f"{sim.guidance.aim_point.y:+.1f}, "
-            f"{sim.guidance.aim_point.z:+.1f})"
+        current_aim = (
+            sim.shared_overlap.aim_point
+            if sim.shared_overlap is not None
+            else sim.guidance.aim_point
             if sim.guidance is not None
+            else None
+        )
+        current_guidance = (
+            f"{sim.multi_guidance_mode if len(sim.contacts) > 1 else sim.guidance.mode}; "
+            f"aim ({current_aim.x:+.1f}, "
+            f"{current_aim.y:+.1f}, "
+            f"{current_aim.z:+.1f})"
+            if current_aim is not None and sim.guidance is not None
             else "disabled: no guidance-quality visual observation"
         )
         oval_rows = []
@@ -2185,7 +2357,7 @@ class WorldRenderer:
                     "SENSOR PIPELINE",
                     [
                         "SYNTHETIC BOX + POSE is the honest default: ImageDetectorAdapter is the optional YOLO/DINO sensor-frame boundary; no weights are falsely claimed.",
-                        f"{len(sim.contacts)} contacts run independent boxes, signal timers, ranges, tracks, ovals, and guidance; {sim.active_contact.track_id} is camera-priority.",
+                        f"{len(sim.contacts)} contacts run independent boxes, signal timers, ranges, tracks, ovals, and guidance; current state: {sim.multi_guidance_mode}.",
                         "Only after that visual detection does the simulated signal query reveal the requested vehicle model and its real dimensions.",
                         "Range uses the pinhole relation Z = focal_pixels x known_size / apparent_pixels.",
                         f"Current model: {sim.target.spec.name if sim.identity_confirmed else 'UNKNOWN / QUERYING'}",
@@ -2249,10 +2421,10 @@ class WorldRenderer:
                 (
                     "HOW THE AIM IS CHOSEN",
                     [
-                        "The solver checks 5s, 3s, 2s, then 1s and selects the largest completely green edge.",
-                        "The aim is biased from its center toward measured likely motion, but remains inside 65% of the ellipse.",
+                        "Multi-contact mode compares matching horizons, aims at one cyan overlap centroid, then commits on smaller-oval entry.",
+                        "Single-target mode checks 5s, 3s, 2s, then 1s and biases the largest green oval toward likely motion.",
                         "If none pass, it reports NO GUARANTEED OVAL and follows the transparent unchanged-motion point.",
-                        "When our one-second reach enters the smallest oval, it switches to camera-derived terminal collision lead.",
+                        "In single-target mode, entering the one-second oval switches to camera-derived terminal collision lead.",
                         f"Current guidance: {current_guidance}",
                     ],
                 ),
@@ -2325,7 +2497,7 @@ class WorldRenderer:
                     "PROOF BOUNDARY",
                     [
                         "Defense guidance never reads target truth; truth only renders the synthetic image, resolves contact, and supports verification.",
-                        "Multi-contact priority uses only apparent size, detector confidence, estimated range/closing/TTC, plus a 0.35s anti-flicker dwell.",
+                        "Multi-contact pairing uses same-horizon image ellipses, mutual-center containment, a reachable shared centroid, and sticky nested-oval entry.",
                         "TRICKY AI is the declared exception: only its target autopilot knows our approach; it cannot feed our sensor or guidance.",
                         "The detector/pose output, signal lookup, meshes, and aerodynamics are deterministic presentation adapters, not trained/deployed hardware.",
                         "CHECK 2s records an old camera frame and evaluates truth at T+2.",
