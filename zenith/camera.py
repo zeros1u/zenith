@@ -57,7 +57,7 @@ class Detection:
 class ImageDetectorAdapter(Protocol):
     """Optional boundary for YOLO/DINO-style sensor-frame integrations.
 
-    ZENITH's self-contained demo uses ``detect_box`` as a deterministic
+    INTERCEPTRON's self-contained demo uses ``detect_box`` as a deterministic
     synthetic image-recognition adapter. A real backend can implement this
     protocol and return the same image-space observations without changing
     tracking, ranging, prediction, or guidance.

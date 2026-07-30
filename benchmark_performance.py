@@ -1,4 +1,4 @@
-"""Repeatable CPU benchmark for the ZENITH simulation and software renderer."""
+"""Repeatable CPU benchmark for the INTERCEPTRON simulation and software renderer."""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ def complete_frames_per_second(frames: int, enemy_count: int = 1) -> float:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Benchmark ZENITH without opening a window"
+        description="Benchmark INTERCEPTRON without opening a window"
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--ticks", type=int, default=300)

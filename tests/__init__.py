@@ -1,1 +1,1 @@
-"""ZENITH automated tests."""
+"""INTERCEPTRON automated tests."""

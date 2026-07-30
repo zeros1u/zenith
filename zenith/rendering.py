@@ -1904,10 +1904,14 @@ class WorldRenderer:
         width, height = surface.get_size()
         top = pygame.Surface((width, 54), pygame.SRCALPHA)
         top.fill((3, 12, 20, 235))
-        top.blit(self.font_title.render("ZENITH", True, WHITE), (18, 9))
+        top.blit(self.font_title.render("INTERCEPTRON", True, WHITE), (18, 9))
         top.blit(
-            self.font_small.render("VISION-ONLY INTERCEPTION // PROTOTYPE 02", True, CYAN),
-            (132, 19),
+            self.font_small.render(
+                "VISION-ONLY INTERCEPTION",
+                True,
+                CYAN,
+            ),
+            (230, 19),
         )
         status_color = GREEN if sim.hit else (CYAN if sim.identity_confirmed else AMBER)
         status_text = self.font_bold.render(sim.status, True, status_color)
@@ -2504,7 +2508,7 @@ class WorldRenderer:
                     ],
                 ),
                 (
-                    "FAST DEMO KEYS",
+                    "QUICK CONTROLS",
                     [
                         "F1 info | H controls | F2 analysis | F3 spectator | F4 settings | F5 CSV",
                         "M minimap | G check 2s | O camera occlusion | Space pause | +/- time",
@@ -2594,7 +2598,7 @@ class WorldRenderer:
             ("RED", "requested action unavailable"),
         ]
         overlay.blit(
-            self.font_bold.render("CAMERA / DEMO", True, AMBER),
+            self.font_bold.render("CAMERA / DISPLAY", True, AMBER),
             (card.x + 36, card.y + 76),
         )
         overlay.blit(

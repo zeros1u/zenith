@@ -1,4 +1,4 @@
-# ZENITH requirement and correctness audit
+# INTERCEPTRON requirement and correctness audit
 
 This matrix states exactly what the prototype claims and how that claim is checked.
 

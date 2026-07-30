@@ -94,7 +94,7 @@ The target's bounded acceleration spreads its future projected position in the p
 
 ### “Does checking four points prove the whole oval is reachable?”
 
-No. Connecting four cardinal extremes makes a diamond that excludes diagonal parts of an ellipse. ZENITH keeps the four large dots for explanation but tests all 96 rendered edge directions. A deliberately tested diagonal failure remains red even with `CARDINAL 4/4`.
+No. Connecting four cardinal extremes makes a diamond that excludes diagonal parts of an ellipse. INTERCEPTRON keeps the four large dots for explanation but tests all 96 rendered edge directions. A deliberately tested diagonal failure remains red even with `CARDINAL 4/4`.
 
 ### “Can an aircraft accelerate in any direction in this simulation?”
 
@@ -106,7 +106,7 @@ Gravity is continuously applied at `9.81 m/s²` to every airborne vehicle. A pow
 
 ### “What happens when the target rotates?”
 
-A naive fixed-width calculation is biased. ZENITH projects all eight corners of the known 3D dimensions using a pose estimate and fits both horizontal and vertical spans.
+A naive fixed-width calculation is biased. INTERCEPTRON projects all eight corners of the known 3D dimensions using a pose estimate and fits both horizontal and vertical spans.
 
 ### “Where are YOLO or DINO?”
 
@@ -122,7 +122,7 @@ Every contact is processed separately. At most one pair affects the command. The
 
 ### “Why can Wraith-S miss even though it is fastest?”
 
-Maximum speed is not the same as interception agility. Wraith-S reaches `82 m/s`, but Talon-R has more lateral acceleration and a higher turn-rate limit. ZENITH now schedules fixed-wing closing speed before terminal range and cuts throttle to use passive drag; it does not invent reverse thrust or automatically deploy an airbrake based on speed.
+Maximum speed is not the same as interception agility. Wraith-S reaches `82 m/s`, but Talon-R has more lateral acceleration and a higher turn-rate limit. INTERCEPTRON now schedules fixed-wing closing speed before terminal range and cuts throttle to use passive drag; it does not invent reverse thrust or automatically deploy an airbrake based on speed.
 
 ### “Are the vehicles still boxes?”
 
@@ -146,7 +146,7 @@ No. It changes only the presentation camera used to inspect the scene. The synth
 
 ## A clean live-demo sequence
 
-1. Start `run_zenith.bat`.
+1. Start `run_interceptron.bat`.
 2. Select `TALON-R`, `FALCON-X1`, `EVASIVE MANEUVERS`, three enemy contacts, and 1920×1080.
 3. Start and wait for signal confirmation.
 4. Press `V` once for chase view, hold the right mouse button to look around, and use `Shift` while captured to show camera roll. Release it and press `C` to center.

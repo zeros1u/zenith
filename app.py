@@ -1,4 +1,4 @@
-"""ZENITH interactive desktop prototype entry point."""
+"""INTERCEPTRON interactive desktop application entry point."""
 
 from __future__ import annotations
 
@@ -246,7 +246,7 @@ class SetupScreen:
         pygame.draw.circle(surface, (19, 64, 76), (width - 120, 80), 160, 1)
         pygame.draw.circle(surface, (17, 52, 63), (width - 120, 80), 110, 1)
 
-        surface.blit(self.title.render("ZENITH", True, WHITE), (48, 30))
+        surface.blit(self.title.render("INTERCEPTRON", True, WHITE), (48, 30))
         display_x = width - 424
         surface.blit(
             self.small.render("WINDOW SIZE // CAMERA SENSOR IS SEPARATE", True, MUTED),
@@ -478,7 +478,6 @@ def run_headless(args: argparse.Namespace) -> int:
         pygame.image.save(surface, output)
 
     result = {
-        "version": "prototype-02",
         "scenario": args.scenario,
         "steps": steps,
         "simulation_time_s": round(simulation.time_s, 3),
@@ -497,7 +496,7 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
     output_dir = Path("exports")
     output_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = output_dir / f"zenith_{simulation.config.scenario}_{stamp}.csv"
+    output = output_dir / f"interceptron_{simulation.config.scenario}_{stamp}.csv"
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
@@ -605,7 +604,7 @@ def export_telemetry(simulation: InterceptionSimulation) -> Path:
 def run_interactive() -> int:
     enable_windows_dpi_awareness()
     pygame.init()
-    pygame.display.set_caption("ZENITH — Vision-only Interception")
+    pygame.display.set_caption("INTERCEPTRON — Vision-only Interception")
     screen = pygame.display.set_mode(WINDOW_SIZE, pygame.RESIZABLE)
     clock = pygame.time.Clock()
     setup = SetupScreen(screen.get_size())
@@ -919,7 +918,9 @@ def run_interactive() -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ZENITH vision-only interception prototype")
+    parser = argparse.ArgumentParser(
+        description="INTERCEPTRON vision-only interception simulation"
+    )
     parser.add_argument(
         "--headless-steps",
         type=int,

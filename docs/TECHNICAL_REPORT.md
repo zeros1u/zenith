@@ -1,8 +1,8 @@
-# ZENITH technical report
+# INTERCEPTRON technical report
 
 ## 1. Purpose and assumptions
 
-ZENITH is a proof-of-concept onboard software system that tells an interceptor which maneuver to execute using one monocular camera. Target model information is given by the exercise and is represented operationally as a signal lookup that starts only after a generic visual drone detection.
+INTERCEPTRON is a proof-of-concept onboard software system that tells an interceptor which maneuver to execute using one monocular camera. Target model information is given by the exercise and is represented operationally as a signal lookup that starts only after a generic visual drone detection.
 
 The defense guidance algorithm does not read simulated target coordinates. Simulation truth has three isolated defense-side uses:
 
@@ -72,7 +72,7 @@ A width-only estimate fails when a rectangular target rotates. For box dimension
 Sx(ψ) = |W cos ψ| + |L sin ψ|
 ```
 
-ZENITH uses all eight known-model corners and the synthetic detector adapter's imperfect visual pose output to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The range estimator does not read target orientation directly. The full fit matters at terminal distance because different corners no longer have equal depth.
+INTERCEPTRON uses all eight known-model corners and the synthetic detector adapter's imperfect visual pose output to calculate horizontal and vertical physical spans. It first evaluates `Z = fS/p` in both axes, then fits the complete projected 3D box. The range estimator does not read target orientation directly. The full fit matters at terminal distance because different corners no longer have equal depth.
 
 The display retains a naive width-only result internally, allowing the compensated method to be compared later when realistic models and a pose detector are connected.
 
@@ -157,7 +157,7 @@ position   = prediction + α residual
 velocity   = velocity + (β/Δt) residual
 ```
 
-This reduces range-quantization jitter without secretly substituting ground truth. Position gains rise with detector confidence, while drone velocity uses a deliberately lower gain so a tiny image change cannot inflate an oval in one frame. The separately identified fast-rocket profile enables a more responsive velocity update because its closing speed is much higher. Target velocity and acceleration still come from successive camera-derived position measurements, never from the target body's velocity fields. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, ZENITH separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`, while altitude and approximately half of the selected vehicle's maximum speed are regulated. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
+This reduces range-quantization jitter without secretly substituting ground truth. Position gains rise with detector confidence, while drone velocity uses a deliberately lower gain so a tiny image change cannot inflate an oval in one frame. The separately identified fast-rocket profile enables a more responsive velocity update because its closing speed is much higher. Target velocity and acceleration still come from successive camera-derived position measurements, never from the target body's velocity fields. A track is guidance-valid only while the image detector has visual lock. The sensor optical axis is recomputed from the interceptor airframe orientation every tick; there is no independent target-following gimbal. While detections are valid, INTERCEPTRON separately filters horizontal and vertical image-bearing rates. If detection is lost, range and guidance are invalidated immediately. The last image motion is extrapolated for at most 1.5 seconds, after which autonomy requests an expanding horizontal body scan around that predicted direction. Its requested world elevation remains inside `-35 to +35 degrees`, while altitude and approximately half of the selected vehicle's maximum speed are regulated. Reacquisition requires the body-mounted camera to see a new visible detection; after a meaningful gap, the metric tracker is restarted instead of pretending its stale prediction is current.
 
 ## 8. Prediction ovals
 
@@ -199,7 +199,7 @@ Four large cardinal points remain visible, but their connecting diamond does not
 
 ## 9. Reachability and maneuver choice
 
-For every rendered target-edge direction and horizon, ZENITH computes whether our interceptor can arrive before the target:
+For every rendered target-edge direction and horizon, INTERCEPTRON computes whether our interceptor can arrive before the target:
 
 ```text
 distance_to_point ≤ maximum_distance(v_along, max_accel, max_speed, horizon)
